@@ -1,6 +1,6 @@
 {
   "name": "@prodrifterdk/pi-qdrant-memory",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "Read-only Qdrant memory recall for Pi and Prime Agent",
   "type": "module",
   "license": "MIT",
@@ -38,6 +38,8 @@
     "test:integration": "vitest run tests/integration",
     "test:all": "vitest run",
     "check:dist": "npm run build && git diff --exit-code -- dist",
+    "check": "npm run typecheck && npm test && npm run build && git diff --exit-code -- dist",
+    "pack:dry-run": "npm pack --dry-run",
     "prepack": "npm run build"
   },
   "peerDependencies": {

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
@@ -468,7 +469,17 @@ export async function main(args, deps = defaultCliDependencies()) {
         return exit;
     }
 }
-if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+function entryPointUrl(value) {
+    if (value === undefined || value === "")
+        return "";
+    try {
+        return pathToFileURL(realpathSync(value)).href;
+    }
+    catch {
+        return pathToFileURL(value).href;
+    }
+}
+if (import.meta.url === entryPointUrl(process.argv[1])) {
     process.exitCode = await main(process.argv.slice(2), defaultCliDependencies());
 }
 //# sourceMappingURL=cli.js.map
