@@ -1,4 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { describe, expect, it, beforeAll, afterAll, vi } from "vitest";
 import { EmbeddingsClient } from "../../src/clients/embeddings.js";
 import { ReadonlyQdrantClient } from "../../src/clients/qdrant-readonly.js";
@@ -44,7 +46,7 @@ async function closeWithin(close: () => Promise<void>, timeoutMs = 1_000): Promi
     await Promise.race([
       close(),
       new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error("embedding stub close timed out")), timeoutMs);
+        timer = setTimeout(() => reject(new Error("test HTTP server close timed out")), timeoutMs);
       }),
     ]);
   } finally {
@@ -140,13 +142,118 @@ describe("deterministic embedding stub", () => {
   });
 });
 
+describe("bounded test-local Qdrant transport", () => {
+  it("aborts a stalled loopback response and leaves its server fully closed", async () => {
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { "content-type": "application/json", "content-length": "128" });
+      response.flushHeaders();
+      // Deliberately leave the response body incomplete after sending headers.
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address() as AddressInfo;
+    let closePromise: Promise<void> | undefined;
+    const startClose = (): Promise<void> => {
+      closePromise ??= new Promise<void>((resolve, reject) => {
+        server.close(error => error === undefined ? resolve() : reject(error));
+      });
+      return closePromise;
+    };
+    const forcedCleanup = setTimeout(() => server.closeAllConnections(), 750);
+
+    try {
+      const startedAt = Date.now();
+      await expect(qdrantRequest(
+        `http://127.0.0.1:${address.port}`,
+        "/stalled",
+        {},
+        50,
+      )).rejects.toThrow("test Qdrant request timed out");
+      expect(Date.now() - startedAt).toBeLessThan(500);
+      await closeWithin(startClose, 500);
+      expect(server.listening).toBe(false);
+      const connections = await new Promise<number>((resolve, reject) => {
+        server.getConnections((error, count) => error === null ? resolve(count) : reject(error));
+      });
+      expect(connections).toBe(0);
+    } finally {
+      clearTimeout(forcedCleanup);
+      const pendingClose = startClose();
+      server.closeAllConnections();
+      await closeWithin(() => pendingClose, 500);
+    }
+  }, 2_000);
+});
+
 interface QdrantEnvelope {
   result?: unknown;
   status?: string;
 }
 
-async function qdrantRequest(baseUrl: string, path: string, init: RequestInit = {}): Promise<Response> {
-  return fetch(`${baseUrl.replace(/\/+$/, "")}${path}`, init);
+interface RawQdrantResponse {
+  status: number;
+  ok: boolean;
+  body: Uint8Array;
+}
+
+const RAW_QDRANT_REQUEST_TIMEOUT_MS = 1_000;
+
+async function qdrantRequest(
+  baseUrl: string,
+  path: string,
+  init: RequestInit = {},
+  timeoutMs = RAW_QDRANT_REQUEST_TIMEOUT_MS,
+): Promise<RawQdrantResponse> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("test Qdrant request timeout is invalid");
+  }
+  const controller = new AbortController();
+  const callerSignal = init.signal ?? undefined;
+  let callerAborted = callerSignal?.aborted ?? false;
+  let timedOut = false;
+  let timer: NodeJS.Timeout | undefined;
+  const onCallerAbort = (): void => {
+    callerAborted = true;
+    if (timer !== undefined) clearTimeout(timer);
+    controller.abort();
+  };
+  if (callerSignal !== undefined && !callerAborted) {
+    callerSignal.addEventListener("abort", onCallerAbort, { once: true });
+  } else if (callerAborted) {
+    controller.abort();
+  }
+  if (!callerAborted) {
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+  }
+
+  try {
+    const response = await fetch(`${baseUrl.replace(/\/+$/, "")}${path}`, {
+      ...init,
+      signal: controller.signal,
+    });
+    const body = new Uint8Array(await response.arrayBuffer());
+    return { status: response.status, ok: response.ok, body };
+  } catch {
+    if (timedOut) throw new Error("test Qdrant request timed out");
+    if (callerAborted) throw new Error("test Qdrant request cancelled");
+    throw new Error("test Qdrant request unavailable");
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    callerSignal?.removeEventListener("abort", onCallerAbort);
+  }
+}
+
+function qdrantJson(response: RawQdrantResponse): QdrantEnvelope {
+  try {
+    return JSON.parse(Buffer.from(response.body).toString("utf8")) as QdrantEnvelope;
+  } catch {
+    throw new Error("test Qdrant JSON response was malformed");
+  }
 }
 
 async function waitForQdrant(baseUrl: string, collection: string, timeoutMs = 15_000): Promise<void> {
@@ -168,7 +275,6 @@ async function waitForQdrant(baseUrl: string, collection: string, timeoutMs = 15
 async function collectionStatus(baseUrl: string, collection: string): Promise<number> {
   assertGeneratedCollection(collection);
   const response = await qdrantRequest(baseUrl, `/collections/${encodeURIComponent(collection)}`);
-  await response.arrayBuffer();
   return response.status;
 }
 
@@ -200,7 +306,7 @@ async function exactCount(baseUrl: string, collection: string): Promise<number> 
     body: JSON.stringify({ exact: true }),
   });
   if (!response.ok) throw new Error(`Qdrant exact count failed with HTTP ${response.status}`);
-  const body = await response.json() as QdrantEnvelope;
+  const body = qdrantJson(response);
   const result = body.result;
   if (typeof result !== "object" || result === null || !("count" in result)) {
     throw new Error("Qdrant exact count response was malformed");
@@ -234,7 +340,6 @@ async function deleteGeneratedCollection(baseUrl: string, collection: string): P
   if (response.status !== 404 && !response.ok) {
     throw new Error(`test collection cleanup failed with HTTP ${response.status}`);
   }
-  await response.arrayBuffer();
 }
 
 async function allPoints(client: AdminQdrantClient, collection: string): Promise<AdminPoint[]> {
@@ -264,10 +369,29 @@ function pointById(points: readonly AdminPoint[], id: string): AdminPoint {
   return point;
 }
 
-const configuredQdrantUrl = process.env.PI_QDRANT_MEMORY_TEST_QDRANT_URL?.replace(/\/+$/, "");
+function configuredIntegrationUrl(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  const normalized = raw.trim().replace(/\/+$/, "");
+  if (normalized.length === 0) {
+    throw new Error("PI_QDRANT_MEMORY_TEST_QDRANT_URL is set but empty");
+  }
+  return normalized;
+}
+
+describe("integration environment gate", () => {
+  it("distinguishes an absent URL from a present value that normalizes to empty", () => {
+    const generatedBefore = generatedCollections.size;
+    expect(configuredIntegrationUrl(undefined)).toBeUndefined();
+    expect(() => configuredIntegrationUrl("   ///   "))
+      .toThrow("PI_QDRANT_MEMORY_TEST_QDRANT_URL is set but empty");
+    expect(generatedCollections.size).toBe(generatedBefore);
+  });
+});
+
+const configuredQdrantUrl = configuredIntegrationUrl(process.env.PI_QDRANT_MEMORY_TEST_QDRANT_URL);
 
 describe("real Qdrant runtime and approved import integration", () => {
-  if (configuredQdrantUrl === undefined || configuredQdrantUrl.length === 0) {
+  if (configuredQdrantUrl === undefined) {
     it.skip("PI_QDRANT_MEMORY_TEST_QDRANT_URL is not set", () => {});
     return;
   }
@@ -350,13 +474,11 @@ describe("real Qdrant runtime and approved import integration", () => {
       ...extra,
     });
     const runtimePoints: AdminPoint[] = [
-      { id: runtimeIds.current, vector: queryVector, payload: runtimePayload("current project", { project_id: currentProjectId, project_label: "current" }) },
-      { id: runtimeIds.globalA, vector: queryVector, payload: runtimePayload("global alpha") },
-      { id: runtimeIds.globalB, vector: queryVector, payload: runtimePayload("global beta") },
-      { id: runtimeIds.other, vector: queryVector, payload: runtimePayload("other project", { project_id: "synthetic-other-project", project_label: "other" }) },
-      { id: runtimeIds.pi, vector: queryVector, payload: runtimePayload("wrong host", { host: "pi" }) },
-      { id: runtimeIds.blocked, vector: queryVector, payload: runtimePayload("blocked", { project_id: currentProjectId, status: "blocked" }) },
       { id: runtimeIds.failedScan, vector: queryVector, payload: runtimePayload("failed scan", { project_id: currentProjectId, secret_scan: "failed" }) },
+      { id: runtimeIds.other, vector: queryVector, payload: runtimePayload("other project", { project_id: "synthetic-other-project", project_label: "other" }) },
+      { id: runtimeIds.globalB, vector: queryVector, payload: runtimePayload("global beta") },
+      { id: runtimeIds.pi, vector: queryVector, payload: runtimePayload("wrong host", { host: "pi" }) },
+      { id: runtimeIds.current, vector: queryVector, payload: runtimePayload("current project", { project_id: currentProjectId, project_label: "current" }) },
       {
         id: runtimeIds.missingScan,
         vector: queryVector,
@@ -369,6 +491,8 @@ describe("real Qdrant runtime and approved import integration", () => {
           project_id: currentProjectId,
         },
       },
+      { id: runtimeIds.globalA, vector: queryVector, payload: runtimePayload("global alpha") },
+      { id: runtimeIds.blocked, vector: queryVector, payload: runtimePayload("blocked", { project_id: currentProjectId, status: "blocked" }) },
     ];
     await destinationAdmin.upsert(destinationCollection, runtimePoints);
     expect(await waitForExactCount(qdrantUrl, destinationCollection, runtimePoints.length)).toBe(runtimePoints.length);
