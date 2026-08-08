@@ -75,7 +75,7 @@ jobs:
             node tests/compat/run-host-smoke.mjs
 
   compat-prime:
-    name: Prime a2f910e actual-host compatibility
+    name: Prime a18809e actual-host compatibility
     needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -92,7 +92,7 @@ jobs:
         run: |
           set -euo pipefail
           PRIME_HOST="$RUNNER_TEMP/prime-agent"
-          PRIME_COMMIT="a2f910e37b01404994c91679029d5a797b9843a6"
+          PRIME_COMMIT="a18809e00ea30638584d87b3afea7285a9d7296c"
           git clone https://github.com/PrimeIntellect-ai/prime-agent.git "$PRIME_HOST"
           git -C "$PRIME_HOST" checkout --detach "$PRIME_COMMIT"
           test "$(git -C "$PRIME_HOST" rev-parse HEAD)" = "$PRIME_COMMIT"

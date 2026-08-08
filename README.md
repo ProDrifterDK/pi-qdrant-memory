@@ -24,7 +24,7 @@ v1 has no model-callable store/update/delete operation, no automatic conversatio
 The v1 compatibility contract pins:
 
 - Pi `@earendil-works/pi-coding-agent` **0.84.1**; and
-- Prime Agent commit **`a2f910e37b01404994c91679029d5a797b9843a6`**.
+- Prime Agent commit **`a18809e00ea30638584d87b3afea7285a9d7296c`**.
 
 See [`compatibility.json`](compatibility.json). The package requires Node.js 20 or newer; Pi 0.84.1 itself currently requires Node.js 22.19 or newer.
 

@@ -10,8 +10,8 @@ const EXPECTED_COMPATIBILITY = {
   schema: 1,
   primeAgent: {
     repository: "https://github.com/PrimeIntellect-ai/prime-agent.git",
-    minimumCommit: "a2f910e37b01404994c91679029d5a797b9843a6",
-    latestTestedCommit: "a2f910e37b01404994c91679029d5a797b9843a6",
+    minimumCommit: "a18809e00ea30638584d87b3afea7285a9d7296c",
+    latestTestedCommit: "a18809e00ea30638584d87b3afea7285a9d7296c",
   },
   pi: {
     package: "@earendil-works/pi-coding-agent",
