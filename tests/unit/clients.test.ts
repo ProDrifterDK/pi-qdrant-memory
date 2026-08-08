@@ -92,6 +92,82 @@ describe("abortable HTTP client", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("times out when JSON body consumption stalls after headers", async () => {
+    vi.useFakeTimers();
+    let bodyCancelled = false;
+    const fetchImpl = vi.fn(async (_url: string, _init?: RequestInit) => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"result":'));
+        },
+        cancel() {
+          bodyCancelled = true;
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "content-type": "application/json" } });
+    });
+
+    const pending = fetchJson("http://service.test/data", {}, { timeoutMs: 100, fetchImpl }).catch((value: unknown) => value);
+    const watchdog = new Promise<symbol>((resolve) => setTimeout(() => resolve(Symbol.for("body-stall")), 150));
+    const outcome = Promise.race([pending, watchdog]);
+    await vi.advanceTimersByTimeAsync(150);
+    const result = await outcome;
+    expect(typeof result).toBe("object");
+    expect(errorDetails(result).category).toBe("timeout");
+    expect(bodyCancelled).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("propagates host cancellation after headers while JSON body is pending", async () => {
+    vi.useFakeTimers();
+    const host = new AbortController();
+    const add = vi.spyOn(host.signal, "addEventListener");
+    const remove = vi.spyOn(host.signal, "removeEventListener");
+    let bodyStarted = false;
+    let bodyAborted = false;
+    let fetchSignal: AbortSignal | undefined;
+    let releaseFetch: ((response: Response) => void) | undefined;
+    const fetchImpl = vi.fn((_url: string, init?: RequestInit) => {
+      fetchSignal = init?.signal;
+      return new Promise<Response>((resolve) => { releaseFetch = resolve; });
+    });
+    const stalledBody = (): Promise<never> => new Promise((_resolve, reject) => {
+      bodyStarted = true;
+      fetchSignal?.addEventListener("abort", () => {
+        bodyAborted = true;
+        reject(new DOMException("aborted", "AbortError"));
+      }, { once: true });
+    });
+
+    const pending = fetchJson("http://service.test/data", {}, {
+      timeoutMs: 100,
+      signal: host.signal,
+      fetchImpl,
+    }).catch((value: unknown) => value);
+    expect(releaseFetch).toBeTypeOf("function");
+    const response = {
+      ok: true,
+      status: 200,
+      clone: () => ({ arrayBuffer: stalledBody }),
+      json: stalledBody,
+    } as unknown as Response;
+    releaseFetch?.(response);
+    for (let attempt = 0; attempt < 10 && !bodyStarted; attempt += 1) await Promise.resolve();
+    expect(bodyStarted).toBe(true);
+
+    host.abort();
+    const watchdog = new Promise<symbol>((resolve) => setTimeout(() => resolve(Symbol.for("body-cancel")), 150));
+    const outcome = Promise.race([pending, watchdog]);
+    await vi.advanceTimersByTimeAsync(150);
+    const result = await outcome;
+    expect(typeof result).toBe("object");
+    expect(errorDetails(result).category).toBe("cancelled");
+    expect(bodyAborted).toBe(true);
+    expect(add).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("maps non-abort fetch failures to a redacted network error", async () => {
     const error = await fetchJson("http://service.test/data?secret=1", {}, {
       timeoutMs: 2500,
