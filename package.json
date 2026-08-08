@@ -1,0 +1,53 @@
+{
+  "name": "@prodrifterdk/pi-qdrant-memory",
+  "version": "0.0.0",
+  "description": "Read-only Qdrant memory recall for Pi and Prime Agent",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "qdrant",
+    "memory",
+    "prime-agent"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "docs/configuration.md",
+    "docs/security.md",
+    "compatibility.json"
+  ],
+  "bin": {
+    "pi-qdrant-memory": "./dist/admin/cli.js"
+  },
+  "pi": {
+    "extensions": [
+      "./dist/extension.js"
+    ]
+  },
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:all": "vitest run",
+    "check:dist": "npm run build && git diff --exit-code -- dist",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@types/node": "^24.0.0",
+    "typebox": "^1.1.24",
+    "typescript": "^5.9.0",
+    "vitest": "^4.0.0"
+  }
+}
