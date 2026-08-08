@@ -37,7 +37,7 @@ Use loopback endpoints for same-machine services, or authenticated TLS endpoints
 
 ## Install the extension
 
-These commands are pinned to the intended v1 tag. This repository preparation does **not** create that tag or publish the npm package; use them only after `v1.0.0`/`1.0.0` is available from the stated source.
+These commands are pinned to the v1 tag. GitHub installation is available from `v1.0.0`. This release does **not** publish the npm package; registry-only examples below remain unavailable until a separate npm publication.
 
 ### Prime Agent
 
