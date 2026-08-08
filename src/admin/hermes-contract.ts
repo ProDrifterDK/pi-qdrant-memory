@@ -38,12 +38,36 @@ function validId(value: unknown): value is string | number {
   );
 }
 
+function validOrdinaryDenseArray<T>(
+  value: unknown,
+  validElement: (element: unknown) => element is T,
+): value is T[] {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) return false;
+  if (Object.getOwnPropertySymbols(value).length > 0) return false;
+  if (Object.getOwnPropertyNames(value).length !== value.length + 1) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (
+      descriptor === undefined ||
+      !("value" in descriptor) ||
+      !descriptor.enumerable ||
+      !validElement(descriptor.value)
+    ) return false;
+  }
+  return true;
+}
+
 function validDenseVector(value: unknown): value is number[] {
   return (
-    Array.isArray(value) &&
-    value.length > 0 &&
-    value.every((component) => typeof component === "number" && Number.isFinite(component))
+    validOrdinaryDenseArray(
+      value,
+      (component): component is number => typeof component === "number" && Number.isFinite(component),
+    ) && value.length > 0
   );
+}
+
+function validTags(value: unknown): value is string[] {
+  return validOrdinaryDenseArray(value, (tag): tag is string => typeof tag === "string");
 }
 
 function leapYear(year: number): boolean {
@@ -127,9 +151,7 @@ export function validateHermesPoint(point: AdminPoint): HermesValidation {
   }
 
   if (hasOwn(payload, "tags")) {
-    if (!Array.isArray(payload.tags) || !payload.tags.every((tag) => typeof tag === "string")) {
-      return { eligible: false, reason: "tags" };
-    }
+    if (!validTags(payload.tags)) return { eligible: false, reason: "tags" };
   }
 
   if (hasOwn(payload, "fact_status")) {

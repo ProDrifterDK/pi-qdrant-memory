@@ -197,6 +197,47 @@ describe("normalizeHermesPoint", () => {
     })).toEqual({ accepted: false, reason });
   });
 
+  it("fails closed without raw exceptions for sparse and subclass vector/tag arrays", () => {
+    const sparseVector = new Array<number>(2);
+    sparseVector[1] = 0.2;
+    const sparseTags = new Array<string>(2);
+    sparseTags[1] = "safe";
+    class VectorSubclass extends Array<number> {}
+    class TagSubclass extends Array<string> {}
+    const candidates = [
+      point({ text: "safe", model: "bge-m3" }, "sparse-vector", sparseVector),
+      point({ text: "safe", model: "bge-m3" }, "subclass-vector", new VectorSubclass(0.1, 0.2)),
+      point({ text: "safe", model: "bge-m3", tags: sparseTags }, "sparse-tags"),
+      point({ text: "safe", model: "bge-m3", tags: new TagSubclass("safe") }, "subclass-tags"),
+    ];
+
+    for (const candidate of candidates) {
+      expect(() => normalizeHermesPoint({
+        point: candidate,
+        targetHost: "prime",
+        sourceCollection: "hermes_memory",
+        configuredModel: "bge-m3",
+      })).not.toThrow();
+    }
+    expect(normalizeHermesPoint({
+      point: candidates[0] as AdminPoint,
+      targetHost: "prime",
+      sourceCollection: "hermes_memory",
+      configuredModel: "bge-m3",
+    })).toEqual({ accepted: false, reason: "vector" });
+    expect(normalizeHermesPoint({
+      point: candidates[2] as AdminPoint,
+      targetHost: "prime",
+      sourceCollection: "hermes_memory",
+      configuredModel: "bge-m3",
+    })).toEqual({ accepted: false, reason: "tags" });
+
+    expect(buildImportPlan(planInput(candidates, { declaredSourceModel: "bge-m3" })).rejected).toEqual({
+      tags: 2,
+      vector: 2,
+    });
+  });
+
   it("does not mutate or retain mutable caller-owned arrays", () => {
     const input = point({ text: "safe", model: "bge-m3", tags: ["one"] });
     const before = structuredClone(input);

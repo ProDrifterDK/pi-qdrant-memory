@@ -2,8 +2,12 @@ import { describe, expect, it } from "vitest";
 import { validateHermesPoint } from "../../src/admin/hermes-contract.js";
 import type { AdminPoint } from "../../src/admin/qdrant-admin.js";
 
-function point(payload: Record<string, unknown> = { text: "safe" }): AdminPoint {
-  return { id: "source-1", vector: [0.1, -0.2], payload };
+function point(
+  payload: Record<string, unknown> = { text: "safe" },
+  id: string | number = "source-1",
+  vector: number[] = [0.1, -0.2],
+): AdminPoint {
+  return { id, vector, payload };
 }
 
 describe("validateHermesPoint", () => {
@@ -64,6 +68,26 @@ describe("validateHermesPoint", () => {
     [{ id: "ok", vector: ["1"], payload: { text: "safe" } }, "vector"],
   ])("strictly rejects malformed point structure", (candidate, reason) => {
     expect(validateHermesPoint(candidate as AdminPoint)).toEqual({ eligible: false, reason });
+  });
+
+  it("rejects sparse, accessor-backed, and subclass vectors and tags", () => {
+    const sparseVector = new Array<number>(2);
+    sparseVector[1] = 0.2;
+    const sparseTags = new Array<string>(2);
+    sparseTags[1] = "safe";
+    class VectorSubclass extends Array<number> {}
+    class TagSubclass extends Array<string> {}
+    const accessorVector = [0.1, 0.2];
+    Object.defineProperty(accessorVector, "0", { enumerable: true, get: () => 0.1 });
+    const accessorTags = ["safe"];
+    Object.defineProperty(accessorTags, "0", { enumerable: true, get: () => "safe" });
+
+    expect(validateHermesPoint(point({ text: "safe" }, "source", sparseVector))).toEqual({ eligible: false, reason: "vector" });
+    expect(validateHermesPoint(point({ text: "safe" }, "source", new VectorSubclass(0.1, 0.2)))).toEqual({ eligible: false, reason: "vector" });
+    expect(validateHermesPoint(point({ text: "safe" }, "source", accessorVector))).toEqual({ eligible: false, reason: "vector" });
+    expect(validateHermesPoint(point({ text: "safe", tags: sparseTags }))).toEqual({ eligible: false, reason: "tags" });
+    expect(validateHermesPoint(point({ text: "safe", tags: new TagSubclass("safe") }))).toEqual({ eligible: false, reason: "tags" });
+    expect(validateHermesPoint(point({ text: "safe", tags: accessorTags }))).toEqual({ eligible: false, reason: "tags" });
   });
 
   it("does not mutate caller-owned input", () => {
