@@ -32,6 +32,7 @@
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "npm run clean && tsc -p tsconfig.json",
+    "postbuild": "node -e \"require('node:fs').chmodSync('dist/admin/cli.js',0o755)\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run tests/unit",
     "test:integration": "vitest run tests/integration",

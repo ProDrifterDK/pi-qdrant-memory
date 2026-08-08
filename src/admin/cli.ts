@@ -1,0 +1,534 @@
+#!/usr/bin/env node
+
+import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { pathToFileURL } from "node:url";
+import { parseArgs } from "node:util";
+import { containsSecret } from "./secret-scan.js";
+import { loadConfig as loadRuntimeConfig } from "../config.js";
+import { MemoryClientError } from "../clients/http.js";
+import type { HostId, RuntimeConfig } from "../types.js";
+import {
+  ImportApprovalMismatchError,
+  ImportInfrastructureError,
+  ImportValidationError,
+  applyHermesImport as applyImport,
+  planHermesImport as planImport,
+  type ImportClients,
+  type ImportOptions,
+} from "./import-hermes.js";
+import type { ImportPlan } from "./import-plan.js";
+import {
+  initializeDestination as initializeMemoryDestination,
+  type InitializeDestinationResult,
+} from "./init.js";
+import { AdminQdrantClient } from "./qdrant-admin.js";
+import { memoryStatus as readMemoryStatus, type MemoryStatus } from "./status.js";
+
+const ADMIN_HOST_ENVIRONMENT = "PI_QDRANT_MEMORY_HOST";
+const PLAN_ID_PATTERN = /^[a-f0-9]{64}$/;
+const COLLECTION_PATTERN = /^[A-Za-z0-9_-]{1,255}$/;
+
+const TOP_LEVEL_HELP = `Usage: pi-qdrant-memory <command> [options]
+
+Commands:
+  init             initialize the configured destination
+  status           inspect configured administrative dependencies
+  import-hermes    dry-run or apply an approved Hermes import
+
+Run a command with --help for command-specific options.`;
+
+const INIT_HELP = `Usage: pi-qdrant-memory init [--json]
+
+Host rule: set PI_QDRANT_MEMORY_HOST explicitly to prime or pi.`;
+
+const STATUS_HELP = `Usage: pi-qdrant-memory status [--json]
+
+Host rule: set PI_QDRANT_MEMORY_HOST explicitly to prime or pi.`;
+
+const IMPORT_HELP = `Usage:
+  pi-qdrant-memory import-hermes --target-host prime|pi --dry-run [options]
+  pi-qdrant-memory import-hermes --target-host prime|pi --approve <plan-id> [options]
+
+Options:
+  --source-url <url>
+  --source-collection <collection>
+  --source-model <model>
+  --json
+  --help`;
+
+class CliInputError extends Error {
+  constructor() {
+    super("invalid arguments or configuration");
+    this.name = "CliInputError";
+  }
+}
+
+class CliConfigError extends Error {
+  constructor() {
+    super("invalid arguments or configuration");
+    this.name = "CliConfigError";
+  }
+}
+
+export interface CliDependencies {
+  env: Record<string, string | undefined>;
+  loadConfig(host: HostId): Promise<RuntimeConfig>;
+  initialize(config: RuntimeConfig): Promise<InitializeDestinationResult>;
+  status(config: RuntimeConfig): Promise<MemoryStatus>;
+  plan(options: ImportOptions, clients: ImportClients): Promise<ImportPlan>;
+  apply(
+    options: ImportOptions & { approvedPlanId: string },
+    clients: ImportClients,
+  ): Promise<{ planId: string; upserted: number; batches: number }>;
+  createImportClients(config: RuntimeConfig, sourceUrl: string): ImportClients;
+  writeStdout(value: string): void;
+  writeStderr(value: string): void;
+}
+
+export interface DefaultCliDependencyOptions {
+  env?: Record<string, string | undefined>;
+  homeDir?: string;
+  readTextFile?(path: string): Promise<string>;
+  fetchImpl?: typeof fetch;
+  writeStdout?(value: string): void;
+  writeStderr?(value: string): void;
+}
+
+function sourceClientProjection(client: AdminQdrantClient): ImportClients["source"] {
+  return {
+    collectionInfo: (collection, signal) => client.collectionInfo(collection, signal),
+    scroll: (collection, offset, limit, signal) =>
+      client.scroll(collection, offset, limit, signal),
+  };
+}
+
+function destinationClientProjection(client: AdminQdrantClient): ImportClients["destination"] {
+  return {
+    collectionInfo: (collection, signal) => client.collectionInfo(collection, signal),
+    upsert: (collection, points, signal) => client.upsert(collection, points, signal),
+  };
+}
+
+function createDefaultImportClients(
+  config: RuntimeConfig,
+  sourceUrl: string,
+  fetchImpl: typeof fetch | undefined,
+): ImportClients {
+  const common = {
+    timeoutMs: config.retrieval.timeoutMs,
+    ...(fetchImpl === undefined ? {} : { fetchImpl }),
+  };
+  const sourceClient = new AdminQdrantClient({
+    ...common,
+    baseUrl: sourceUrl,
+    ...(config.admin.source.apiKey === undefined
+      ? {}
+      : { apiKey: config.admin.source.apiKey }),
+  });
+  const destinationClient = new AdminQdrantClient({
+    ...common,
+    baseUrl: config.qdrant.url,
+    ...(config.admin.destinationApiKey === undefined
+      ? {}
+      : { apiKey: config.admin.destinationApiKey }),
+  });
+  return {
+    source: sourceClientProjection(sourceClient),
+    destination: destinationClientProjection(destinationClient),
+  };
+}
+
+export function defaultCliDependencies(
+  options: DefaultCliDependencyOptions = {},
+): CliDependencies {
+  const env = options.env ?? process.env;
+  const home = options.homeDir ?? homedir();
+  const readTextFile = options.readTextFile ?? ((path: string) => readFile(path, "utf8"));
+  const fetchImpl = options.fetchImpl;
+  const configDependencies = {
+    env,
+    homeDir: home,
+    ...(env.XDG_CONFIG_HOME === undefined || env.XDG_CONFIG_HOME === ""
+      ? {}
+      : { xdgConfigHome: env.XDG_CONFIG_HOME }),
+    readTextFile,
+  };
+  return {
+    env,
+    loadConfig: (host) => loadRuntimeConfig(host, configDependencies),
+    initialize: (config) =>
+      initializeMemoryDestination(config, {
+        ...(fetchImpl === undefined ? {} : { fetchImpl }),
+      }),
+    status: (config) =>
+      readMemoryStatus(config, {
+        ...(fetchImpl === undefined ? {} : { fetchImpl }),
+      }),
+    plan: planImport,
+    apply: applyImport,
+    createImportClients: (config, sourceUrl) =>
+      createDefaultImportClients(config, sourceUrl, fetchImpl),
+    writeStdout: options.writeStdout ?? ((value) => process.stdout.write(value)),
+    writeStderr: options.writeStderr ?? ((value) => process.stderr.write(value)),
+  };
+}
+
+function parseSimpleCommand(args: readonly string[]): { json: boolean; help: boolean } {
+  try {
+    const parsed = parseArgs({
+      args: [...args],
+      strict: true,
+      allowPositionals: false,
+      options: {
+        json: { type: "boolean" },
+        help: { type: "boolean", short: "h" },
+      },
+    });
+    return { json: parsed.values.json ?? false, help: parsed.values.help ?? false };
+  } catch {
+    throw new CliInputError();
+  }
+}
+
+interface ParsedImportCommand {
+  json: boolean;
+  help: boolean;
+  targetHost?: string;
+  dryRun: boolean;
+  approve?: string;
+  sourceUrl?: string;
+  sourceCollection?: string;
+  sourceModel?: string;
+}
+
+function parseImportCommand(args: readonly string[]): ParsedImportCommand {
+  try {
+    const parsed = parseArgs({
+      args: [...args],
+      strict: true,
+      allowPositionals: false,
+      options: {
+        json: { type: "boolean" },
+        help: { type: "boolean", short: "h" },
+        "target-host": { type: "string" },
+        "dry-run": { type: "boolean" },
+        approve: { type: "string" },
+        "source-url": { type: "string" },
+        "source-collection": { type: "string" },
+        "source-model": { type: "string" },
+      },
+    });
+    return {
+      json: parsed.values.json ?? false,
+      help: parsed.values.help ?? false,
+      dryRun: parsed.values["dry-run"] ?? false,
+      ...(parsed.values["target-host"] === undefined
+        ? {}
+        : { targetHost: parsed.values["target-host"] }),
+      ...(parsed.values.approve === undefined
+        ? {}
+        : { approve: parsed.values.approve }),
+      ...(parsed.values["source-url"] === undefined
+        ? {}
+        : { sourceUrl: parsed.values["source-url"] }),
+      ...(parsed.values["source-collection"] === undefined
+        ? {}
+        : { sourceCollection: parsed.values["source-collection"] }),
+      ...(parsed.values["source-model"] === undefined
+        ? {}
+        : { sourceModel: parsed.values["source-model"] }),
+    };
+  } catch {
+    throw new CliInputError();
+  }
+}
+
+function explicitAdministrativeHost(env: Record<string, string | undefined>): HostId {
+  const value = env[ADMIN_HOST_ENVIRONMENT];
+  if (value !== "prime" && value !== "pi") throw new CliInputError();
+  return value;
+}
+
+function targetHost(value: string | undefined): HostId {
+  if (value !== "prime" && value !== "pi") throw new CliInputError();
+  return value;
+}
+
+function collectionIdentifier(value: string): string {
+  if (!COLLECTION_PATTERN.test(value) || containsSecret(value)) throw new CliInputError();
+  return value;
+}
+
+function modelIdentifier(value: string): string {
+  if (
+    value.trim() !== value ||
+    value.length === 0 ||
+    value.length > 256 ||
+    /[\u0000-\u001f\u007f]/.test(value) ||
+    containsSecret(value)
+  ) {
+    throw new CliInputError();
+  }
+  return value;
+}
+
+function sourceUrl(value: string): string {
+  if (value.trim() !== value || value.length === 0 || containsSecret(value)) {
+    throw new CliInputError();
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new CliInputError();
+  }
+  if (
+    (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    value.includes("?") ||
+    value.includes("#") ||
+    parsed.search !== "" ||
+    parsed.hash !== ""
+  ) {
+    throw new CliInputError();
+  }
+  return value.replace(/\/+$/, "");
+}
+
+function isSystemIoError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof (error as { code?: unknown }).code === "string"
+  );
+}
+
+async function configured(host: HostId, deps: CliDependencies): Promise<RuntimeConfig> {
+  try {
+    return await deps.loadConfig(host);
+  } catch (error: unknown) {
+    if (isSystemIoError(error)) {
+      throw new ImportInfrastructureError("configuration unavailable");
+    }
+    throw new CliConfigError();
+  }
+}
+
+function safeStatus(status: MemoryStatus): Record<string, unknown> {
+  const collection = (value: MemoryStatus["destination"]): Record<string, unknown> => ({
+    collection: value.collection,
+    exists: value.exists,
+    dimension: value.dimension,
+    distance: value.distance,
+    pointCount: value.pointCount,
+    healthy: value.healthy,
+    keyConfigured: value.keyConfigured,
+  });
+  return {
+    destinationExists: status.destinationExists,
+    destination: collection(status.destination),
+    source: collection(status.source),
+    embeddings: {
+      model: status.embeddings.model,
+      dimension: status.embeddings.dimension,
+      healthy: status.embeddings.healthy,
+      keyConfigured: status.embeddings.keyConfigured,
+    },
+    qdrant: {
+      healthy: status.qdrant.healthy,
+      destinationHealthy: status.qdrant.destinationHealthy,
+      sourceHealthy: status.qdrant.sourceHealthy,
+    },
+  };
+}
+
+function safePlan(plan: ImportPlan): Record<string, unknown> {
+  return {
+    planId: plan.planId,
+    transformVersion: plan.transformVersion,
+    targetHost: plan.targetHost,
+    sourceCollection: plan.sourceCollection,
+    destinationCollection: plan.destinationCollection,
+    rejected: plan.rejected,
+    report: plan.report,
+  };
+}
+
+function output(
+  deps: CliDependencies,
+  json: boolean,
+  command: string,
+  value: Record<string, unknown>,
+): void {
+  const projection = { command, ...value };
+  deps.writeStdout(
+    json
+      ? `${JSON.stringify(projection)}\n`
+      : `${command}\n${JSON.stringify(value, null, 2)}\n`,
+  );
+}
+
+function help(
+  deps: CliDependencies,
+  json: boolean,
+  usage: string,
+): void {
+  deps.writeStdout(json ? `${JSON.stringify({ usage })}\n` : `${usage}\n`);
+}
+
+function requestedJson(args: readonly string[]): boolean {
+  return args.some((value) => value === "--json");
+}
+
+function failure(
+  deps: CliDependencies,
+  json: boolean,
+  message: "invalid arguments or configuration" | "operation failed" | "source changed; run dry-run again",
+): void {
+  deps.writeStderr(json ? `${JSON.stringify({ error: message })}\n` : `${message}\n`);
+}
+
+function exitForError(error: unknown): 1 | 2 {
+  if (
+    error instanceof CliInputError ||
+    error instanceof CliConfigError ||
+    error instanceof ImportValidationError ||
+    (error instanceof MemoryClientError && error.category === "configuration")
+  ) {
+    return 2;
+  }
+  if (error instanceof ImportInfrastructureError) return 1;
+  return 1;
+}
+
+async function runSimple(
+  command: "init" | "status",
+  args: readonly string[],
+  deps: CliDependencies,
+): Promise<number> {
+  const parsed = parseSimpleCommand(args);
+  if (parsed.help) {
+    help(deps, parsed.json, command === "init" ? INIT_HELP : STATUS_HELP);
+    return 0;
+  }
+  const host = explicitAdministrativeHost(deps.env);
+  const config = await configured(host, deps);
+  if (command === "init") {
+    const result = await deps.initialize(config);
+    output(deps, parsed.json, "init", { host, ...result });
+  } else {
+    const result = await deps.status(config);
+    output(deps, parsed.json, "status", { host, ...safeStatus(result) });
+  }
+  return 0;
+}
+
+async function runImport(
+  args: readonly string[],
+  deps: CliDependencies,
+): Promise<number> {
+  const parsed = parseImportCommand(args);
+  if (parsed.help) {
+    help(deps, parsed.json, IMPORT_HELP);
+    return 0;
+  }
+  const host = targetHost(parsed.targetHost);
+  const hasApproval = parsed.approve !== undefined;
+  if (parsed.dryRun === hasApproval) throw new CliInputError();
+  if (hasApproval && !PLAN_ID_PATTERN.test(parsed.approve as string)) {
+    throw new CliInputError();
+  }
+
+  const sourceUrlOverride = parsed.sourceUrl === undefined
+    ? undefined
+    : sourceUrl(parsed.sourceUrl);
+  const sourceCollectionOverride = parsed.sourceCollection === undefined
+    ? undefined
+    : collectionIdentifier(parsed.sourceCollection);
+  const sourceModelOverride = parsed.sourceModel === undefined
+    ? undefined
+    : modelIdentifier(parsed.sourceModel);
+
+  const config = await configured(host, deps);
+  const resolvedSourceUrl = sourceUrl(sourceUrlOverride ?? config.admin.source.url);
+  const resolvedSourceCollection = collectionIdentifier(
+    sourceCollectionOverride ?? config.admin.source.collection,
+  );
+  const destinationCollection = collectionIdentifier(config.qdrant.collection);
+  const configuredModel = modelIdentifier(config.embeddings.model);
+  const clients = deps.createImportClients(config, resolvedSourceUrl);
+  const importOptions: ImportOptions = {
+    sourceIdentity: resolvedSourceUrl,
+    sourceCollection: resolvedSourceCollection,
+    destinationCollection,
+    targetHost: host,
+    configuredModel,
+    configuredDimension: config.embeddings.dimension,
+    ...(sourceModelOverride === undefined
+      ? {}
+      : { declaredSourceModel: sourceModelOverride }),
+  };
+
+  if (parsed.dryRun) {
+    const plan = await deps.plan(importOptions, clients);
+    output(deps, parsed.json, "import-hermes", { mode: "dry-run", ...safePlan(plan) });
+    return 0;
+  }
+
+  const result = await deps.apply(
+    { ...importOptions, approvedPlanId: parsed.approve as string },
+    clients,
+  );
+  output(deps, parsed.json, "import-hermes", {
+    mode: "apply",
+    targetHost: host,
+    sourceCollection: resolvedSourceCollection,
+    destinationCollection,
+    ...result,
+  });
+  return 0;
+}
+
+export async function main(
+  args: readonly string[],
+  deps: CliDependencies = defaultCliDependencies(),
+): Promise<number> {
+  const json = requestedJson(args);
+  try {
+    if (
+      args.length === 1 &&
+      (args[0] === "--help" || args[0] === "-h")
+    ) {
+      help(deps, json, TOP_LEVEL_HELP);
+      return 0;
+    }
+    const command = args[0];
+    const commandArgs = args.slice(1);
+    if (command === "init" || command === "status") {
+      return await runSimple(command, commandArgs, deps);
+    }
+    if (command === "import-hermes") {
+      return await runImport(commandArgs, deps);
+    }
+    throw new CliInputError();
+  } catch (error: unknown) {
+    if (error instanceof ImportApprovalMismatchError) {
+      failure(deps, json, "source changed; run dry-run again");
+      return 2;
+    }
+    const exit = exitForError(error);
+    failure(
+      deps,
+      json,
+      exit === 2 ? "invalid arguments or configuration" : "operation failed",
+    );
+    return exit;
+  }
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  process.exitCode = await main(process.argv.slice(2), defaultCliDependencies());
+}
