@@ -505,6 +505,46 @@ describe("administrative CLI", () => {
   });
 
   it.each([
+    { name: "newline", control: "\n" },
+    { name: "carriage return", control: "\r" },
+    { name: "tab", control: "\t" },
+    { name: "DEL", control: "\u007f" },
+    { name: "C1 start", control: "\u0080" },
+    { name: "C1 end", control: "\u009f" },
+  ])(
+    "rejects a raw $name control in source URL before config or network work",
+    async ({ control }) => {
+      const harness = cliHarness();
+      const unsafeUrl = `https://source.example/a${control}b`;
+      expect(await main([
+        "import-hermes", "--target-host", "prime", "--source-url", unsafeUrl, "--dry-run",
+      ], harness.deps)).toBe(2);
+      expect(harness.loadConfig).not.toHaveBeenCalled();
+      expect(harness.createImportClients).not.toHaveBeenCalled();
+      expect(harness.plan).not.toHaveBeenCalled();
+    },
+  );
+
+  it("uses one parsed normalized source URL for both plan identity and client base URL", async () => {
+    const harness = cliHarness();
+    expect(await main([
+      "import-hermes",
+      "--target-host", "prime",
+      "--source-url", "HTTP://Source.Example:80/a/../qdrant///",
+      "--dry-run",
+    ], harness.deps)).toBe(0);
+    const normalized = "http://source.example/qdrant";
+    expect(harness.createImportClients).toHaveBeenCalledWith(expect.any(Object), normalized);
+    expect(harness.plan).toHaveBeenCalledWith(
+      expect.objectContaining({ sourceIdentity: normalized }),
+      expect.any(Object),
+    );
+    expect(harness.createImportClients.mock.calls[0]?.[1]).toBe(
+      harness.plan.mock.calls[0]?.[0].sourceIdentity,
+    );
+  });
+
+  it.each([
     ["--source-collection", "../private"],
     ["--source-collection", "password=hunter2long"],
     ["--source-model", " token=abcdefghijklmnop"],
@@ -532,6 +572,134 @@ describe("administrative CLI", () => {
     }
   });
 
+  it("injectively escapes aggregate keys and dry-run projection strings in JSON and human output", async () => {
+    const actualDel = "type\u007f";
+    const literalDelEscape = String.raw`type\u007F`;
+    const actualC1 = "type\u0085";
+    const literalC1Escape = String.raw`type\u0085`;
+    const actualNewline = "line\nbreak";
+    const maliciousPlan = safePlan({
+      sourceCollection: "source\u007fcollection",
+      destinationCollection: "password=hunter2long",
+      rejected: { [actualC1]: 3, [literalC1Escape]: 4 },
+      report: {
+        accepted: 3,
+        rejected: 7,
+        bySourceType: {
+          [actualDel]: 1,
+          [literalDelEscape]: 2,
+          [actualNewline]: 3,
+        },
+        byProjectLabel: { [actualC1]: 3, [literalC1Escape]: 4 },
+      },
+    });
+
+    for (const json of [false, true]) {
+      const harness = cliHarness({ plan: vi.fn(async () => maliciousPlan) });
+      expect(await main([
+        "import-hermes", "--target-host", "prime", "--dry-run", ...(json ? ["--json"] : []),
+      ], harness.deps)).toBe(0);
+      const stdout = harness.stdout.join("");
+      expect(stdout).not.toContain("hunter2long");
+      expect(stdout).not.toContain(actualDel);
+      expect(stdout).not.toContain(actualC1);
+      expect(stdout).not.toContain("\r");
+      expect(stdout).not.toContain("\t");
+      expect(stdout).toContain(String.raw`type\\u007F`);
+      expect(stdout).toContain(String.raw`type\\\\u007F`);
+      expect(stdout).toContain(String.raw`type\\u0085`);
+      expect(stdout).toContain(String.raw`type\\\\u0085`);
+      expect(stdout).toContain(String.raw`line\\u000Abreak`);
+      if (json) {
+        expect(stdout.slice(0, -1)).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
+        const parsed = JSON.parse(stdout) as {
+          sourceCollection: string;
+          destinationCollection: string;
+          report: { bySourceType: Record<string, number> };
+        };
+        expect(parsed.sourceCollection).toBe(String.raw`source\u007Fcollection`);
+        expect(parsed.destinationCollection).toBe("[redacted]");
+        expect(parsed.report.bySourceType).toEqual({
+          [String.raw`type\u007F`]: 1,
+          [String.raw`type\\u007F`]: 2,
+          [String.raw`line\u000Abreak`]: 3,
+        });
+      }
+    }
+  });
+
+  it("redacts credential-shaped config strings and escapes controls in init/status projections", async () => {
+    const maliciousConfig = config();
+    maliciousConfig.qdrant.collection = "password=hunter2long";
+    maliciousConfig.admin.source.collection = "source\u007fcollection";
+    maliciousConfig.embeddings.model = "token=abcdefghijklmnop";
+
+    const initHarness = cliHarness({
+      loadConfig: vi.fn(async () => maliciousConfig),
+      initialize: vi.fn(async () => ({
+        created: false,
+        collection: maliciousConfig.qdrant.collection,
+        dimension: 3,
+        distance: "Cos\u0085ine" as "Cosine",
+      })),
+    });
+    expect(await main(["init", "--json"], initHarness.deps)).toBe(0);
+    const initOutput = initHarness.stdout.join("");
+    expect(initOutput).not.toContain("hunter2long");
+    expect(initOutput).not.toContain("\u0085");
+    expect(JSON.parse(initOutput)).toMatchObject({
+      collection: "[redacted]",
+      distance: String.raw`Cos\u0085ine`,
+    });
+
+    const baseStatus = await cliHarness().deps.status(config());
+    baseStatus.destination.collection = maliciousConfig.qdrant.collection;
+    baseStatus.destination.distance = "Cos\u007fine";
+    baseStatus.source.collection = maliciousConfig.admin.source.collection;
+    baseStatus.source.distance = "Cos\u009fine";
+    baseStatus.embeddings.model = maliciousConfig.embeddings.model;
+    const statusHarness = cliHarness({
+      loadConfig: vi.fn(async () => maliciousConfig),
+      status: vi.fn(async () => baseStatus),
+    });
+    expect(await main(["status", "--json"], statusHarness.deps)).toBe(0);
+    const statusOutput = statusHarness.stdout.join("");
+    expect(statusOutput).not.toContain("hunter2long");
+    expect(statusOutput).not.toContain("abcdefghijklmnop");
+    expect(statusOutput.slice(0, -1)).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
+    expect(JSON.parse(statusOutput)).toMatchObject({
+      destination: {
+        collection: "[redacted]",
+        distance: String.raw`Cos\u007Fine`,
+      },
+      source: {
+        collection: String.raw`source\u007Fcollection`,
+        distance: String.raw`Cos\u009Fine`,
+      },
+      embeddings: { model: "[redacted]" },
+    });
+  });
+
+  it("escapes every apply result string before JSON output", async () => {
+    const harness = cliHarness({
+      apply: vi.fn(async () => ({
+        planId: "plan\u007fidentifier",
+        upserted: 1,
+        batches: 1,
+      })),
+    });
+    expect(await main([
+      "import-hermes", "--target-host", "prime", "--approve", PLAN_ID, "--json",
+    ], harness.deps)).toBe(0);
+    const output = harness.stdout.join("");
+    expect(output.slice(0, -1)).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
+    expect(JSON.parse(output)).toMatchObject({
+      planId: String.raw`plan\u007Fidentifier`,
+      sourceCollection: "hermes_memory",
+      destinationCollection: "pi_memory",
+    });
+  });
+
   it("runs approved apply and prints only the safe result", async () => {
     const harness = cliHarness();
     expect(await main([
@@ -553,6 +721,8 @@ describe("administrative CLI", () => {
 
   it.each([
     { args: ["--help"] },
+    { args: ["--help", "--json"] },
+    { args: ["--json", "--help"] },
     { args: ["init", "--help"] },
     { args: ["status", "--help"] },
     { args: ["import-hermes", "--help"] },
@@ -561,6 +731,10 @@ describe("administrative CLI", () => {
     const harness = cliHarness();
     expect(await main(args, harness.deps)).toBe(0);
     expect(harness.loadConfig).not.toHaveBeenCalled();
+    expect(harness.createImportClients).not.toHaveBeenCalled();
+    if (args.includes("--json")) {
+      expect(JSON.parse(harness.stdout.join(""))).toHaveProperty("usage");
+    }
   });
 
   it("maps invalid/config/mismatch to 2, infrastructure to 1, and redacts caught messages", async () => {

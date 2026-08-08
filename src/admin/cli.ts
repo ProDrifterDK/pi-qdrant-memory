@@ -28,6 +28,8 @@ import { memoryStatus as readMemoryStatus, type MemoryStatus } from "./status.js
 const ADMIN_HOST_ENVIRONMENT = "PI_QDRANT_MEMORY_HOST";
 const PLAN_ID_PATTERN = /^[a-f0-9]{64}$/;
 const COLLECTION_PATTERN = /^[A-Za-z0-9_-]{1,255}$/;
+const RAW_CONTROL_PATTERN = /[\u0000-\u001f\u007f-\u009f]/u;
+const DISPLAY_REDACTED = "[redacted]";
 
 const TOP_LEVEL_HELP = `Usage: pi-qdrant-memory <command> [options]
 
@@ -274,7 +276,12 @@ function modelIdentifier(value: string): string {
 }
 
 function sourceUrl(value: string): string {
-  if (value.trim() !== value || value.length === 0 || containsSecret(value)) {
+  if (
+    value.trim() !== value ||
+    value.length === 0 ||
+    RAW_CONTROL_PATTERN.test(value) ||
+    containsSecret(value)
+  ) {
     throw new CliInputError();
   }
   let parsed: URL;
@@ -294,7 +301,9 @@ function sourceUrl(value: string): string {
   ) {
     throw new CliInputError();
   }
-  return value.replace(/\/+$/, "");
+  const normalized = parsed.href.replace(/\/+$/, "");
+  if (normalized.length === 0 || containsSecret(normalized)) throw new CliInputError();
+  return normalized;
 }
 
 function isSystemIoError(error: unknown): boolean {
@@ -317,12 +326,53 @@ async function configured(host: HostId, deps: CliDependencies): Promise<RuntimeC
   }
 }
 
+function escapeDisplayString(value: string): string {
+  let escaped = "";
+  for (const character of value) {
+    const code = character.codePointAt(0);
+    if (character === "\\") {
+      escaped += "\\\\";
+    } else if (
+      code !== undefined &&
+      ((code >= 0x00 && code <= 0x1f) || (code >= 0x7f && code <= 0x9f))
+    ) {
+      escaped += `\\u${code.toString(16).toUpperCase().padStart(4, "0")}`;
+    } else {
+      escaped += character;
+    }
+  }
+  return escaped;
+}
+
+function displayString(value: string): string {
+  return containsSecret(value) ? DISPLAY_REDACTED : escapeDisplayString(value);
+}
+
+function displayOptionalString(value: string | null): string | null {
+  return value === null ? null : displayString(value);
+}
+
+function displayCountRecord(counts: Record<string, number>): Record<string, number> {
+  return Object.fromEntries(
+    Object.entries(counts).map(([key, count]) => [escapeDisplayString(key), count]),
+  );
+}
+
+function safeInitialize(result: InitializeDestinationResult): Record<string, unknown> {
+  return {
+    created: result.created,
+    collection: displayString(result.collection),
+    dimension: result.dimension,
+    distance: displayString(result.distance),
+  };
+}
+
 function safeStatus(status: MemoryStatus): Record<string, unknown> {
   const collection = (value: MemoryStatus["destination"]): Record<string, unknown> => ({
-    collection: value.collection,
+    collection: displayString(value.collection),
     exists: value.exists,
     dimension: value.dimension,
-    distance: value.distance,
+    distance: displayOptionalString(value.distance),
     pointCount: value.pointCount,
     healthy: value.healthy,
     keyConfigured: value.keyConfigured,
@@ -332,7 +382,7 @@ function safeStatus(status: MemoryStatus): Record<string, unknown> {
     destination: collection(status.destination),
     source: collection(status.source),
     embeddings: {
-      model: status.embeddings.model,
+      model: displayString(status.embeddings.model),
       dimension: status.embeddings.dimension,
       healthy: status.embeddings.healthy,
       keyConfigured: status.embeddings.keyConfigured,
@@ -347,13 +397,18 @@ function safeStatus(status: MemoryStatus): Record<string, unknown> {
 
 function safePlan(plan: ImportPlan): Record<string, unknown> {
   return {
-    planId: plan.planId,
+    planId: displayString(plan.planId),
     transformVersion: plan.transformVersion,
-    targetHost: plan.targetHost,
-    sourceCollection: plan.sourceCollection,
-    destinationCollection: plan.destinationCollection,
-    rejected: plan.rejected,
-    report: plan.report,
+    targetHost: displayString(plan.targetHost),
+    sourceCollection: displayString(plan.sourceCollection),
+    destinationCollection: displayString(plan.destinationCollection),
+    rejected: displayCountRecord(plan.rejected),
+    report: {
+      accepted: plan.report.accepted,
+      rejected: plan.report.rejected,
+      bySourceType: displayCountRecord(plan.report.bySourceType),
+      byProjectLabel: displayCountRecord(plan.report.byProjectLabel),
+    },
   };
 }
 
@@ -381,6 +436,18 @@ function help(
 
 function requestedJson(args: readonly string[]): boolean {
   return args.some((value) => value === "--json");
+}
+
+function topLevelHelpRequest(args: readonly string[]): boolean {
+  let helpRequested = false;
+  for (const value of args) {
+    if (value === "--help" || value === "-h") {
+      helpRequested = true;
+    } else if (value !== "--json") {
+      return false;
+    }
+  }
+  return helpRequested;
 }
 
 function failure(
@@ -418,10 +485,16 @@ async function runSimple(
   const config = await configured(host, deps);
   if (command === "init") {
     const result = await deps.initialize(config);
-    output(deps, parsed.json, "init", { host, ...result });
+    output(deps, parsed.json, "init", {
+      host: displayString(host),
+      ...safeInitialize(result),
+    });
   } else {
     const result = await deps.status(config);
-    output(deps, parsed.json, "status", { host, ...safeStatus(result) });
+    output(deps, parsed.json, "status", {
+      host: displayString(host),
+      ...safeStatus(result),
+    });
   }
   return 0;
 }
@@ -484,10 +557,12 @@ async function runImport(
   );
   output(deps, parsed.json, "import-hermes", {
     mode: "apply",
-    targetHost: host,
-    sourceCollection: resolvedSourceCollection,
-    destinationCollection,
-    ...result,
+    targetHost: displayString(host),
+    sourceCollection: displayString(resolvedSourceCollection),
+    destinationCollection: displayString(destinationCollection),
+    planId: displayString(result.planId),
+    upserted: result.upserted,
+    batches: result.batches,
   });
   return 0;
 }
@@ -498,10 +573,7 @@ export async function main(
 ): Promise<number> {
   const json = requestedJson(args);
   try {
-    if (
-      args.length === 1 &&
-      (args[0] === "--help" || args[0] === "-h")
-    ) {
+    if (topLevelHelpRequest(args)) {
       help(deps, json, TOP_LEVEL_HELP);
       return 0;
     }
