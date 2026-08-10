@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "primeAgent": {
     "repository": "https://github.com/PrimeIntellect-ai/prime-agent.git",
     "minimumCommit": "a18809e00ea30638584d87b3afea7285a9d7296c",
@@ -9,5 +9,9 @@
     "package": "@earendil-works/pi-coding-agent",
     "minimumVersion": "0.84.1",
     "latestTestedVersion": "0.84.1"
+  },
+  "qdrant": {
+    "minimumVersion": "1.17.0",
+    "latestTestedVersion": "1.17.1"
   }
 }

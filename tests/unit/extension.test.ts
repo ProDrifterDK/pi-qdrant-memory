@@ -60,7 +60,7 @@ function user(text: string, timestamp = 1): AgentMessages[number] {
 
 function hostConfig(autoRecall = true) {
   return JSON.stringify({
-    embeddings: { dimension: 2 },
+    embeddings: { dimension: 1024 },
     retrieval: {
       topK: 5,
       candidatesPerLane: 2,
@@ -79,11 +79,12 @@ function runtimeFetch(host: "prime" | "pi") {
     const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
     calls.push({ url, body });
     if (url.endsWith("/healthz")) return new Response("ok");
-    if (url.endsWith("/collections/pi_memory")) {
-      return new Response(JSON.stringify({ result: { config: { params: { vectors: { size: 2, distance: "Cosine" } } } } }));
+    const collection = host === "pi" ? "pi_memory" : "prime_memory";
+    if (url.endsWith(`/collections/${collection}`)) {
+      return new Response(JSON.stringify({ result: { config: { params: { vectors: { size: 1024, distance: "Cosine" } } } } }));
     }
     if (url.endsWith("/embeddings")) {
-      return new Response(JSON.stringify({ data: [{ embedding: [0.1, 0.2] }] }));
+      return new Response(JSON.stringify({ data: [{ embedding: Array.from({ length: 1024 }, () => 0.1) }] }));
     }
     if (url.endsWith("/points/search")) {
       const isProject = body?.filter?.must?.some((condition: any) => condition.key === "project_id");

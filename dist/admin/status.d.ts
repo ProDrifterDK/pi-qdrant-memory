@@ -1,42 +1,45 @@
 import type { RuntimeConfig } from "../types.js";
-interface Dependencies {
-    fetchImpl?: typeof fetch;
-    signal?: AbortSignal;
-}
 export interface MemoryStatus {
-    destinationExists: boolean;
+    host: RuntimeConfig["host"];
+    configPath: string;
+    enabled: boolean;
+    autoRecall: boolean;
     destination: {
         endpoint: string;
         collection: string;
+        ownerHost: RuntimeConfig["host"];
+        schema: "pi-qdrant-memory-v2";
+        dimension: 1024;
+        distance: "Cosine";
         exists: boolean;
-        dimension: number | null;
-        distance: string | null;
-        pointCount: number | null;
-        healthy: boolean;
-        keyConfigured: boolean;
-    };
-    source: {
-        endpoint: string;
-        collection: string;
-        exists: boolean;
-        dimension: number | null;
-        distance: string | null;
-        pointCount: number | null;
         healthy: boolean;
         keyConfigured: boolean;
     };
     embeddings: {
         endpoint: string;
         model: string;
-        dimension: number;
+        dimension: 1024;
         healthy: boolean;
         keyConfigured: boolean;
+    };
+    capture: {
+        enabled: boolean;
+        episodeRetentionDays: RuntimeConfig["capture"]["episodeRetentionDays"];
+    };
+    privacy: {
+        egressMode: RuntimeConfig["privacy"]["egressMode"];
+        qdrantDestinations: number;
+        embeddingDestinations: number;
+        llmDestinations: number;
     };
     qdrant: {
         healthy: boolean;
         destinationHealthy: boolean;
-        sourceHealthy: boolean;
+        probed: false;
     };
 }
-export declare function memoryStatus(config: RuntimeConfig, deps?: Dependencies): Promise<MemoryStatus>;
-export {};
+export interface MemoryStatusDependencies {
+    signal?: AbortSignal;
+}
+/** Return the destination-only v2 status contract without touching services. */
+export declare function memoryStatus(config: RuntimeConfig, _deps?: MemoryStatusDependencies): Promise<MemoryStatus>;

@@ -1,4 +1,10 @@
 export type HostId = "prime" | "pi";
+export type RetentionDays = number | "indefinite";
+export interface AuthorizedDestination {
+    id: string;
+    residency: string;
+    dataUse: string;
+}
 export interface RetrievalConfig {
     topK: number;
     candidatesPerLane: number;
@@ -8,33 +14,85 @@ export interface RetrievalConfig {
     toolResultBudgetChars: number;
     hardContextCharBudget: 16000;
     timeoutMs: number;
+    rootScope: "project" | "project_and_global";
+    childSearch: boolean;
 }
 export interface RuntimeConfig {
     host: HostId;
+    configPath: string;
     enabled: boolean;
     autoRecall: boolean;
-    configPath: string;
     qdrant: {
         url: string;
         collection: string;
         apiKey?: string;
+        replicationFactor: number;
+        writeConsistencyFactor: number;
     };
     embeddings: {
         baseUrl: string;
         model: string;
-        dimension: number;
+        dimension: 1024;
         queryPrefix: string;
         apiKey?: string;
     };
     retrieval: RetrievalConfig;
-    admin: {
-        destinationApiKey?: string;
-        source: {
-            url: string;
-            collection: string;
-            schema: "hermes-qdrant-memory-v0.9-compatible";
-            apiKey?: string;
-        };
+    projects: {
+        registrations: Record<string, {
+            canonicalPath: string;
+            fingerprint: string;
+            alias: string;
+        }>;
+    };
+    capture: {
+        enabled: boolean;
+        projectAllowlist: string[];
+        projectDenylist: string[];
+        episodeRetentionDays: RetentionDays;
+        toolArgsChars: number;
+        toolResultChars: number;
+    };
+    privacy: {
+        egressMode: "local_only" | "allowlist";
+        allowedQdrantDestinations: AuthorizedDestination[];
+        allowedEmbeddingDestinations: AuthorizedDestination[];
+        allowedLlmDestinations: AuthorizedDestination[];
+        allowActiveModelFallback: boolean;
+        allowCrossProviderReplay: boolean;
+    };
+    coordination: {
+        maxClockSkewMs: number;
+        readConsistency: number | "majority" | "quorum" | "all";
+        leaseMs: number;
+        reconcileIntervalMs: number;
+    };
+    outbox: {
+        maxJobs: number;
+        maxBytes: number;
+        retryBaseMs: number;
+        retryMaxMs: number;
+        nodeId?: string;
+        sharedFilesystem: boolean;
+    };
+    curation: {
+        turnTrigger: number;
+        toolTrigger: number;
+        maxInputTokens: number;
+    };
+    memoryModel: {
+        modelId?: string;
+        timeoutMs: number;
+        maxOutputTokens: number;
+    };
+    raptor: {
+        rebuildEpisodeDelta: number;
+        maxLevels: number;
+        summaryInputTokens: number;
+        umapDimensions: number;
+        localNeighbors: number;
+        gmmMaxClusters: number;
+        membershipThreshold: number;
+        seed?: number;
     };
 }
 export interface ConfigLoadDependencies {

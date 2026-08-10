@@ -18,7 +18,7 @@ const hit: MemoryCandidate = {
   projectId: "project-id",
   projectLabel: "project",
   sourceType: "conversation",
-  sourceSystem: "hermes",
+  sourceSystem: "pi",
 };
 
 function config(overrides: Partial<RuntimeConfig["retrieval"]> = {}): RuntimeConfig {
@@ -27,31 +27,21 @@ function config(overrides: Partial<RuntimeConfig["retrieval"]> = {}): RuntimeCon
     enabled: true,
     autoRecall: true,
     configPath: "/safe/config.json",
-    qdrant: { url: "http://qdrant.test", collection: "pi_memory" },
-    embeddings: {
-      baseUrl: "http://embeddings.test/v1",
-      model: "bge-m3",
-      dimension: 3,
-      queryPrefix: "search_query: ",
-    },
+    qdrant: { url: "http://qdrant.test", collection: "prime_memory", replicationFactor: 1, writeConsistencyFactor: 1 },
+    embeddings: { baseUrl: "http://embeddings.test/v1", model: "bge-m3", dimension: 1024, queryPrefix: "search_query: " },
     retrieval: {
-      topK: 5,
-      candidatesPerLane: 20,
-      minScore: 0.35,
-      projectBoost: 0.05,
-      contextBudgetChars: 1200,
-      toolResultBudgetChars: 8000,
-      hardContextCharBudget: 16000,
-      timeoutMs: 2500,
-      ...overrides,
+      topK: 5, candidatesPerLane: 20, minScore: 0.35, projectBoost: 0.05,
+      contextBudgetChars: 1200, toolResultBudgetChars: 8000, hardContextCharBudget: 16000,
+      timeoutMs: 2500, rootScope: "project", childSearch: true, ...overrides,
     },
-    admin: {
-      source: {
-        url: "http://source.test",
-        collection: "hermes_memory",
-        schema: "hermes-qdrant-memory-v0.9-compatible",
-      },
-    },
+    projects: { registrations: {} },
+    capture: { enabled: false, projectAllowlist: [], projectDenylist: [], episodeRetentionDays: "indefinite", toolArgsChars: 2000, toolResultChars: 4000 },
+    privacy: { egressMode: "local_only", allowedQdrantDestinations: [], allowedEmbeddingDestinations: [], allowedLlmDestinations: [], allowActiveModelFallback: false, allowCrossProviderReplay: false },
+    coordination: { maxClockSkewMs: 300000, readConsistency: 1, leaseMs: 30000, reconcileIntervalMs: 900000 },
+    outbox: { maxJobs: 10000, maxBytes: 268435456, retryBaseMs: 500, retryMaxMs: 30000, sharedFilesystem: false },
+    curation: { turnTrigger: 10, toolTrigger: 15, maxInputTokens: 12000 },
+    memoryModel: { timeoutMs: 30000, maxOutputTokens: 2048 },
+    raptor: { rebuildEpisodeDelta: 64, maxLevels: 5, summaryInputTokens: 12000, umapDimensions: 10, localNeighbors: 10, gmmMaxClusters: 50, membershipThreshold: 0.1 },
   };
 }
 
@@ -268,8 +258,8 @@ describe("MemoryService recall lifecycle", () => {
 describe("MemoryService health", () => {
   it("uses a fixed non-sensitive probe and validates dimension and Cosine distance", async () => {
     const health = vi.fn(async () => undefined);
-    const collectionInfo = vi.fn(async () => ({ dimension: 3, distance: "cosine" }));
-    const embedQuery = vi.fn(async () => [0, 0, 0]);
+    const collectionInfo = vi.fn(async () => ({ dimension: 1024, distance: "cosine" }));
+    const embedQuery = vi.fn(async () => Array.from({ length: 1024 }, () => 0));
     const { service, warnings } = makeService({
       qdrant: { health, collectionInfo },
       embeddings: { embedQuery },

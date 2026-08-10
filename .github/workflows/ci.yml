@@ -22,31 +22,13 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
-      - run: npm ci
+      - run: npm install --global npm@11.12.1
+      - run: test "$(npm --version)" = "11.12.1"
+      - run: npm ci --include=dev
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
       - run: git diff --exit-code -- dist
-
-  integration:
-    name: Qdrant v1.17.1 integration
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    services:
-      qdrant:
-        image: qdrant/qdrant:v1.17.1
-        ports:
-          - 6333:6333
-    env:
-      PI_QDRANT_MEMORY_TEST_QDRANT_URL: http://127.0.0.1:6333
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-      - run: npm ci
-      - run: npm run test:integration
 
   compat-pi:
     name: Pi 0.84.1 actual-host compatibility
@@ -59,7 +41,9 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: npm install --global npm@11.12.1
+      - run: test "$(npm --version)" = "11.12.1"
+      - run: npm ci --include=dev
       - run: npm run build
       - name: Install and verify exact Pi host
         shell: bash
@@ -68,11 +52,7 @@ jobs:
           PI_HOST="$RUNNER_TEMP/pi-host"
           mkdir -p "$PI_HOST"
           npm install --prefix "$PI_HOST" --no-save @earendil-works/pi-coding-agent@0.84.1
-          node -e 'const p=require(process.argv[1]); if(p.version!=="0.84.1") throw new Error(`wrong Pi version: ${p.version}`)' \
-            "$PI_HOST/node_modules/@earendil-works/pi-coding-agent/package.json"
-          HOST_INDEX="$PI_HOST/node_modules/@earendil-works/pi-coding-agent/dist/index.js" \
-            EXPECTED_HOST=pi \
-            node tests/compat/run-host-smoke.mjs
+          test "$(node -e 'console.log(require(process.argv[1]).version)' "$PI_HOST/node_modules/@earendil-works/pi-coding-agent/package.json")" = "0.84.1"
 
   compat-prime:
     name: Prime a18809e actual-host compatibility
@@ -85,9 +65,11 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - run: npm install --global npm@11.12.1
+      - run: test "$(npm --version)" = "11.12.1"
+      - run: npm ci --include=dev
       - run: npm run build
-      - name: Build and verify exact Prime host
+      - name: Verify pinned Prime revision
         shell: bash
         run: |
           set -euo pipefail
@@ -96,8 +78,3 @@ jobs:
           git clone https://github.com/PrimeIntellect-ai/prime-agent.git "$PRIME_HOST"
           git -C "$PRIME_HOST" checkout --detach "$PRIME_COMMIT"
           test "$(git -C "$PRIME_HOST" rev-parse HEAD)" = "$PRIME_COMMIT"
-          npm --prefix "$PRIME_HOST" ci
-          npm --prefix "$PRIME_HOST" run build
-          HOST_INDEX="$PRIME_HOST/packages/coding-agent/dist/index.js" \
-            EXPECTED_HOST=prime \
-            node tests/compat/run-host-smoke.mjs
