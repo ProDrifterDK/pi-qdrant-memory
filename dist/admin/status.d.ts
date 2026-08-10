@@ -35,11 +35,12 @@ export interface MemoryStatus {
     qdrant: {
         healthy: boolean;
         destinationHealthy: boolean;
-        probed: false;
+        probed: boolean;
     };
 }
 export interface MemoryStatusDependencies {
     signal?: AbortSignal;
+    fetchImpl?: typeof fetch;
 }
-/** Return the destination-only v2 status contract without touching services. */
-export declare function memoryStatus(config: RuntimeConfig, _deps?: MemoryStatusDependencies): Promise<MemoryStatus>;
+/** Probe only the configured host collection with its collection-scoped key. */
+export declare function memoryStatus(config: RuntimeConfig, deps?: MemoryStatusDependencies): Promise<MemoryStatus>;

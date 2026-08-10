@@ -43,7 +43,12 @@ export function defaultCliDependencies(options = {}) {
     return {
         env,
         loadConfig: host => loadRuntimeConfig(host, configDependencies),
-        initialize: config => initializeDestination(config),
+        initialize: config => {
+            const adminKey = loadAdminProcessSecrets(env).destinationApiKey;
+            if (adminKey === undefined)
+                throw new Error("Human Qdrant admin key is required for CLI initialization");
+            return initializeDestination(config, { adminApiKey: adminKey });
+        },
         status: config => memoryStatus(config),
         writeStdout: options.writeStdout ?? ((value) => process.stdout.write(value)),
         writeStderr: options.writeStderr ?? ((value) => process.stderr.write(value)),
@@ -98,10 +103,6 @@ async function runCommand(command, args, deps) {
         return 0;
     }
     const host = explicitHost(deps.env);
-    if (command === "init" || command === "status" || command === "privacy" || command === "forget") {
-        // This credential is scoped to this human process and is never config input.
-        void loadAdminProcessSecrets(deps.env);
-    }
     const config = await configured(host, deps);
     if (command === "init") {
         const result = await deps.initialize(config);

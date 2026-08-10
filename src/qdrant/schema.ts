@@ -1,0 +1,92 @@
+import { canonicalStringify, deterministicUuid, sha256Hex } from "../domain/canonical.js";
+import { canonicalRecordHash, parseMemoryRecord, type ControlRecord } from "../domain/records.js";
+import type { HostId } from "../types.js";
+
+export const V2_COLLECTION_METADATA = {
+  schema: "pi-qdrant-memory-v2",
+  schema_revision: 1,
+  dense_vector: "semantic",
+  embedding_model: "bge-m3",
+  embedding_dimension: 1024,
+  distance: "Cosine",
+} as const;
+export const V2_CONTRACT_HASH = sha256Hex(canonicalStringify(V2_COLLECTION_METADATA));
+export type PayloadIndexSchema = "keyword" | "integer" | "datetime" | "text";
+export const REQUIRED_INDEXES = [
+  ["record_type", "keyword"], ["owner_host", "keyword"], ["project_id", "keyword"], ["project_identity_kind", "keyword"], ["scope", "keyword"], ["status", "keyword"], ["resolution", "keyword"], ["state_key", "keyword"], ["content_id", "keyword"], ["observation_id", "keyword"], ["session_id", "keyword"], ["turn_id", "keyword"], ["agent_role", "keyword"], ["generation_id", "keyword"], ["job_id", "keyword"], ["category", "keyword"], ["tool_name", "keyword"], ["error_fingerprint", "keyword"], ["secret_scan", "keyword"], ["event_at", "datetime"], ["effective_at", "datetime"], ["created_at", "datetime"], ["lease_expires_at", "datetime"], ["expires_at", "datetime"], ["privacy_epoch", "integer"], ["coordination_policy_epoch", "integer"], ["version", "integer"], ["level", "integer"], ["text", "text"],
+] as const satisfies readonly (readonly [string, PayloadIndexSchema])[];
+
+export const COLLECTION_METADATA_ID = deterministicUuid("pi-qdrant-memory-v2", "collection_metadata");
+export const COLLECTION_CONTROL_ID = deterministicUuid("pi-qdrant-memory-v2", "collection_control");
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+export type PointRecordType = "episode" | "curated_memory" | "curated_current" | "raptor_summary" | "collection_control" | "processing_policy" | "job" | "coverage" | "evidence_link" | "tombstone" | "collection_metadata";
+export function isPhysicalPointId(value: unknown): value is string { return typeof value === "string" && UUID.test(value); }
+/** Qdrant point IDs are UUIDs. Logical IDs remain in payload and are domain-mapped when needed. */
+export function physicalPointId(recordType: string, logicalId: string): string {
+  if (typeof recordType !== "string" || recordType.length === 0 || typeof logicalId !== "string" || logicalId.length === 0) throw new TypeError("Point identity is invalid");
+  return isPhysicalPointId(logicalId) ? logicalId : deterministicUuid("pi-qdrant-memory-v2:point", recordType, logicalId);
+}
+
+export interface CollectionMetadataPayload {
+  record_type: "collection_metadata";
+  owner_host: HostId;
+  schema: typeof V2_COLLECTION_METADATA.schema;
+  schema_revision: 1;
+  dense_vector: typeof V2_COLLECTION_METADATA.dense_vector;
+  embedding_model: typeof V2_COLLECTION_METADATA.embedding_model;
+  embedding_dimension: 1024;
+  distance: "Cosine";
+  contract_hash: string;
+  status: "active";
+  secret_scan: "passed";
+}
+export function collectionMetadataPayload(ownerHost: HostId, contractHash = V2_CONTRACT_HASH): CollectionMetadataPayload {
+  if (ownerHost !== "pi" && ownerHost !== "prime") throw new TypeError("Metadata owner host is invalid");
+  if (!/^[a-f0-9]{64}$/u.test(contractHash)) throw new TypeError("Metadata contract hash is invalid");
+  return { record_type: "collection_metadata", owner_host: ownerHost, schema: V2_COLLECTION_METADATA.schema, schema_revision: 1, dense_vector: "semantic", embedding_model: "bge-m3", embedding_dimension: 1024, distance: "Cosine", contract_hash: contractHash, status: "active", secret_scan: "passed" };
+}
+export function collectionMetadataPoint(ownerHost: HostId, contractHash = V2_CONTRACT_HASH): { id: string; payload: CollectionMetadataPayload } { return { id: COLLECTION_METADATA_ID, payload: collectionMetadataPayload(ownerHost, contractHash) }; }
+
+/** Control payload is intentionally point-only; no Qdrant collection metadata bag is used. */
+export function controlPayload(control: ControlRecord): Record<string, unknown> {
+  return { record_type: "collection_control", id: control.id, owner_host: control.ownerHost, schema_revision: control.schemaRevision, created_at: control.createdAt, privacy_epoch: control.privacyEpoch, processing_policy_id: control.processingPolicyId, expires_at: control.expiresAt, content_hash: control.contentHash, version: control.version, active_generation: control.activeGeneration, active_base_generation: control.activeBaseGeneration, coordination_policy_epoch: control.coordinationPolicyEpoch, coordination_policy_hash: control.coordinationPolicyHash, state: control.state, status: "active", secret_scan: "passed", scan_cursor: control.scanCursor, last_forget_barrier: control.lastForgetBarrier };
+}
+export function collectionControlPoint(control: ControlRecord): { id: string; payload: Record<string, unknown> } {
+  if (control.id !== COLLECTION_CONTROL_ID) throw new TypeError("Collection control ID is invalid");
+  return { id: COLLECTION_CONTROL_ID, payload: controlPayload(control) };
+}
+
+/** Strict bootstrap control validation shared by init, admin insertion and write helper. */
+export function bootstrapControlHash(control: ControlRecord): string {
+  const copy: Record<string, unknown> = { ...(control as unknown as Record<string, unknown>) };
+  delete copy.contentHash; delete copy.createdAt; delete copy.vector; delete copy.producerId; delete copy.nodeId;
+  return sha256Hex(canonicalStringify(copy));
+}
+export function assertBootstrapControl(control: ControlRecord, ownerHost: HostId): void {
+  try { parseMemoryRecord({ ...control, version: 1 }, { ownerHost }); } catch { throw new TypeError("Invalid version-0 bootstrap control"); }
+  if (control.id !== COLLECTION_CONTROL_ID || control.recordType !== "collection_control" || control.ownerHost !== ownerHost || control.schemaRevision !== 1 || control.version !== 0 || control.privacyEpoch !== 0 || control.activeGeneration !== null || control.activeBaseGeneration !== null || control.state !== "active" || control.scanCursor !== null || control.lastForgetBarrier !== null || control.expiresAt !== null || control.processingPolicyId.length === 0 || control.coordinationPolicyHash.length === 0 || !Number.isSafeInteger(control.coordinationPolicyEpoch) || control.coordinationPolicyEpoch < 0 || control.contentHash !== bootstrapControlHash(control)) throw new TypeError("Invalid version-0 bootstrap control");
+}
+function exactObject(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
+const CONTROL_PAYLOAD_KEYS = Object.keys(controlPayload({ ownerHost: "pi", schemaRevision: 1, createdAt: "1970-01-01T00:00:00.000Z", privacyEpoch: 0, processingPolicyId: "placeholder", expiresAt: null, recordType: "collection_control", id: COLLECTION_CONTROL_ID, version: 1, activeGeneration: null, activeBaseGeneration: null, coordinationPolicyEpoch: 0, coordinationPolicyHash: "placeholder", state: "active", scanCursor: null, lastForgetBarrier: null, contentHash: "placeholder" })).sort();
+function exactControlPayload(value: Record<string, unknown>): boolean { const keys = Object.keys(value).sort(); return keys.length === CONTROL_PAYLOAD_KEYS.length && keys.every((key, index) => key === CONTROL_PAYLOAD_KEYS[index]); }
+/** Convert and strictly validate a Qdrant control payload. Version 0 is accepted only through bootstrap validation. */
+export function controlRecordFromPayload(value: unknown, ownerHost: HostId): ControlRecord {
+  if (!exactObject(value) || !exactControlPayload(value) || value.record_type !== "collection_control" || value.id !== COLLECTION_CONTROL_ID || value.owner_host !== ownerHost || value.status !== "active" || value.secret_scan !== "passed") throw new TypeError("Invalid collection control payload");
+  const control = { ownerHost, schemaRevision: value.schema_revision, createdAt: value.created_at, privacyEpoch: value.privacy_epoch, processingPolicyId: value.processing_policy_id, expiresAt: value.expires_at, recordType: "collection_control" as const, id: COLLECTION_CONTROL_ID, version: value.version, activeGeneration: value.active_generation, activeBaseGeneration: value.active_base_generation, coordinationPolicyEpoch: value.coordination_policy_epoch, coordinationPolicyHash: value.coordination_policy_hash, state: value.state, scanCursor: value.scan_cursor, lastForgetBarrier: value.last_forget_barrier, contentHash: value.content_hash };
+  if (control.version === 0) { parseMemoryRecord({ ...control, version: 1 }, { ownerHost }); assertBootstrapControl(control as ControlRecord, ownerHost); return control as ControlRecord; }
+  parseMemoryRecord(control, { ownerHost }); if (control.contentHash !== canonicalRecordHash(control as ControlRecord)) throw new TypeError("Control payload canonical hash mismatch"); return control as ControlRecord;
+}
+export function isBootstrapControlPayload(value: unknown, control: ControlRecord, ownerHost: HostId): boolean {
+  if (!exactObject(value) || value.owner_host !== ownerHost) return false;
+  try { const expected = controlPayload(control); const keys = Object.keys(value).sort(); const expectedKeys = Object.keys(expected).sort();
+    return keys.length === expectedKeys.length && keys.every((key, index) => key === expectedKeys[index] && canonicalStringify(value[key]) === canonicalStringify((expected as unknown as Record<string, unknown>)[key])); } catch { return false; }
+}
+
+export function isValidBootstrapControlPayload(value: unknown, ownerHost: HostId): boolean { try { return controlRecordFromPayload(value, ownerHost).version === 0; } catch { return false; } }
+
+export function isCollectionMetadataPayload(value: unknown, ownerHost: HostId, contractHash = V2_CONTRACT_HASH): value is CollectionMetadataPayload {
+  if (!exactObject(value)) return false;
+  try { const expected = collectionMetadataPayload(ownerHost, contractHash); const keys = Object.keys(value).sort(); const expectedKeys = Object.keys(expected).sort();
+    return keys.length === expectedKeys.length && keys.every((key, index) => key === expectedKeys[index] && canonicalStringify(value[key]) === canonicalStringify((expected as unknown as Record<string, unknown>)[key])); } catch { return false; }
+}
+export function collectionVectors(): { semantic: { size: 1024; distance: "Cosine" } } { return { semantic: { size: 1024, distance: "Cosine" } }; }

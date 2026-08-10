@@ -18,7 +18,7 @@ export class MemoryClientError extends Error {
   }
 }
 
-interface FetchOptions {
+export interface FetchOptions {
   timeoutMs: number;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
