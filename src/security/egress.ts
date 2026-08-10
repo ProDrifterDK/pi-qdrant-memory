@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
-import type { AuthorizedDestination, RuntimeConfig } from "../types.js";
+import type { AuthorizedDestination, RedactedEgressMaterial, RuntimeConfig } from "../types.js";
+import type { RedactionResult } from "./redaction.js";
+import { redactAndScan } from "./redaction.js";
 import { canonicalStringify } from "../domain/canonical.js";
 
 export interface EgressDestination extends AuthorizedDestination {
@@ -7,10 +9,24 @@ export interface EgressDestination extends AuthorizedDestination {
   nodeId: string;
 }
 const NODE_ID = /^[A-Za-z0-9._-]{1,128}$/u;
-function validNode(nodeId: unknown): asserts nodeId is string { if (typeof nodeId !== "string" || !NODE_ID.test(nodeId) || nodeId === "local") throw new TypeError("A bounded pseudonymous node ID is required"); }
+function validNode(nodeId: unknown): asserts nodeId is string {
+  if (typeof nodeId !== "string" || !NODE_ID.test(nodeId) || nodeId === "local") throw new TypeError("A bounded pseudonymous node ID is required");
+  const checked = redactAndScan({ text: nodeId, maxChars: 128, homeDir: "/" });
+  if (checked.dropped || checked.secretScan !== "passed" || checked.redactionStatus !== "unchanged" || checked.text !== nodeId) throw new TypeError("A bounded pseudonymous node ID is required");
+}
+function scanDecodedPath(path: string): void {
+  let decoded: string;
+  try { decoded = decodeURIComponent(path); } catch { throw new TypeError("Endpoint path encoding is invalid"); }
+  const checked = redactAndScan({ text: decoded, maxChars: 4096, homeDir: "/" });
+  if (checked.dropped || checked.secretScan !== "passed" || checked.redactionStatus !== "unchanged" || checked.text !== decoded) throw new TypeError("Endpoint contains unsafe material");
+}
 function normalizeEndpoint(endpoint: string): string {
-  if (endpoint.startsWith("unix:")) { if (endpoint.length > 4096) throw new TypeError("Unix endpoint is unbounded"); return endpoint; }
+  if (typeof endpoint !== "string" || endpoint.length > 4096) throw new TypeError("Endpoint is unbounded");
+  const checked = redactAndScan({ text: endpoint, maxChars: 4096, homeDir: "/" });
+  if (checked.dropped || checked.secretScan !== "passed" || checked.redactionStatus !== "unchanged" || checked.text !== endpoint) throw new TypeError("Endpoint contains unsafe material");
+  if (endpoint.startsWith("unix:")) { scanDecodedPath(endpoint.slice("unix:".length)); return endpoint; }
   let url: URL; try { url = new URL(endpoint); } catch { throw new TypeError("Endpoint must be a URL"); }
+  scanDecodedPath(url.pathname);
   if (url.protocol !== "http:" && url.protocol !== "https:") throw new TypeError("Endpoint must use http(s)");
   if (url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") throw new TypeError("Endpoint must not contain credentials or query metadata");
   return `${url.protocol}//${url.hostname}${url.port === "" ? "" : `:${url.port}`}${url.pathname.replace(/\/+$/u, "")}`;
@@ -31,7 +47,23 @@ export function destinationForEndpoint(endpoint: string, nodeId: string, labels:
   validNode(nodeId); validLabels(labels); const normalized = normalizeEndpoint(endpoint); if (!isLoopback(normalized)) throw new Error("local_only egress requires a loopback or Unix-socket endpoint");
   return { id: localDestinationId(normalized, nodeId, labels), residency: labels.residency, dataUse: labels.dataUse, endpoint: normalized, nodeId };
 }
+export type EgressMaterialGate = RedactionResult;
+export interface EgressPayloadOptions { homeDir: string; maxChars: number }
 export interface EgressCheckOptions { nodeId?: string; residency?: string; dataUse?: string }
+function hasFinalShape(value: EgressMaterialGate | undefined): value is RedactedEgressMaterial {
+  return value !== undefined && typeof value.text === "string" && typeof value.contentHash === "string" && typeof value.redactionStatus === "string" && typeof value.secretScan === "string" && typeof value.dropped === "boolean" && value.text.length > 0 && value.dropped === false && value.redactionStatus !== "dropped" && value.secretScan === "passed";
+}
+function isCanonicalEgressMaterial(value: EgressMaterialGate | undefined, options: EgressPayloadOptions): value is RedactedEgressMaterial {
+  if (!hasFinalShape(value) || !Number.isSafeInteger(options.maxChars) || options.maxChars < 0 || typeof options.homeDir !== "string") return false;
+  const checked = redactAndScan({ text: value.text, maxChars: options.maxChars, homeDir: options.homeDir });
+  return checked.secretScan === "passed" && checked.dropped === false && checked.text === value.text && checked.contentHash === value.contentHash && (value.redactionStatus === "unchanged" || value.redactionStatus === "redacted");
+}
+export function isFinalEgressMaterial(value: EgressMaterialGate | undefined, options?: EgressPayloadOptions): value is RedactedEgressMaterial {
+  return options !== undefined && isCanonicalEgressMaterial(value, options);
+}
+export function assertFinalEgressMaterial(value: EgressMaterialGate, options: EgressPayloadOptions): asserts value is RedactedEgressMaterial {
+  if (!isCanonicalEgressMaterial(value, options)) throw new Error("Only final redacted material with a passed secret scan may egress");
+}
 export function isDestinationAllowed(mode: RuntimeConfig["privacy"]["egressMode"], destination: AuthorizedDestination | EgressDestination, allowlist: readonly AuthorizedDestination[], options: EgressCheckOptions = {}): boolean {
   if (mode === "local_only") {
     if (!("endpoint" in destination) || !("nodeId" in destination) || !isLoopback(destination.endpoint)) return false;
@@ -40,5 +72,8 @@ export function isDestinationAllowed(mode: RuntimeConfig["privacy"]["egressMode"
   }
   return allowlist.some((allowed) => allowed.id === destination.id && allowed.residency === destination.residency && allowed.dataUse === destination.dataUse);
 }
-export function canEgress(input: { mode: RuntimeConfig["privacy"]["egressMode"]; destination: AuthorizedDestination | EgressDestination; allowlist: readonly AuthorizedDestination[]; options?: EgressCheckOptions }): boolean { return isDestinationAllowed(input.mode, input.destination, input.allowlist, input.options); }
-export function assertEgressAllowed(input: Parameters<typeof canEgress>[0]): void { if (!canEgress(input)) throw new Error("Egress destination is not authorized by the processing policy"); }
+export function canEgress(input: { mode: RuntimeConfig["privacy"]["egressMode"]; destination: AuthorizedDestination | EgressDestination; allowlist: readonly AuthorizedDestination[]; options?: EgressCheckOptions; material: EgressMaterialGate; payload: EgressPayloadOptions }): boolean {
+  if (!isCanonicalEgressMaterial(input.material, input.payload)) return false;
+  return isDestinationAllowed(input.mode, input.destination, input.allowlist, input.options);
+}
+export function assertEgressAllowed(input: Parameters<typeof canEgress>[0]): void { if (!canEgress(input)) throw new Error("Egress destination or final payload is not authorized by the processing policy"); }

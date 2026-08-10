@@ -109,3 +109,13 @@ export interface ConfigLoadDependencies {
     xdgConfigHome?: string;
     readTextFile(path: string): Promise<string>;
 }
+/** Structural-redaction and final-scanner states shared by all egress lanes. */
+export type RedactionStatus = "unchanged" | "redacted" | "dropped";
+export type SecretScanStatus = "passed" | "rejected" | "error";
+export interface RedactedEgressMaterial {
+    readonly text: string;
+    readonly redactionStatus: Exclude<RedactionStatus, "dropped">;
+    readonly secretScan: "passed";
+    readonly dropped: false;
+    readonly contentHash: string;
+}

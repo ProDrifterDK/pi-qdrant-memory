@@ -47,5 +47,20 @@ describe("producer processing policy", () => {
     expect(() => destinationForEndpoint("http://127.0.0.1:6333")).toThrow(/node/i);
     expect(() => assertEgressAllowed({ mode: "allowlist", destination: local, allowlist: [] })).toThrow(/authorized/i);
   });
+  it("rejects encoded secret material in URL and Unix endpoint paths", () => {
+    expect(() => destinationForEndpoint("http://127.0.0.1:6333/%41%4b%49%41ABCDEFGHIJKLMNOP", "node-redacted")).toThrow();
+    expect(() => destinationForEndpoint("http://127.0.0.1:6333/%70assword=hunter2long", "node-redacted")).toThrow();
+    expect(() => destinationForEndpoint("unix:/tmp/%70assword=hunter2long", "node-redacted")).toThrow();
+    expect(() => destinationForEndpoint("http://127.0.0.1:6333/%ZZ", "node-redacted")).toThrow();
+    expect(destinationForEndpoint("http://127.0.0.1:6333/%63ollections", "node-redacted").endpoint).toContain("%63ollections");
+  });
+
+  it("rejects secret node IDs and endpoint path material before destination construction", () => {
+    const high = "opaque 0123456789abcdef0123456789abcdef0123456789abcdef";
+    for (const nodeId of ["sk-abcdefghijklmnopqrstuvwxyz123456", high]) expect(() => destinationForEndpoint("http://127.0.0.1:6333", nodeId)).toThrow(/node/i);
+    expect(() => destinationForEndpoint("http://127.0.0.1:6333/sk-abcdefghijklmnopqrstuvwxyz123456", "node-redacted")).toThrow();
+    expect(() => destinationForEndpoint(`http://127.0.0.1:6333/${high}`, "node-redacted")).toThrow();
+    expect(destinationForEndpoint("http://127.0.0.1:6333/collections", "node-redacted").nodeId).toBe("node-redacted");
+  });
   it("handles expiry conservatively", () => expect(isPolicyExpired(policy(), Date.parse("2026-08-20T00:00:00.000Z"))).toBe(true));
 });
