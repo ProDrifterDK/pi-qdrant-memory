@@ -5,6 +5,14 @@ export interface AuthorizedDestination {
     residency: string;
     dataUse: string;
 }
+export interface CollectionMetadataContract {
+    ownerHost: HostId;
+    schema: "pi-qdrant-memory-v2";
+    schemaRevision: 1;
+    dimension: number;
+    distance: "Cosine";
+    model: string;
+}
 export interface RetrievalConfig {
     topK: number;
     candidatesPerLane: number;

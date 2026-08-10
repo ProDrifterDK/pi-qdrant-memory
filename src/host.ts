@@ -1,4 +1,4 @@
-import type { HostId } from "./types.js";
+import type { CollectionMetadataContract, HostId } from "./types.js";
 
 export type HostDetectionResult =
   | { ok: true; host: HostId }
@@ -70,3 +70,19 @@ export function resolvePrimeRlmDepth(
   if (env.RLM_DEPTH !== undefined) return parseEnvironmentDepth(env.RLM_DEPTH);
   return 0;
 }
+
+
+/** Fail-closed compatibility hook used before a host accepts a destination. */
+export function validateCollectionMetadata(
+  expectedHost: HostId,
+  metadata: Partial<CollectionMetadataContract>,
+  expectedModel?: string,
+  expectedDimension = 1024,
+): asserts metadata is CollectionMetadataContract {
+  if (metadata.ownerHost !== expectedHost) throw new Error("Collection owner host mismatch");
+  if (metadata.schema !== "pi-qdrant-memory-v2" || metadata.schemaRevision !== 1) throw new Error("Collection schema mismatch");
+  if (metadata.dimension !== expectedDimension || metadata.distance !== "Cosine") throw new Error("Collection vector metadata mismatch");
+  if (expectedModel !== undefined && metadata.model !== expectedModel) throw new Error("Collection model mismatch");
+}
+
+export const assertCollectionMetadata = validateCollectionMetadata;

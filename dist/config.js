@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 const PREFIX = "PI_QDRANT_MEMORY_";
 const RETIRED_ENV_PREFIX = ["SOURCE", "_QDRANT_"].join("");
 const RETIRED_ADMIN_FIELD = ["admin", ".", "source"].join("");
@@ -231,6 +231,18 @@ function stringValue(name, raw, fallback) {
         throw new Error(`${name} must be a non-empty string`);
     return raw;
 }
+function boundedIdentifier(name, raw, fallback, max, pattern = /^[A-Za-z0-9._:/-]+$/u) {
+    const value = stringValue(name, raw, fallback);
+    if (value.length > max || !pattern.test(value) || /(?:api[-_]?key|access[-_]?token|authorization|bearer|credential|password|secret|token)/iu.test(value))
+        throw new Error(`${name} must be a bounded redacted identifier`);
+    return value;
+}
+function boundedText(name, raw, fallback, max) {
+    const value = stringValue(name, raw, fallback);
+    if (value.length > max || /(?:api[-_]?key|access[-_]?token|authorization|bearer|credential|password|secret|token)/iu.test(value))
+        throw new Error(`${name} must be bounded and redacted`);
+    return value;
+}
 function booleanValue(name, raw, fallback) {
     if (raw === undefined)
         return fallback;
@@ -263,10 +275,15 @@ function normalizeUrl(name, raw, fallback) {
     catch {
         throw new Error(`${name} must be a valid URL`);
     }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+        throw new Error(`${name} must use REST-safe http(s)`);
+    if (parsed.hostname.length === 0)
+        throw new Error(`${name} must include a hostname`);
     if (parsed.username !== "" || parsed.password !== "" || parsed.search !== "" || parsed.hash !== "") {
         throw new Error(`${name} must not include credentials or query metadata`);
     }
-    return value.replace(/\/+$/, "");
+    const pathname = parsed.pathname.replace(/\/+$/u, "");
+    return `${parsed.protocol}//${parsed.hostname}${parsed.port === "" ? "" : `:${parsed.port}`}${pathname}`;
 }
 function absentFile(error) {
     return isRecord(error) && error.code === "ENOENT";
@@ -289,8 +306,8 @@ function checkEnvironmentNames(env) {
 function listValue(name, raw, fallback) {
     if (raw === undefined)
         return [...fallback];
-    if (!Array.isArray(raw) || raw.some(value => typeof value !== "string" || value.length === 0)) {
-        throw new Error(`${name} must be an array of non-empty strings`);
+    if (!Array.isArray(raw) || raw.some(value => typeof value !== "string" || value.length === 0 || value.length > 256 || /(?:api[-_]?key|token|secret|password)/iu.test(value))) {
+        throw new Error(`${name} must be an array of bounded non-secret strings`);
     }
     return [...raw];
 }
@@ -299,14 +316,20 @@ function destinations(name, raw, fallback) {
         return [...fallback];
     if (!Array.isArray(raw))
         throw new Error(`${name} must be an array`);
+    const seen = new Set();
     return raw.map((value, index) => {
         if (!isRecord(value))
             throw new Error(`${name}[${index}] must be an object`);
-        return {
-            id: stringValue(`${name}[${index}].id`, value.id, ""),
-            residency: stringValue(`${name}[${index}].residency`, value.residency, ""),
-            dataUse: stringValue(`${name}[${index}].dataUse`, value.dataUse, ""),
+        const destination = {
+            id: boundedIdentifier(`${name}[${index}].id`, value.id, "", 256),
+            residency: boundedIdentifier(`${name}[${index}].residency`, value.residency, "", 128, /^[A-Za-z0-9._:/ -]+$/u),
+            dataUse: boundedIdentifier(`${name}[${index}].dataUse`, value.dataUse, "", 128, /^[A-Za-z0-9._:/ -]+$/u),
         };
+        const key = JSON.stringify(destination);
+        if (seen.has(key))
+            throw new Error(`${name} contains a duplicate destination`);
+        seen.add(key);
+        return destination;
     });
 }
 function retention(name, raw, fallback) {
@@ -322,6 +345,54 @@ function consistency(name, raw, fallback) {
     if (raw === "majority" || raw === "quorum" || raw === "all")
         return raw;
     return boundedInteger(name, raw, 1, 7);
+}
+function explicitProperty(record, key) {
+    return Object.prototype.hasOwnProperty.call(record, key);
+}
+function resolvedConfiguredQdrantSections(file) {
+    const shared = isRecord(file.qdrant) ? file.qdrant : undefined;
+    const result = [];
+    if (shared !== undefined) {
+        if (shared.collection !== undefined)
+            result.push({
+                name: "shared.qdrant",
+                url: normalizeUrl("shared.qdrant.url", shared.url, "http://127.0.0.1:6333"),
+                collection: stringValue("shared.qdrant.collection", shared.collection, ""),
+            });
+    }
+    for (const host of ["pi", "prime"]) {
+        const hostValue = file[host];
+        if (!isRecord(hostValue) || !isRecord(hostValue.qdrant))
+            continue;
+        const hostQdrant = hostValue.qdrant;
+        const defaultCollection = host === "pi" ? "pi_memory" : "prime_memory";
+        result.push({
+            name: `${host}.qdrant`,
+            url: normalizeUrl(`${host}.qdrant.url`, hostQdrant.url ?? shared?.url, "http://127.0.0.1:6333"),
+            collection: stringValue(`${host}.qdrant.collection`, hostQdrant.collection ?? shared?.collection, defaultCollection),
+        });
+    }
+    return result;
+}
+function rejectDuplicateConfiguredDestinations(file) {
+    const seen = new Map();
+    for (const item of resolvedConfiguredQdrantSections(file)) {
+        const key = `${item.url}\0${item.collection}`;
+        const previous = seen.get(key);
+        if (previous !== undefined)
+            throw new Error(`Qdrant endpoint/collection is configured by both ${previous} and ${item.name}`);
+        seen.set(key, item.name);
+    }
+}
+function effectiveQdrantForHost(file, host) {
+    const shared = section(file, "qdrant", "qdrant configuration");
+    const hostSection = section(section(file, host, `${host} configuration`), "qdrant", `${host}.qdrant configuration`);
+    const defaults = defaultConfig(host);
+    const url = normalizeUrl(`${host}.qdrant.url`, hostSection.url ?? shared.url ?? defaults.qdrant.url, defaults.qdrant.url);
+    const collection = boundedIdentifier(`${host}.qdrant.collection`, hostSection.collection ?? shared.collection ?? defaults.qdrant.collection, defaults.qdrant.collection, 256);
+    const hostRoot = section(file, host, `${host} configuration`);
+    const enabled = booleanValue(`${host}.enabled`, hostRoot.enabled, booleanValue("enabled", file.enabled, true));
+    return { url, collection, enabled };
 }
 export function configPath(deps) {
     const configHome = deps.xdgConfigHome !== undefined && deps.xdgConfigHome !== ""
@@ -339,6 +410,7 @@ export async function loadConfig(host, deps) {
             throw new Error("Configuration root must be a JSON object");
         inspectFile(parsed);
         validateFileShape(parsed);
+        rejectDuplicateConfiguredDestinations(parsed);
         file = parsed;
     }
     catch (error) {
@@ -359,6 +431,15 @@ export async function loadConfig(host, deps) {
     const memoryModel = mergeRecords(defaults.memoryModel, section(file, "memoryModel", "memoryModel configuration"), section(hostOverrides, "memoryModel", `${host}.memoryModel configuration`));
     const raptor = mergeRecords(defaults.raptor, section(file, "raptor", "raptor configuration"), section(hostOverrides, "raptor", `${host}.raptor configuration`));
     const autoRecallRaw = deps.env[`${PREFIX}AUTO_RECALL`];
+    const sharedCapture = section(file, "capture", "capture configuration");
+    const hostCapture = section(hostOverrides, "capture", `${host}.capture configuration`);
+    const captureRetentionExplicit = explicitProperty(sharedCapture, "episodeRetentionDays") || explicitProperty(hostCapture, "episodeRetentionDays");
+    const sharedPrivacy = section(file, "privacy", "privacy configuration");
+    const hostPrivacy = section(hostOverrides, "privacy", `${host}.privacy configuration`);
+    const captureEgressExplicit = explicitProperty(sharedPrivacy, "egressMode") || explicitProperty(hostPrivacy, "egressMode");
+    const sharedCoordination = section(file, "coordination", "coordination configuration");
+    const hostCoordination = section(hostOverrides, "coordination", `${host}.coordination configuration`);
+    const readConsistencyExplicit = explicitProperty(sharedCoordination, "readConsistency") || explicitProperty(hostCoordination, "readConsistency");
     const sharedEnabled = file.enabled;
     const sharedAutoRecall = file.autoRecall;
     const result = {
@@ -370,20 +451,20 @@ export async function loadConfig(host, deps) {
             : environmentBoolean(`${PREFIX}AUTO_RECALL`, autoRecallRaw, defaults.autoRecall),
         qdrant: {
             url: normalizeUrl(`${PREFIX}QDRANT_URL`, environmentRaw(deps.env, "QDRANT_URL", qdrant.url), defaults.qdrant.url),
-            collection: stringValue(`${PREFIX}QDRANT_COLLECTION`, environmentRaw(deps.env, "QDRANT_COLLECTION", qdrant.collection), defaults.qdrant.collection),
+            collection: boundedIdentifier(`${PREFIX}QDRANT_COLLECTION`, environmentRaw(deps.env, "QDRANT_COLLECTION", qdrant.collection), defaults.qdrant.collection, 256),
             replicationFactor: boundedInteger("qdrant.replicationFactor", qdrant.replicationFactor, 1, 7),
             writeConsistencyFactor: boundedInteger("qdrant.writeConsistencyFactor", qdrant.writeConsistencyFactor, 1, 7),
         },
         embeddings: {
             baseUrl: normalizeUrl(`${PREFIX}EMBEDDING_BASE_URL`, environmentRaw(deps.env, "EMBEDDING_BASE_URL", embeddings.baseUrl), defaults.embeddings.baseUrl),
-            model: stringValue(`${PREFIX}EMBEDDING_MODEL`, environmentRaw(deps.env, "EMBEDDING_MODEL", embeddings.model), defaults.embeddings.model),
+            model: boundedIdentifier(`${PREFIX}EMBEDDING_MODEL`, environmentRaw(deps.env, "EMBEDDING_MODEL", embeddings.model), defaults.embeddings.model, 256),
             dimension: (() => {
                 const value = boundedInteger(`${PREFIX}EMBEDDING_DIMENSION`, environmentRaw(deps.env, "EMBEDDING_DIMENSION", embeddings.dimension), 1, 65536);
                 if (value !== 1024)
                     throw new Error("embeddings.dimension must be 1024");
                 return 1024;
             })(),
-            queryPrefix: stringValue("embeddings.queryPrefix", embeddings.queryPrefix, defaults.embeddings.queryPrefix),
+            queryPrefix: boundedText("embeddings.queryPrefix", embeddings.queryPrefix, defaults.embeddings.queryPrefix, 256),
         },
         retrieval: {
             topK: boundedInteger(`${PREFIX}TOP_K`, environmentRaw(deps.env, "TOP_K", retrieval.topK), 1, 10),
@@ -401,11 +482,14 @@ export async function loadConfig(host, deps) {
             registrations: isRecord(projects.registrations) ? Object.fromEntries(Object.entries(projects.registrations).map(([key, value]) => {
                 if (!isRecord(value))
                     throw new Error(`projects.registrations.${key} must be an object`);
-                return [key, {
-                        canonicalPath: stringValue(`projects.registrations.${key}.canonicalPath`, value.canonicalPath, ""),
-                        fingerprint: stringValue(`projects.registrations.${key}.fingerprint`, value.fingerprint, ""),
-                        alias: stringValue(`projects.registrations.${key}.alias`, value.alias, ""),
-                    }];
+                const canonicalPath = stringValue(`projects.registrations.${key}.canonicalPath`, value.canonicalPath, "");
+                const fingerprint = stringValue(`projects.registrations.${key}.fingerprint`, value.fingerprint, "");
+                const alias = stringValue(`projects.registrations.${key}.alias`, value.alias, "");
+                if (!isAbsolute(canonicalPath) || canonicalPath.length > 4096)
+                    throw new Error(`projects.registrations.${key}.canonicalPath must be an absolute bounded path`);
+                if (fingerprint.length > 512 || /(?:api[-_]?key|token|secret|password)/iu.test(fingerprint) || alias.length > 256 || /(?:api[-_]?key|token|secret|password)/iu.test(alias) || alias !== key || !/^[A-Za-z0-9._-]+$/u.test(alias))
+                    throw new Error(`projects.registrations.${key} contains a secret, overlap, or unbounded identity`);
+                return [key, { canonicalPath, fingerprint, alias }];
             })) : (() => { throw new Error("projects.registrations must be an object"); })(),
         },
         capture: {
@@ -426,7 +510,18 @@ export async function loadConfig(host, deps) {
         },
         coordination: {
             maxClockSkewMs: boundedInteger("coordination.maxClockSkewMs", coordination.maxClockSkewMs, 0, 3600000),
-            readConsistency: consistency("coordination.readConsistency", coordination.readConsistency, 1),
+            readConsistency: (() => {
+                const replication = boundedInteger("qdrant.replicationFactor", qdrant.replicationFactor, 1, 7);
+                const configured = consistency("coordination.readConsistency", coordination.readConsistency, 1);
+                if (replication > 1 && configured === 1) {
+                    if (readConsistencyExplicit)
+                        throw new Error("coordination.readConsistency must be at least majority");
+                    return "majority";
+                }
+                if (replication > 1 && typeof configured === "number" && configured < Math.ceil((replication + 1) / 2))
+                    throw new Error("coordination.readConsistency must be at least majority");
+                return configured;
+            })(),
             leaseMs: boundedInteger("coordination.leaseMs", coordination.leaseMs, 5000, 300000),
             reconcileIntervalMs: boundedInteger("coordination.reconcileIntervalMs", coordination.reconcileIntervalMs, 60000, 86400000),
         },
@@ -435,7 +530,7 @@ export async function loadConfig(host, deps) {
             maxBytes: boundedInteger("outbox.maxBytes", outbox.maxBytes, 1048576, 1073741824),
             retryBaseMs: boundedInteger("outbox.retryBaseMs", outbox.retryBaseMs, 100, 10000),
             retryMaxMs: boundedInteger("outbox.retryMaxMs", outbox.retryMaxMs, 1000, 300000),
-            ...(outbox.nodeId === undefined ? {} : { nodeId: stringValue("outbox.nodeId", outbox.nodeId, "") }),
+            ...(outbox.nodeId === undefined ? {} : { nodeId: boundedIdentifier("outbox.nodeId", outbox.nodeId, "", 256) }),
             sharedFilesystem: booleanValue("outbox.sharedFilesystem", outbox.sharedFilesystem, false),
         },
         curation: {
@@ -444,7 +539,7 @@ export async function loadConfig(host, deps) {
             maxInputTokens: boundedInteger("curation.maxInputTokens", curation.maxInputTokens, 512, 65536),
         },
         memoryModel: {
-            ...(memoryModel.modelId === undefined ? {} : { modelId: stringValue("memoryModel.modelId", memoryModel.modelId, "") }),
+            ...(memoryModel.modelId === undefined ? {} : { modelId: boundedIdentifier("memoryModel.modelId", memoryModel.modelId, "", 256) }),
             timeoutMs: boundedInteger("memoryModel.timeoutMs", memoryModel.timeoutMs, 1000, 120000),
             maxOutputTokens: boundedInteger("memoryModel.maxOutputTokens", memoryModel.maxOutputTokens, 128, 8192),
         },
@@ -459,6 +554,32 @@ export async function loadConfig(host, deps) {
             ...(raptor.seed === undefined ? {} : { seed: boundedInteger("raptor.seed", raptor.seed, 0, 4294967295) }),
         },
     };
+    const registrations = Object.values(result.projects.registrations);
+    for (let index = 0; index < registrations.length; index += 1)
+        for (let other = index + 1; other < registrations.length; other += 1) {
+            const left = registrations[index].canonicalPath.replace(/\/+$/u, "");
+            const right = registrations[other].canonicalPath.replace(/\/+$/u, "");
+            if (left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`))
+                throw new Error("Project registration path overlap is ambiguous");
+        }
+    if (result.capture.enabled && !captureRetentionExplicit)
+        throw new Error("capture.episodeRetentionDays must be explicitly selected before capture is enabled");
+    if (result.capture.enabled && !captureEgressExplicit)
+        throw new Error("privacy.egressMode must be explicitly selected before capture is enabled");
+    const effectivePi = effectiveQdrantForHost(file, "pi");
+    const effectivePrime = effectiveQdrantForHost(file, "prime");
+    const activePi = host === "pi" ? { ...effectivePi, url: result.qdrant.url, collection: result.qdrant.collection } : effectivePi;
+    const activePrime = host === "prime" ? { ...effectivePrime, url: result.qdrant.url, collection: result.qdrant.collection } : effectivePrime;
+    if (activePi.enabled && activePrime.enabled && activePi.url === activePrime.url && activePi.collection === activePrime.collection)
+        throw new Error("Effective Pi and Prime endpoint/collection collision");
+    if (result.outbox.retryBaseMs > result.outbox.retryMaxMs)
+        throw new Error("outbox.retryBaseMs must not exceed retryMaxMs");
+    if (result.qdrant.replicationFactor > 1 && result.qdrant.writeConsistencyFactor < Math.ceil((result.qdrant.replicationFactor + 1) / 2))
+        throw new Error("qdrant.writeConsistencyFactor must satisfy replication majority");
+    if (result.outbox.sharedFilesystem && result.outbox.nodeId === undefined)
+        throw new Error("outbox.nodeId is required for a shared filesystem");
+    if (result.privacy.egressMode === "allowlist" && (result.privacy.allowedQdrantDestinations.length === 0 || result.privacy.allowedEmbeddingDestinations.length === 0))
+        throw new Error("allowlist egress requires explicit Qdrant and embedding destinations");
     const qdrantApiKey = environmentSecret(deps.env, "QDRANT_API_KEY");
     const embeddingApiKey = environmentSecret(deps.env, "EMBEDDING_API_KEY");
     if (qdrantApiKey !== undefined)

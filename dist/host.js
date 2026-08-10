@@ -56,4 +56,16 @@ export function resolvePrimeRlmDepth(header, env) {
         return parseEnvironmentDepth(env.RLM_DEPTH);
     return 0;
 }
+/** Fail-closed compatibility hook used before a host accepts a destination. */
+export function validateCollectionMetadata(expectedHost, metadata, expectedModel, expectedDimension = 1024) {
+    if (metadata.ownerHost !== expectedHost)
+        throw new Error("Collection owner host mismatch");
+    if (metadata.schema !== "pi-qdrant-memory-v2" || metadata.schemaRevision !== 1)
+        throw new Error("Collection schema mismatch");
+    if (metadata.dimension !== expectedDimension || metadata.distance !== "Cosine")
+        throw new Error("Collection vector metadata mismatch");
+    if (expectedModel !== undefined && metadata.model !== expectedModel)
+        throw new Error("Collection model mismatch");
+}
+export const assertCollectionMetadata = validateCollectionMetadata;
 //# sourceMappingURL=host.js.map
