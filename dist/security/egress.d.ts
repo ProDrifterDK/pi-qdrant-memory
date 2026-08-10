@@ -4,6 +4,9 @@ export interface EgressDestination extends AuthorizedDestination {
     endpoint: string;
     nodeId: string;
 }
+export declare function assertPseudonymousNodeId(nodeId: unknown, options?: {
+    allowDerivedDigest?: boolean;
+}): asserts nodeId is string;
 export declare function localDestinationId(endpoint: string, nodeId: string, labels?: Pick<AuthorizedDestination, "residency" | "dataUse">): string;
 export declare function destinationForEndpoint(endpoint: string, nodeId: string, labels?: Pick<AuthorizedDestination, "residency" | "dataUse">): EgressDestination;
 export type EgressMaterialGate = RedactionResult;

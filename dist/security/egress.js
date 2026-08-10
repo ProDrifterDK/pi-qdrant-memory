@@ -1,14 +1,19 @@
 import { createHash } from "node:crypto";
 import { redactAndScan } from "./redaction.js";
 import { canonicalStringify } from "../domain/canonical.js";
-const NODE_ID = /^[A-Za-z0-9._-]{1,128}$/u;
-function validNode(nodeId) {
-    if (typeof nodeId !== "string" || !NODE_ID.test(nodeId) || nodeId === "local")
+const NODE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+export function assertPseudonymousNodeId(nodeId, options = {}) {
+    if (typeof nodeId !== "string" || !NODE_ID.test(nodeId) || nodeId === "local" || nodeId === "." || nodeId === "..")
         throw new TypeError("A bounded pseudonymous node ID is required");
+    // Only a caller that actually performed machine-id + installation-salt
+    // derivation may opt into the fixed one-way digest representation.
+    if (options.allowDerivedDigest === true && /^node-[a-f0-9]{32}$/u.test(nodeId))
+        return;
     const checked = redactAndScan({ text: nodeId, maxChars: 128, homeDir: "/" });
     if (checked.dropped || checked.secretScan !== "passed" || checked.redactionStatus !== "unchanged" || checked.text !== nodeId)
         throw new TypeError("A bounded pseudonymous node ID is required");
 }
+function validNode(nodeId) { assertPseudonymousNodeId(nodeId, { allowDerivedDigest: true }); }
 function scanDecodedPath(path) {
     let decoded;
     try {

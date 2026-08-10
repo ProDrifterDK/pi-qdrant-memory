@@ -1,5 +1,6 @@
 import { isAbsolute, join } from "node:path";
 import type { ConfigLoadDependencies, HostId, RuntimeConfig } from "./types.js";
+import { assertPseudonymousNodeId } from "./security/egress.js";
 
 const PREFIX = "PI_QDRANT_MEMORY_";
 const RETIRED_ENV_PREFIX = ["SOURCE", "_QDRANT_"].join("");
@@ -238,6 +239,13 @@ function boundedIdentifier(name: string, raw: unknown, fallback: string, max: nu
   return value;
 }
 
+function outboxNodeId(raw: unknown): string {
+  const value = stringValue("outbox.nodeId", raw, "");
+  try { assertPseudonymousNodeId(value); }
+  catch { throw new Error("outbox.nodeId must be a bounded pseudonymous path component"); }
+  return value;
+}
+
 function boundedText(name: string, raw: unknown, fallback: string, max: number): string {
   const value = stringValue(name, raw, fallback);
   if (value.length > max || /(?:api[-_]?key|access[-_]?token|authorization|bearer|credential|password|secret|token)/iu.test(value)) throw new Error(`${name} must be bounded and redacted`);
@@ -414,7 +422,7 @@ export async function loadConfig(host: HostId, deps: ConfigLoadDependencies): Pr
   const capture = mergeRecords(defaults.capture, section(file, "capture", "capture configuration"), section(hostOverrides, "capture", `${host}.capture configuration`));
   const privacy = mergeRecords(defaults.privacy, section(file, "privacy", "privacy configuration"), section(hostOverrides, "privacy", `${host}.privacy configuration`));
   const coordination = mergeRecords(defaults.coordination, section(file, "coordination", "coordination configuration"), section(hostOverrides, "coordination", `${host}.coordination configuration`));
-  const outbox = mergeRecords(defaults.outbox, section(file, "outbox", "outbox configuration"), section(hostOverrides, "outbox", `${host}.outbox configuration`));
+  const outbox = mergeRecords(defaults.outbox as unknown as JsonRecord, section(file, "outbox", "outbox configuration"), section(hostOverrides, "outbox", `${host}.outbox configuration`));
   const curation = mergeRecords(defaults.curation, section(file, "curation", "curation configuration"), section(hostOverrides, "curation", `${host}.curation configuration`));
   const memoryModel = mergeRecords(defaults.memoryModel, section(file, "memoryModel", "memoryModel configuration"), section(hostOverrides, "memoryModel", `${host}.memoryModel configuration`));
   const raptor = mergeRecords(defaults.raptor, section(file, "raptor", "raptor configuration"), section(hostOverrides, "raptor", `${host}.raptor configuration`));
@@ -513,7 +521,7 @@ export async function loadConfig(host: HostId, deps: ConfigLoadDependencies): Pr
       maxBytes: boundedInteger("outbox.maxBytes", outbox.maxBytes, 1048576, 1073741824),
       retryBaseMs: boundedInteger("outbox.retryBaseMs", outbox.retryBaseMs, 100, 10000),
       retryMaxMs: boundedInteger("outbox.retryMaxMs", outbox.retryMaxMs, 1000, 300000),
-      ...(outbox.nodeId === undefined ? {} : { nodeId: boundedIdentifier("outbox.nodeId", outbox.nodeId, "", 256) }),
+      ...(outbox.nodeId === undefined ? {} : { nodeId: outboxNodeId(outbox.nodeId) }),
       sharedFilesystem: booleanValue("outbox.sharedFilesystem", outbox.sharedFilesystem, false),
     },
     curation: {

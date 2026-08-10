@@ -1,4 +1,5 @@
 import { isAbsolute, join } from "node:path";
+import { assertPseudonymousNodeId } from "./security/egress.js";
 const PREFIX = "PI_QDRANT_MEMORY_";
 const RETIRED_ENV_PREFIX = ["SOURCE", "_QDRANT_"].join("");
 const RETIRED_ADMIN_FIELD = ["admin", ".", "source"].join("");
@@ -235,6 +236,16 @@ function boundedIdentifier(name, raw, fallback, max, pattern = /^[A-Za-z0-9._:/-
     const value = stringValue(name, raw, fallback);
     if (value.length > max || !pattern.test(value) || /(?:api[-_]?key|access[-_]?token|authorization|bearer|credential|password|secret|token)/iu.test(value))
         throw new Error(`${name} must be a bounded redacted identifier`);
+    return value;
+}
+function outboxNodeId(raw) {
+    const value = stringValue("outbox.nodeId", raw, "");
+    try {
+        assertPseudonymousNodeId(value);
+    }
+    catch {
+        throw new Error("outbox.nodeId must be a bounded pseudonymous path component");
+    }
     return value;
 }
 function boundedText(name, raw, fallback, max) {
@@ -530,7 +541,7 @@ export async function loadConfig(host, deps) {
             maxBytes: boundedInteger("outbox.maxBytes", outbox.maxBytes, 1048576, 1073741824),
             retryBaseMs: boundedInteger("outbox.retryBaseMs", outbox.retryBaseMs, 100, 10000),
             retryMaxMs: boundedInteger("outbox.retryMaxMs", outbox.retryMaxMs, 1000, 300000),
-            ...(outbox.nodeId === undefined ? {} : { nodeId: boundedIdentifier("outbox.nodeId", outbox.nodeId, "", 256) }),
+            ...(outbox.nodeId === undefined ? {} : { nodeId: outboxNodeId(outbox.nodeId) }),
             sharedFilesystem: booleanValue("outbox.sharedFilesystem", outbox.sharedFilesystem, false),
         },
         curation: {

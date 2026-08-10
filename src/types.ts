@@ -16,6 +16,15 @@ export interface CollectionMetadataContract {
   model: string;
 }
 
+export interface OutboxConfig {
+  maxJobs: number;
+  maxBytes: number;
+  retryBaseMs: number;
+  retryMaxMs: number;
+  nodeId?: string;
+  sharedFilesystem: boolean;
+}
+
 export interface RetrievalConfig {
   topK: number;
   candidatesPerLane: number;
@@ -74,14 +83,7 @@ export interface RuntimeConfig {
     leaseMs: number;
     reconcileIntervalMs: number;
   };
-  outbox: {
-    maxJobs: number;
-    maxBytes: number;
-    retryBaseMs: number;
-    retryMaxMs: number;
-    nodeId?: string;
-    sharedFilesystem: boolean;
-  };
+  outbox: OutboxConfig;
   curation: {
     turnTrigger: number;
     toolTrigger: number;
