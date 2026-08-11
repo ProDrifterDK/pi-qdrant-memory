@@ -4,6 +4,9 @@ import type { HostId } from "../types.js";
 type JsonRecord = Record<string, unknown>;
 type Consistency = number | "majority" | "quorum" | "all";
 export type PointId = string;
+export type HostScopedQdrantCollection = "pi_memory" | "prime_memory";
+/** The only collection an owner may write or read through this client family. */
+export declare function expectedQdrantCollection(ownerHost: HostId): HostScopedQdrantCollection;
 export interface QdrantClientOptions {
     baseUrl: string;
     collection: string;
@@ -80,7 +83,9 @@ export interface ControlUpdatePrecondition {
     expectedBaseGeneration?: string | null;
 }
 export interface QdrantReadClient {
+    readonly endpoint: string;
     readonly ownerHost: HostId;
+    readonly collection: HostScopedQdrantCollection;
     readonly maxClockSkewMs: number;
     health(): Promise<unknown>;
     collectionInfo(): Promise<QdrantCollectionInfo>;
@@ -115,7 +120,9 @@ export declare function readPolicy(input: {
     processingPolicyId?: string;
 }): QdrantReadPolicy;
 declare class RestQdrantReadClient implements QdrantReadClient {
+    readonly endpoint: string;
     readonly ownerHost: HostId;
+    readonly collection: HostScopedQdrantCollection;
     readonly maxClockSkewMs: number;
     protected readonly options: QdrantClientOptions;
     constructor(options: QdrantClientOptions);

@@ -7,10 +7,27 @@ const MAX_ID_CHARS = 512;
 const MAX_ARRAY = 1024;
 const SECRET_ID = /(api[-_]?key|access[-_]?token|auth(?:orization|entication)?|bearer|credential|password|secret|token)/iu;
 const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
+/**
+ * The sole semantic projection that crosses Task 7 document egress.  It is
+ * deterministic, scanner-safe by construction, and never includes the
+ * high-entropy error fingerprint itself (only its safe presence marker).
+ */
+export function episodeSemanticProjection(episode) {
+    const parts = [`event:${episode.eventKind}`];
+    if (episode.toolName !== undefined)
+        parts.push(`tool:${episode.toolName}`);
+    if (episode.text !== undefined)
+        parts.push(`text:${episode.text}`);
+    if (episode.toolArgs !== undefined)
+        parts.push(`tool_args:${episode.toolArgs}`);
+    if (episode.errorFingerprint !== undefined)
+        parts.push("error_fingerprint:present");
+    return parts.join("\n");
+}
 const COMMON_KEYS = new Set(["recordType", "id", "ownerHost", "schemaRevision", "createdAt", "privacyEpoch", "processingPolicyId", "expiresAt", "contentHash"]);
 const DERIVED_KEYS = new Set(["coordinationPolicyHash", "coordinationPolicyEpoch"]);
 const RECORD_KEYS = {
-    episode: new Set([...COMMON_KEYS, "sourceEntryId", "host", "projectId", "projectIdentityKind", "sessionId", "turnId", "agentRole", "depth", "eventKind", "eventAt", "modelId", "embeddingDimension", "originProvider", "destinationId", "status", "secretScan", "text", "toolName", "toolArgs", "errorFingerprint", "vector", "producerId", "nodeId"]),
+    episode: new Set([...COMMON_KEYS, "sourceEntryId", "host", "projectId", "projectIdentityKind", "sessionId", "turnId", "agentRole", "depth", "eventKind", "eventAt", "modelId", "embeddingDimension", "originProvider", "destinationId", "status", "redactionStatus", "secretScan", "text", "toolName", "toolArgs", "errorFingerprint", "vector", "producerId", "nodeId"]),
     curated_memory: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "contentId", "observationId", "eventAt", "effectiveAt", "sourceEpisodeIds", "manifestHash", "primaryEvidenceEpisodeId", "effectiveOrder", "stateKey", "category", "scope", "subject", "predicate", "value", "text", "provenance", "confidence", "vector"]),
     curated_current: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "contentId", "observationId", "version", "stateKey", "resolution", "conflictManifestHash", "effectiveOrder", "sourceEpisodeIds", "text", "vector"]),
     raptor_summary: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "generationId", "clusterId", "membershipHash", "level", "memberIds", "manifestHash", "summary", "vector", "modelId", "embeddingDimension", "promptRevision", "algorithm", "seed", "jobId", "fencingToken", "temporalFrom", "temporalTo", "coveredProjects", "algorithmParameters"]),
@@ -127,6 +144,8 @@ function validate(value, context) {
             text("destinationId", value.destinationId);
             if (value.status !== "active")
                 fail("episode status invalid");
+            if (value.redactionStatus !== "unchanged" && value.redactionStatus !== "redacted")
+                fail("redaction status invalid");
             if (value.secretScan !== "passed")
                 fail("secret scan invalid");
             if (value.text !== undefined)

@@ -1,6 +1,8 @@
 import { fetchJson, fetchOk, MemoryClientError } from "../clients/http.js";
 import { canonicalStringify } from "../domain/canonical.js";
 import { assertBootstrapControl, collectionControlPoint, collectionMetadataPoint, collectionVectors, isPhysicalPointId } from "./schema.js";
+/** The only collection an owner may write or read through this client family. */
+export function expectedQdrantCollection(ownerHost) { return ownerHost === "pi" ? "pi_memory" : "prime_memory"; }
 function validatePurpose(purpose, recordTypes) { if (!["memory", "control", "metadata", "query", "internal", "write_verification"].includes(purpose))
     throw new TypeError("Read purpose is invalid"); if ((purpose === "metadata" && (recordTypes.length !== 1 || recordTypes[0] !== "collection_metadata")) || (purpose === "control" && (recordTypes.length !== 1 || recordTypes[0] !== "collection_control")) || ((purpose === "memory" || purpose === "query") && (recordTypes.length === 0 || recordTypes.some((type) => !["episode", "curated_memory", "curated_current", "raptor_summary"].includes(type)))) || ((purpose === "internal" || purpose === "write_verification") && recordTypes.length === 0))
     throw new TypeError("Read purpose and record types do not match"); }
@@ -132,14 +134,17 @@ function responseCollection(value) { const result = envelope(value); if (!isReco
     }
 } const status = typeof result.status === "string" ? result.status : undefined; return { ...(status === undefined ? {} : { status }), dimension: 1024, distance: "Cosine", vectors: { semantic: { size: 1024, distance: "Cosine" } }, pointsCount, ...(payloadSchema === undefined ? {} : { payloadSchema }), raw: value }; }
 function freezeOptions(input) { const endpoint = baseUrl(input.baseUrl); validateCollection(input.collection); if (input.ownerHost !== "pi" && input.ownerHost !== "prime")
-    failInput("Owner host is invalid"); if (input.apiKey !== undefined && (typeof input.apiKey !== "string" || input.apiKey.trim() === ""))
+    failInput("Owner host is invalid"); if (input.collection !== expectedQdrantCollection(input.ownerHost))
+    failInput("Qdrant collection does not match owner host"); if (input.apiKey !== undefined && (typeof input.apiKey !== "string" || input.apiKey.trim() === ""))
     failInput("Qdrant API key is invalid"); validateTimeout(input.timeoutMs); if (input.maxClockSkewMs !== undefined && (!Number.isFinite(input.maxClockSkewMs) || input.maxClockSkewMs < 0))
     failInput("Clock skew is invalid"); return Object.freeze({ ...input, baseUrl: endpoint, maxClockSkewMs: input.maxClockSkewMs ?? 0 }); }
 class RestQdrantReadClient {
+    endpoint;
     ownerHost;
+    collection;
     maxClockSkewMs;
     options;
-    constructor(options) { this.options = freezeOptions(options); this.ownerHost = this.options.ownerHost; this.maxClockSkewMs = this.options.maxClockSkewMs ?? 0; Object.freeze(this); }
+    constructor(options) { this.options = freezeOptions(options); this.endpoint = this.options.baseUrl; this.ownerHost = this.options.ownerHost; this.collection = expectedQdrantCollection(this.ownerHost); this.maxClockSkewMs = this.options.maxClockSkewMs ?? 0; Object.freeze(this); }
     async health() { const response = await fetchOk(`${this.options.baseUrl}/healthz`, { method: "GET", headers: headers(this.options.apiKey) }, requestOptions(this.options)); const text = await response.text(); if (text.trim() === "healthz check passed")
         return text; let parsed; try {
         parsed = JSON.parse(text);

@@ -7,6 +7,7 @@ export interface EgressDestination extends AuthorizedDestination {
 export declare function assertPseudonymousNodeId(nodeId: unknown, options?: {
     allowDerivedDigest?: boolean;
 }): asserts nodeId is string;
+export declare function canonicalEgressEndpoint(endpoint: string): string;
 export declare function localDestinationId(endpoint: string, nodeId: string, labels?: Pick<AuthorizedDestination, "residency" | "dataUse">): string;
 export declare function destinationForEndpoint(endpoint: string, nodeId: string, labels?: Pick<AuthorizedDestination, "residency" | "dataUse">): EgressDestination;
 export type EgressMaterialGate = RedactionResult;
@@ -31,3 +32,16 @@ export declare function canEgress(input: {
     payload: EgressPayloadOptions;
 }): boolean;
 export declare function assertEgressAllowed(input: Parameters<typeof canEgress>[0]): void;
+/**
+ * Pin a configured endpoint to one declared destination identity.  The caller
+ * supplies no separate ID allowlist: for remote allowlist mode the configured
+ * pair is the authorization object; for local-only mode the identity is
+ * recomputed from the canonical loopback/Unix endpoint and node ID.
+ */
+export declare function bindConfiguredDestination(input: {
+    endpoint: string;
+    configuredDestination: AuthorizedDestination;
+    requestedDestination: AuthorizedDestination;
+    egressMode: RuntimeConfig["privacy"]["egressMode"];
+    nodeId?: string;
+}): AuthorizedDestination;

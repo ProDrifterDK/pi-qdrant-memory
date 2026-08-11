@@ -3,9 +3,14 @@ import { constants as fsConstants } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { canonicalStringify, deterministicUuid, sha256Hex } from "../domain/canonical.js";
+import { canonicalRecordHash, episodeSemanticProjection } from "../domain/records.js";
+import { intersectPolicies, isPolicyExpired, processingPolicyHash } from "../domain/policy.js";
+import { redactAndScan } from "../security/redaction.js";
 import { parseOutboxJob } from "./store.js";
 import { activeAdmissionLocks, isAdmissionProtocolArtifact, retireOwnedAdmissionLock } from "./reservation-protocol.js";
 import { assertPseudonymousNodeId } from "../security/egress.js";
+import { QdrantContentHashCollisionError } from "../domain/qdrant-errors.js";
+import { expectedQdrantCollection } from "../qdrant/client.js";
 const SAFE_COMPONENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const PRODUCER_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -1987,5 +1992,324 @@ export function createOutboxDelivery(input) {
         catch {
             return { delivered: 0, pending: 0, quarantined: 0 };
         } } });
+}
+const INGEST_CONTROL_KEYS = ["state", "privacyEpoch", "coordinationPolicyEpoch", "policyHash", "revokedDestinationIds"];
+function ingestResult(kind, count, category) {
+    return { result: { delivered: kind === "delivered" ? count : 0, pending: kind === "pending" ? count : 0, quarantined: kind === "quarantined" ? count : 0 }, ...(category === undefined ? {} : { category }) };
+}
+function exactDestination(left, right) {
+    return left.id === right.id && left.residency === right.residency && left.dataUse === right.dataUse;
+}
+function destinationFor(policy, lane) {
+    return { id: policy.destinationIds[lane], residency: policy.residency, dataUse: policy.dataUse };
+}
+function exactRedactedDestinationId(value) {
+    if (typeof value !== "string" || value.length === 0 || value.length > 256 || !/^[A-Za-z0-9._:/-]+$/u.test(value))
+        return false;
+    const checked = redactAndScan({ text: value, maxChars: 256, homeDir: "/" });
+    return !checked.dropped && checked.secretScan === "passed" && checked.redactionStatus === "unchanged" && checked.text === value;
+}
+function validControlSnapshot(value, qdrant) {
+    if (typeof value !== "object" || value === null)
+        return false;
+    const snapshot = value;
+    const revoked = snapshot.revokedDestinationIds;
+    if (!exactKeys(snapshot, INGEST_CONTROL_KEYS) || snapshot.state !== "active" || !Number.isSafeInteger(snapshot.privacyEpoch) || snapshot.privacyEpoch < 0 || !Number.isSafeInteger(snapshot.coordinationPolicyEpoch) || snapshot.coordinationPolicyEpoch < 0 || typeof snapshot.policyHash !== "string" || snapshot.policyHash.length === 0 || snapshot.policyHash.length > 512 || !Array.isArray(revoked) || revoked.length > 1024 || revoked.some((id) => !exactRedactedDestinationId(id)) || new Set(revoked).size !== revoked.length)
+        return false;
+    return snapshot.policyHash === qdrant.coordination.policyHash && snapshot.coordinationPolicyEpoch === qdrant.coordination.policyEpoch;
+}
+function isRevoked(snapshot, destination) { return snapshot.revokedDestinationIds.includes(destination.id); }
+function clockValue(clock) { const value = clock(); if (!finiteTime(value))
+    throw new TypeError("Ingest clock is invalid"); return value; }
+function isExpired(policy, now, skew) { return isPolicyExpired(policy, now, skew); }
+function episodeText(episode) { return episodeSemanticProjection(episode); }
+function finalEpisodeMaterialIsSafe(episode) {
+    const text = episodeText(episode);
+    if (text.length === 0 || text.length > 16_000)
+        return false;
+    const checked = redactAndScan({ text, maxChars: 16_000, homeDir: "/" });
+    return !checked.dropped && checked.secretScan === "passed" && checked.text === text;
+}
+function validVector(vector) { return vector.length === 1024 && vector.every((value) => typeof value === "number" && Number.isFinite(value)); }
+function sameEpisodeReadback(readback, source) {
+    if (!record(readback))
+        return false;
+    try {
+        const candidate = readback;
+        return candidate.recordType === "episode" && candidate.id === source.id && candidate.contentHash === source.contentHash && canonicalRecordHash(candidate) === candidate.contentHash && candidate.ownerHost === source.ownerHost && candidate.schemaRevision === source.schemaRevision && candidate.privacyEpoch === source.privacyEpoch && candidate.processingPolicyId === source.processingPolicyId && candidate.expiresAt === source.expiresAt && candidate.secretScan === "passed" && candidate.redactionStatus === source.redactionStatus && candidate.vector !== undefined && validVector(candidate.vector);
+    }
+    catch {
+        return false;
+    }
+}
+function verifiedDifferentCanonicalHash(readback, expected) {
+    if (!record(readback) || readback.recordType !== expected.recordType || readback.id !== expected.id || typeof readback.contentHash !== "string" || readback.contentHash === expected.contentHash)
+        return false;
+    try {
+        return canonicalRecordHash(readback) === readback.contentHash;
+    }
+    catch {
+        return false;
+    }
+}
+function policyRecord(job, privacyEpoch) {
+    const pending = {
+        recordType: "processing_policy", id: job.policy.id, ownerHost: job.ownerHost, schemaRevision: 1, createdAt: job.createdAt,
+        privacyEpoch, processingPolicyId: job.policy.id, expiresAt: job.policy.expiresAt, contentHash: "pending",
+        policy: job.policy, canonicalHash: job.policy.id,
+    };
+    return { ...pending, contentHash: canonicalRecordHash(pending) };
+}
+function policyRecordReadbackIsExact(readback, expected) {
+    if (!record(readback))
+        return false;
+    try {
+        const candidate = readback;
+        return candidate.recordType === "processing_policy" && candidate.id === expected.id && candidate.contentHash === expected.contentHash && canonicalRecordHash(candidate) === candidate.contentHash && candidate.ownerHost === expected.ownerHost && candidate.schemaRevision === expected.schemaRevision && candidate.privacyEpoch === expected.privacyEpoch && candidate.processingPolicyId === expected.processingPolicyId && candidate.expiresAt === expected.expiresAt && candidate.canonicalHash === expected.canonicalHash && canonicalStringify(candidate.policy) === canonicalStringify(expected.policy);
+    }
+    catch {
+        return false;
+    }
+}
+function staticIngestValidation(input, now) {
+    const count = Array.isArray(input.job?.episodes) && input.job.episodes.length > 0 ? input.job.episodes.length : 1;
+    if (!Number.isSafeInteger(input.maxClockSkewMs) || input.maxClockSkewMs < 0 || input.maxClockSkewMs > 3_600_000)
+        return ingestResult("quarantined", count, "policy_invalid");
+    try {
+        if (input.job.policyId !== input.job.policy.id || input.job.deadline !== input.job.policy.expiresAt || processingPolicyHash(input.job.policy) !== input.job.policy.id || processingPolicyHash(input.localPolicy) !== input.localPolicy.id)
+            return ingestResult("quarantined", count, "policy_invalid");
+        const effective = intersectPolicies([input.job.policy], input.localPolicy);
+        if (effective === null)
+            return ingestResult("pending", count, "policy_unauthorized");
+        if (!exactDestination(input.qdrant.destination, destinationFor(effective, "qdrant")) || !exactDestination(input.embedding.destination, destinationFor(effective, "embedding")))
+            return ingestResult("pending", count, "policy_unauthorized");
+        if (input.qdrant.ownerHost !== input.job.ownerHost || input.qdrant.collection !== expectedQdrantCollection(input.job.ownerHost))
+            return ingestResult("pending", count, "policy_unauthorized");
+        if (isExpired(effective, now, input.maxClockSkewMs))
+            return ingestResult("quarantined", count, "expired");
+        for (const episode of input.job.episodes) {
+            if (episode.recordType !== "episode" || episode.ownerHost !== input.job.ownerHost || episode.host !== input.job.ownerHost || episode.processingPolicyId !== input.job.policy.id || episode.expiresAt !== input.job.policy.expiresAt || episode.originProvider !== input.job.policy.originProvider || episode.destinationId !== input.job.policy.destinationIds.qdrant || episode.vector !== undefined || episode.secretScan !== "passed" || !finalEpisodeMaterialIsSafe(episode) || episode.contentHash !== canonicalRecordHash(episode))
+                return ingestResult("quarantined", count, episode.secretScan === "passed" ? "episode_invalid" : "scanner_rejected");
+        }
+        return { effective };
+    }
+    catch {
+        return ingestResult("quarantined", count, "policy_invalid");
+    }
+}
+async function readStableControl(input) {
+    try {
+        const snapshot = await input.control.read();
+        return validControlSnapshot(snapshot, input.qdrant) ? snapshot : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+function controlAllows(snapshot, input, privacyEpoch) {
+    return snapshot.privacyEpoch === privacyEpoch && !isRevoked(snapshot, input.qdrant.destination) && !isRevoked(snapshot, input.embedding.destination);
+}
+async function ingestAttempt(rawInput, clock, signal) {
+    // This is a public direct-call seam as well as the Task 5 callback: parse
+    // and clone the durable envelope before reading policy/control or egressing.
+    let job;
+    try {
+        job = parseOutboxJob(rawInput.job);
+    }
+    catch {
+        return ingestResult("quarantined", 1, "episode_invalid");
+    }
+    const input = { ...rawInput, job };
+    const count = job.episodes.length;
+    let started;
+    try {
+        started = clockValue(clock);
+    }
+    catch {
+        return ingestResult("pending", count, "control_unavailable");
+    }
+    if (signal?.aborted)
+        return ingestResult("pending", count, "aborted");
+    const initial = staticIngestValidation(input, started);
+    if ("result" in initial)
+        return initial;
+    const first = await readStableControl(input);
+    if (signal?.aborted)
+        return ingestResult("pending", count, "aborted");
+    let beforePolicyNow;
+    try {
+        beforePolicyNow = clockValue(clock);
+    }
+    catch {
+        return ingestResult("pending", count, "control_unavailable");
+    }
+    // An embedding-only revocation is deliberately stricter: it suppresses the
+    // policy point too, so no part of the job egresses after either revocation.
+    if (first === undefined || !controlAllows(first, input, first.privacyEpoch))
+        return ingestResult("pending", count, "control_unavailable");
+    if (job.episodes.some((episode) => episode.privacyEpoch !== first.privacyEpoch))
+        return ingestResult("pending", count, "control_unavailable");
+    if (isExpired(initial.effective, beforePolicyNow, input.maxClockSkewMs))
+        return ingestResult("quarantined", count, "expired");
+    if (signal?.aborted)
+        return ingestResult("pending", count, "aborted");
+    const policy = policyRecord(job, first.privacyEpoch);
+    try {
+        await input.qdrant.insertAndReadback(policy);
+    }
+    catch (error) {
+        const collision = error instanceof QdrantContentHashCollisionError;
+        return ingestResult(collision ? "quarantined" : "pending", count, collision ? "hash_collision" : "qdrant_failed");
+    }
+    if (signal?.aborted)
+        return ingestResult("pending", count, "aborted");
+    let policyReadback;
+    try {
+        policyReadback = await input.qdrant.retrieve("processing_policy", policy.id);
+    }
+    catch {
+        return ingestResult("pending", count, "qdrant_failed");
+    }
+    if (signal?.aborted)
+        return ingestResult("pending", count, "aborted");
+    if (!policyRecordReadbackIsExact(policyReadback, policy))
+        return ingestResult(verifiedDifferentCanonicalHash(policyReadback, policy) ? "quarantined" : "pending", count, verifiedDifferentCanonicalHash(policyReadback, policy) ? "hash_collision" : "qdrant_failed");
+    for (const source of job.episodes) {
+        if (signal?.aborted)
+            return ingestResult("pending", count, "aborted");
+        const beforeEmbed = await readStableControl(input);
+        if (signal?.aborted)
+            return ingestResult("pending", count, "aborted");
+        let beforeNow;
+        try {
+            beforeNow = clockValue(clock);
+        }
+        catch {
+            return ingestResult("pending", count, "control_unavailable");
+        }
+        const beforeExpired = isExpired(initial.effective, beforeNow, input.maxClockSkewMs);
+        if (beforeEmbed === undefined || !controlAllows(beforeEmbed, input, first.privacyEpoch) || beforeExpired || signal?.aborted)
+            return ingestResult(beforeExpired ? "quarantined" : "pending", count, signal?.aborted ? "aborted" : beforeExpired ? "expired" : "control_unavailable");
+        if (signal?.aborted)
+            return ingestResult("pending", count, "aborted");
+        let existing;
+        try {
+            existing = await input.qdrant.retrieve("episode", source.id);
+        }
+        catch {
+            return ingestResult("pending", count, "qdrant_failed");
+        }
+        if (signal?.aborted)
+            return ingestResult("pending", count, "aborted");
+        if (existing !== null) {
+            if (sameEpisodeReadback(existing, source)) {
+                const finalExisting = await readStableControl(input);
+                if (signal?.aborted)
+                    return ingestResult("pending", count, "aborted");
+                let finalExistingNow;
+                try {
+                    finalExistingNow = clockValue(clock);
+                }
+                catch {
+                    return ingestResult("pending", count, "control_unavailable");
+                }
+                const existingExpired = isExpired(initial.effective, finalExistingNow, input.maxClockSkewMs);
+                if (finalExisting === undefined || !controlAllows(finalExisting, input, first.privacyEpoch) || existingExpired)
+                    return ingestResult(existingExpired ? "quarantined" : "pending", count, existingExpired ? "expired" : "control_unavailable");
+                continue;
+            }
+            return ingestResult(verifiedDifferentCanonicalHash(existing, source) ? "quarantined" : "pending", count, verifiedDifferentCanonicalHash(existing, source) ? "hash_collision" : "qdrant_failed");
+        }
+        // A null lookup is also an authorization boundary: it may have taken long
+        // enough for revocation, state, privacy epoch, or expiry to change.
+        const afterLookup = await readStableControl(input);
+        if (signal?.aborted)
+            return ingestResult("pending", count, "aborted");
+        let afterLookupNow;
+        try {
+            afterLookupNow = clockValue(clock);
+        }
+        catch {
+            return ingestResult("pending", count, "control_unavailable");
+        }
+        const afterLookupExpired = isExpired(initial.effective, afterLookupNow, input.maxClockSkewMs);
+        if (afterLookup === undefined || !controlAllows(afterLookup, input, first.privacyEpoch) || afterLookupExpired)
+            return ingestResult(afterLookupExpired ? "quarantined" : "pending", count, afterLookupExpired ? "expired" : "control_unavailable");
+        if (signal?.aborted)
+            return ingestResult("pending", count, "aborted");
+        let vector;
+        try {
+            vector = await input.embedding.embed({ model: "bge-m3", text: episodeText(source), ...(signal === undefined ? {} : { signal }) });
+        }
+        catch {
+            return ingestResult("pending", count, signal?.aborted ? "aborted" : "embedding_failed");
+        }
+        if (signal?.aborted)
+            return ingestResult("pending", count, "aborted");
+        if (!validVector(vector))
+            return ingestResult("pending", count, "embedding_invalid");
+        const final = await readStableControl(input);
+        if (signal?.aborted)
+            return ingestResult("pending", count, "aborted");
+        let now;
+        try {
+            now = clockValue(clock);
+        }
+        catch {
+            return ingestResult("pending", count, "control_unavailable");
+        }
+        const finalExpired = isExpired(initial.effective, now, input.maxClockSkewMs);
+        if (final === undefined || !controlAllows(final, input, first.privacyEpoch) || finalExpired)
+            return ingestResult(finalExpired ? "quarantined" : "pending", count, finalExpired ? "expired" : "control_unavailable");
+        const materialized = { ...source, vector: [...vector] };
+        if (signal?.aborted)
+            return ingestResult("pending", count, "aborted");
+        try {
+            await input.qdrant.insertAndReadback(materialized);
+        }
+        catch (error) {
+            const collision = error instanceof QdrantContentHashCollisionError;
+            return ingestResult(collision ? "quarantined" : "pending", count, collision ? "hash_collision" : "qdrant_failed");
+        }
+        if (signal?.aborted)
+            return ingestResult("pending", count, "aborted");
+        let episodeReadback;
+        try {
+            episodeReadback = await input.qdrant.retrieve("episode", materialized.id);
+        }
+        catch {
+            return ingestResult("pending", count, "qdrant_failed");
+        }
+        if (signal?.aborted)
+            return ingestResult("pending", count, "aborted");
+        if (!sameEpisodeReadback(episodeReadback, materialized))
+            return ingestResult(verifiedDifferentCanonicalHash(episodeReadback, materialized) ? "quarantined" : "pending", count, verifiedDifferentCanonicalHash(episodeReadback, materialized) ? "hash_collision" : "qdrant_failed");
+    }
+    return ingestResult("delivered", count);
+}
+function safeIngestCount(value) {
+    return record(value) && Array.isArray(value.episodes) && value.episodes.length > 0 && value.episodes.length <= 1024 ? value.episodes.length : 1;
+}
+/**
+ * Ingest a durable job without throwing into a host turn.  Its public `now`
+ * value is fixed for deterministic direct callers; the production processor
+ * below supplies its live clock so expiry is checked again after embedding.
+ */
+export async function ingestPendingJobs(input) { return (await ingestAttempt(input, () => input.now)).result; }
+/** The sole production OutboxJobProcessor; Task 5 remains scheduling-only. */
+export function createIngestProcessor(input) {
+    if (typeof input.now !== "function")
+        throw new TypeError("Ingest processor requires a clock");
+    return Object.freeze({
+        process: async (job, processInput) => {
+            const count = safeIngestCount(job);
+            const attempt = await ingestAttempt({ ...input, job, now: 0 }, input.now, processInput.signal).catch(() => ingestResult("pending", count, "control_unavailable"));
+            if (attempt.result.delivered === count)
+                return { status: "delivered" };
+            if (attempt.result.quarantined > 0)
+                return { status: "quarantined", category: attempt.category ?? "episode_invalid" };
+            return { status: "pending", category: attempt.category ?? "control_unavailable" };
+        },
+    });
 }
 //# sourceMappingURL=delivery.js.map

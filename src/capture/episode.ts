@@ -3,7 +3,7 @@ import { chmod, mkdir, open, readFile, rename, rm, stat, lstat } from "node:fs/p
 import { dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
 import type { HostId, RedactionStatus, SecretScanStatus } from "../types.js";
 import type { EpisodeRecord } from "../domain/records.js";
-import { canonicalRecordHash } from "../domain/records.js";
+import { canonicalRecordHash, episodeSemanticProjection } from "../domain/records.js";
 import { episodeId } from "../domain/ids.js";
 import { canonicalStringify, deterministicUuid, sha256Hex } from "../domain/canonical.js";
 import { redactAndScan, redactStructure } from "../security/redaction.js";
@@ -294,40 +294,31 @@ function episodeMaterial(entry: SelectedCaptureEntry, input: CaptureInput, marke
   const homeDir = input.homeDir ?? "/";
   const textField = finalField(entry.text, entry.eventKind.startsWith("tool_") ? (input.toolResultChars ?? 4_000) : maxText, homeDir);
   const argsField = finalField(entry.toolArgs, input.toolArgsChars ?? 2_000, homeDir);
-  const text = textField.text;
-  const toolArgs = argsField.text;
+  const text = textField.text; const toolArgs = argsField.text;
   const safeToolName = entry.toolName === undefined ? undefined : boundedId(entry.toolName, "tool", homeDir);
-  const finalText = [text, toolArgs].filter((item): item is string => item !== undefined).join("\n");
-  // A finalized tool call can be meaningful with only a safe tool name. Include
-  // that bounded name in the final scan, but never store it as free-form text.
-  const validationText = [finalText, safeToolName].filter((item): item is string => item !== undefined).join("\n");
-  if (validationText.length === 0 && entry.eventKind !== "tool_error") return { category: "redaction" };
-  const finalCheck = redactAndScan({ text: validationText, maxChars: Math.min(16_000, Math.max(validationText.length, 1)), homeDir, ...(input.scan === undefined ? {} : { scan: input.scan }) });
-  if (finalCheck.dropped) return { category: finalCheck.secretScan === "error" ? "scanner_error" : finalCheck.secretScan === "rejected" ? "scanner_rejected" : "redaction" };
-  const eventAt = isoTimestamp(entry.eventAt, fallbackAt);
-  const stableCreatedAt = isoTimestamp(undefined, fallbackAt);
-  const sessionId = boundedId(input.sessionId, "session", homeDir);
-  const sourceEntryId = boundedId(entry.sourceEntryId, "entry", homeDir);
+  // Non-error entries still need a surviving, structurally redacted semantic
+  // field. Error-only entries are represented by the safe projection marker.
+  if (text === undefined && toolArgs === undefined && safeToolName === undefined && entry.eventKind !== "tool_error") return { category: "redaction" };
+  const eventAt = isoTimestamp(entry.eventAt, fallbackAt); const stableCreatedAt = isoTimestamp(undefined, fallbackAt);
+  const sessionId = boundedId(input.sessionId, "session", homeDir); const sourceEntryId = boundedId(entry.sourceEntryId, "entry", homeDir);
   const messageFallback = entry.messageId === undefined || entry.messageId === null || entry.messageId === "" ? "message" : sourceEntryId;
-  const messageId = boundedId(entry.messageId, messageFallback, homeDir);
-  const id = episodeId({ host: input.host, sessionId, messageId, part: entry.partIdentity });
+  const messageId = boundedId(entry.messageId, messageFallback, homeDir); const id = episodeId({ host: input.host, sessionId, messageId, part: entry.partIdentity });
+  const fieldWasRedacted = textField.status !== "unchanged" || argsField.status !== "unchanged" || (entry.toolName !== undefined && safeToolName !== entry.toolName);
   const record: EpisodeRecord = {
     recordType: "episode", id, ownerHost: input.host, schemaRevision: 1, createdAt: stableCreatedAt, privacyEpoch: input.privacyEpoch ?? 0,
     processingPolicyId: boundedId(input.policyId, "capture-policy", homeDir), expiresAt: input.expiresAt ?? null, contentHash: "pending", sourceEntryId, host: input.host,
     projectId: boundedId(input.projectId, "local_only", homeDir), projectIdentityKind: input.projectIdentityKind ?? "local_only", sessionId, turnId: boundedId(entry.turnId, sourceEntryId, homeDir), agentRole: marker.role, depth: marker.depth,
-    eventKind: entry.eventKind, eventAt, modelId: boundedId(input.modelId, "unknown", homeDir), embeddingDimension: 1024, originProvider: boundedId(input.originProvider, "unknown", homeDir), destinationId: boundedId(input.destinationId, "capture:local", homeDir), status: "active", secretScan: "passed",
+    eventKind: entry.eventKind, eventAt, modelId: boundedId(input.modelId, "unknown", homeDir), embeddingDimension: 1024, originProvider: boundedId(input.originProvider, "unknown", homeDir), destinationId: boundedId(input.destinationId, "capture:local", homeDir), status: "active", redactionStatus: fieldWasRedacted ? "redacted" : "unchanged", secretScan: "passed",
   };
-  if (text !== undefined) record.text = text;
-  if (toolArgs !== undefined) record.toolArgs = toolArgs;
-  if (safeToolName !== undefined) record.toolName = safeToolName;
-  const fingerprint = safeFingerprint(entry.errorFingerprint, homeDir);
-  if (fingerprint !== undefined) record.errorFingerprint = fingerprint;
+  if (text !== undefined) record.text = text; if (toolArgs !== undefined) record.toolArgs = toolArgs; if (safeToolName !== undefined) record.toolName = safeToolName;
+  const fingerprint = safeFingerprint(entry.errorFingerprint, homeDir); if (fingerprint !== undefined) record.errorFingerprint = fingerprint;
   if (input.producerId !== undefined) record.producerId = boundedId(input.producerId, "producer", homeDir);
   if (input.nodeId !== undefined) record.nodeId = boundedId(input.nodeId, "node", homeDir);
-  record.contentHash = canonicalRecordHash(record);
-  return { record };
+  const semantic = episodeSemanticProjection(record); const finalCheck = redactAndScan({ text: semantic, maxChars: Math.min(16_000, semantic.length), homeDir, ...(input.scan === undefined ? {} : { scan: input.scan }) });
+  if (finalCheck.dropped || finalCheck.secretScan !== "passed" || finalCheck.text !== semantic) return { category: finalCheck.secretScan === "error" ? "scanner_error" : finalCheck.secretScan === "rejected" ? "scanner_rejected" : "redaction" };
+  if (finalCheck.redactionStatus === "redacted") record.redactionStatus = "redacted";
+  record.contentHash = canonicalRecordHash(record); return { record };
 }
-
 async function statePathForActivationDir(activationDir: string, sessionId: string): Promise<string> {
   if (typeof activationDir !== "string" || !isAbsolute(activationDir)) throw new Error("Capture activation directory must be absolute");
   const normalized = normalize(resolve(activationDir));

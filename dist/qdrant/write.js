@@ -1,12 +1,15 @@
 import { canonicalRecordHash, parseMemoryRecord } from "../domain/records.js";
 import { canonicalStringify } from "../domain/canonical.js";
+import { bindConfiguredDestination, canonicalEgressEndpoint } from "../security/egress.js";
 import { physicalPointId, COLLECTION_CONTROL_ID, assertBootstrapControl, controlPayload, controlRecordFromPayload } from "./schema.js";
-import { readPolicy } from "./client.js";
+import { expectedQdrantCollection, readPolicy } from "./client.js";
+import { QdrantContentHashCollisionError } from "../domain/qdrant-errors.js";
+export { QdrantContentHashCollisionError, QDRANT_CONTENT_HASH_COLLISION } from "../domain/qdrant-errors.js";
 const CONTROL_PATCH_KEYS = new Set(["version", "processingPolicyId", "activeGeneration", "activeBaseGeneration", "privacyEpoch", "coordinationPolicyEpoch", "coordinationPolicyHash", "state", "scanCursor", "lastForgetBarrier", "contentHash"]);
 function fail(message) { throw new TypeError(message); }
 function isRecord(value) { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function mapKey(key) {
-    const names = { recordType: "record_type", ownerHost: "owner_host", schemaRevision: "schema_revision", createdAt: "created_at", privacyEpoch: "privacy_epoch", processingPolicyId: "processing_policy_id", expiresAt: "expires_at", contentHash: "content_hash", sourceEntryId: "source_entry_id", projectId: "project_id", projectIdentityKind: "project_identity_kind", sessionId: "session_id", turnId: "turn_id", agentRole: "agent_role", eventKind: "event_kind", eventAt: "event_at", modelId: "model_id", embeddingDimension: "embedding_dimension", originProvider: "origin_provider", destinationId: "destination_id", secretScan: "secret_scan", toolName: "tool_name", toolArgs: "tool_args", errorFingerprint: "error_fingerprint", producerId: "producer_id", nodeId: "node_id", coordinationPolicyHash: "coordination_policy_hash", coordinationPolicyEpoch: "coordination_policy_epoch", contentId: "content_id", observationId: "observation_id", effectiveAt: "effective_at", sourceEpisodeIds: "source_episode_ids", manifestHash: "manifest_hash", primaryEvidenceEpisodeId: "primary_evidence_episode_id", effectiveOrder: "effective_order", stateKey: "state_key", category: "category", scope: "scope", subject: "subject", predicate: "predicate", confidence: "confidence", generationId: "generation_id", clusterId: "cluster_id", membershipHash: "membership_hash", level: "level", memberIds: "member_ids", summary: "summary", promptRevision: "prompt_revision", algorithm: "algorithm", seed: "seed", jobId: "job_id", fencingToken: "fencing_token", temporalFrom: "temporal_from", temporalTo: "temporal_to", coveredProjects: "covered_projects", algorithmParameters: "algorithm_parameters", activeGeneration: "active_generation", activeBaseGeneration: "active_base_generation", state: "state", scanCursor: "scan_cursor", lastForgetBarrier: "last_forget_barrier", policy: "policy", canonicalHash: "canonical_hash", policyId: "policy_id", policyHash: "policy_hash", policyEpoch: "policy_epoch", membership: "membership", leaseExpiresAt: "lease_expires_at", leaseOwner: "lease_owner", acceptedProposalId: "accepted_proposal_id", acceptedManifestHash: "accepted_manifest_hash", episodeId: "episode_id", extractorRevision: "extractor_revision", sourceId: "source_id", targetId: "target_id", provenanceId: "provenance_id", resolution: "resolution", conflictManifestHash: "conflict_manifest_hash", value: "value" };
+    const names = { recordType: "record_type", ownerHost: "owner_host", schemaRevision: "schema_revision", createdAt: "created_at", privacyEpoch: "privacy_epoch", processingPolicyId: "processing_policy_id", expiresAt: "expires_at", contentHash: "content_hash", sourceEntryId: "source_entry_id", projectId: "project_id", projectIdentityKind: "project_identity_kind", sessionId: "session_id", turnId: "turn_id", agentRole: "agent_role", eventKind: "event_kind", eventAt: "event_at", modelId: "model_id", embeddingDimension: "embedding_dimension", originProvider: "origin_provider", destinationId: "destination_id", redactionStatus: "redaction_status", secretScan: "secret_scan", toolName: "tool_name", toolArgs: "tool_args", errorFingerprint: "error_fingerprint", producerId: "producer_id", nodeId: "node_id", coordinationPolicyHash: "coordination_policy_hash", coordinationPolicyEpoch: "coordination_policy_epoch", contentId: "content_id", observationId: "observation_id", effectiveAt: "effective_at", sourceEpisodeIds: "source_episode_ids", manifestHash: "manifest_hash", primaryEvidenceEpisodeId: "primary_evidence_episode_id", effectiveOrder: "effective_order", stateKey: "state_key", category: "category", scope: "scope", subject: "subject", predicate: "predicate", confidence: "confidence", generationId: "generation_id", clusterId: "cluster_id", membershipHash: "membership_hash", level: "level", memberIds: "member_ids", summary: "summary", promptRevision: "prompt_revision", algorithm: "algorithm", seed: "seed", jobId: "job_id", fencingToken: "fencing_token", temporalFrom: "temporal_from", temporalTo: "temporal_to", coveredProjects: "covered_projects", algorithmParameters: "algorithm_parameters", activeGeneration: "active_generation", activeBaseGeneration: "active_base_generation", state: "state", scanCursor: "scan_cursor", lastForgetBarrier: "last_forget_barrier", policy: "policy", canonicalHash: "canonical_hash", policyId: "policy_id", policyHash: "policy_hash", policyEpoch: "policy_epoch", membership: "membership", leaseExpiresAt: "lease_expires_at", leaseOwner: "lease_owner", acceptedProposalId: "accepted_proposal_id", acceptedManifestHash: "accepted_manifest_hash", episodeId: "episode_id", extractorRevision: "extractor_revision", sourceId: "source_id", targetId: "target_id", provenanceId: "provenance_id", resolution: "resolution", conflictManifestHash: "conflict_manifest_hash", value: "value" };
     return names[key] ?? key;
 }
 function recordPayload(record) { const parsed = parseMemoryRecord(record); const payload = {}; for (const [key, value] of Object.entries(parsed)) {
@@ -154,5 +157,147 @@ export async function publishControlCas(client, input) {
         return false;
     const rereadRecord = controlRecordFromPayload(reread.payload, client.ownerHost);
     return deepEqual(controlPayload(rereadRecord), expectedPayload);
+}
+/** A nominal, endpoint-pinned writer capability; factories never accept a raw structural client. */
+export class ValidatedQdrantSessionWriter {
+    endpoint;
+    ownerHost;
+    collection;
+    #writer;
+    constructor(endpoint, client) {
+        this.endpoint = endpoint;
+        this.ownerHost = client.ownerHost;
+        this.collection = client.collection;
+        // Copy identity scalars and bind every operation once. Later reassignment
+        // of methods/properties on a caller-owned fake/client cannot retarget this capability.
+        this.#writer = Object.freeze({ endpoint, ownerHost: this.ownerHost, collection: this.collection, maxClockSkewMs: client.maxClockSkewMs, retrieve: client.retrieve.bind(client), upsertPoints: client.upsertPoints.bind(client) });
+        Object.freeze(this);
+    }
+    writer() { return this.#writer; }
+    static bind(input) {
+        const endpoint = canonicalEgressEndpoint(input.endpoint);
+        if (typeof input.client?.upsertPoints !== "function" || typeof input.client.retrieve !== "function" || (input.client.ownerHost !== "pi" && input.client.ownerHost !== "prime") || input.client.collection !== expectedQdrantCollection(input.client.ownerHost) || !Number.isFinite(input.client.maxClockSkewMs) || typeof input.client.endpoint !== "string" || canonicalEgressEndpoint(input.client.endpoint) !== endpoint)
+            throw new TypeError("Qdrant writer endpoint/host/collection pairing is invalid");
+        return new ValidatedQdrantSessionWriter(endpoint, Object.freeze(input.client));
+    }
+}
+/** Explicit factory seam for endpoint-bound production writers and test fakes. */
+export function bindQdrantSessionWriter(input) { return ValidatedQdrantSessionWriter.bind(input); }
+function validCoordinationBinding(hash, epoch) {
+    if (typeof hash !== "string" || hash.length === 0 || hash.length > 512 || !/^[A-Za-z0-9._:-]+$/u.test(hash) || !Number.isSafeInteger(epoch) || epoch < 0)
+        throw new TypeError("Qdrant coordination binding is invalid");
+}
+function payloadValue(payload, camel, snake) { return Object.prototype.hasOwnProperty.call(payload, snake) ? payload[snake] : payload[camel]; }
+function optionalPayload(payload, camel, snake) { return Object.prototype.hasOwnProperty.call(payload, snake) ? payload[snake] : payload[camel]; }
+function sameCanonicalWirePayload(point, parsed) {
+    try {
+        return canonicalStringify(point.payload) === canonicalStringify(recordPayload(parsed));
+    }
+    catch {
+        return false;
+    }
+}
+function sameCanonicalWireVector(point, parsed) {
+    const expected = parsed.recordType === "episode" && parsed.vector !== undefined ? { semantic: parsed.vector } : null;
+    try {
+        return canonicalStringify(point.vector ?? null) === canonicalStringify(expected);
+    }
+    catch {
+        return false;
+    }
+}
+async function boundRetrieve(client, recordType, id) {
+    const policy = policyFor(client, recordType);
+    const point = (await client.retrieve([physicalPointId(recordType, id)], policy, { includeVector: true })).find((candidate) => candidate.id === physicalPointId(recordType, id));
+    if (point === undefined || point.payload.record_type !== recordType || point.payload.content_hash === undefined)
+        return null;
+    const common = {
+        recordType, id, ownerHost: payloadValue(point.payload, "ownerHost", "owner_host"), schemaRevision: payloadValue(point.payload, "schemaRevision", "schema_revision"),
+        createdAt: payloadValue(point.payload, "createdAt", "created_at"), privacyEpoch: payloadValue(point.payload, "privacyEpoch", "privacy_epoch"),
+        processingPolicyId: payloadValue(point.payload, "processingPolicyId", "processing_policy_id"), expiresAt: payloadValue(point.payload, "expiresAt", "expires_at"), contentHash: payloadValue(point.payload, "contentHash", "content_hash"),
+    };
+    const value = recordType === "processing_policy" ? {
+        ...common, policy: point.payload.policy, canonicalHash: payloadValue(point.payload, "canonicalHash", "canonical_hash"),
+    } : {
+        ...common, sourceEntryId: payloadValue(point.payload, "sourceEntryId", "source_entry_id"), host: point.payload.host,
+        projectId: payloadValue(point.payload, "projectId", "project_id"), projectIdentityKind: payloadValue(point.payload, "projectIdentityKind", "project_identity_kind"),
+        sessionId: payloadValue(point.payload, "sessionId", "session_id"), turnId: payloadValue(point.payload, "turnId", "turn_id"), agentRole: payloadValue(point.payload, "agentRole", "agent_role"),
+        depth: point.payload.depth, eventKind: payloadValue(point.payload, "eventKind", "event_kind"), eventAt: payloadValue(point.payload, "eventAt", "event_at"),
+        modelId: payloadValue(point.payload, "modelId", "model_id"), embeddingDimension: payloadValue(point.payload, "embeddingDimension", "embedding_dimension"),
+        originProvider: payloadValue(point.payload, "originProvider", "origin_provider"), destinationId: payloadValue(point.payload, "destinationId", "destination_id"),
+        status: point.payload.status, redactionStatus: payloadValue(point.payload, "redactionStatus", "redaction_status"), secretScan: payloadValue(point.payload, "secretScan", "secret_scan"),
+        ...(optionalPayload(point.payload, "text", "text") === undefined ? {} : { text: optionalPayload(point.payload, "text", "text") }),
+        ...(optionalPayload(point.payload, "toolName", "tool_name") === undefined ? {} : { toolName: optionalPayload(point.payload, "toolName", "tool_name") }),
+        ...(optionalPayload(point.payload, "toolArgs", "tool_args") === undefined ? {} : { toolArgs: optionalPayload(point.payload, "toolArgs", "tool_args") }),
+        ...(optionalPayload(point.payload, "errorFingerprint", "error_fingerprint") === undefined ? {} : { errorFingerprint: optionalPayload(point.payload, "errorFingerprint", "error_fingerprint") }),
+        ...(optionalPayload(point.payload, "producerId", "producer_id") === undefined ? {} : { producerId: optionalPayload(point.payload, "producerId", "producer_id") }),
+        ...(optionalPayload(point.payload, "nodeId", "node_id") === undefined ? {} : { nodeId: optionalPayload(point.payload, "nodeId", "node_id") }),
+        ...(point.vector?.semantic === undefined ? {} : { vector: point.vector.semantic }),
+    };
+    try {
+        const parsed = parseMemoryRecord(value);
+        if (parsed.contentHash !== canonicalRecordHash(parsed) || !sameCanonicalWirePayload(point, parsed) || !sameCanonicalWireVector(point, parsed))
+            return null;
+        return parsed;
+    }
+    catch {
+        return null;
+    }
+}
+function isVerifiedBoundCollision(readback, record) {
+    return readback !== null && readback.recordType === record.recordType && readback.id === record.id && readback.contentHash !== record.contentHash;
+}
+/** Create a closure that snapshots one canonical endpoint/client/destination pairing. */
+export function createQdrantDestinationFactory(input) {
+    validCoordinationBinding(input.coordinationPolicyHash, input.coordinationPolicyEpoch);
+    const endpoint = canonicalEgressEndpoint(input.endpoint);
+    if (!(input.client instanceof ValidatedQdrantSessionWriter) || input.client.endpoint !== endpoint || input.client.collection !== expectedQdrantCollection(input.client.ownerHost))
+        throw new TypeError("Qdrant writer endpoint/host/collection pairing is invalid");
+    const client = input.client.writer();
+    const ownerHost = input.client.ownerHost;
+    const collection = input.client.collection;
+    if (client.endpoint !== endpoint || client.ownerHost !== ownerHost || client.collection !== collection || client.collection !== expectedQdrantCollection(client.ownerHost))
+        throw new TypeError("Qdrant writer endpoint/host/collection pairing is invalid");
+    const egressMode = input.egressMode;
+    const nodeId = input.nodeId;
+    const configuredIdentity = Object.freeze({ ...input.destination });
+    const configured = bindConfiguredDestination({ endpoint, configuredDestination: configuredIdentity, requestedDestination: configuredIdentity, egressMode, ...(nodeId === undefined ? {} : { nodeId }) });
+    const coordination = Object.freeze({ policyHash: input.coordinationPolicyHash, policyEpoch: input.coordinationPolicyEpoch });
+    return Object.freeze({ bind: (requested) => {
+            const destination = Object.freeze({ ...bindConfiguredDestination({ endpoint, configuredDestination: configured, requestedDestination: requested, egressMode, ...(nodeId === undefined ? {} : { nodeId }) }) });
+            return Object.freeze({ destination, ownerHost, collection, coordination,
+                insertAndReadback: async (record) => {
+                    let result;
+                    try {
+                        result = await insertOnly(client, record);
+                    }
+                    catch {
+                        let observed = null;
+                        try {
+                            observed = await boundRetrieve(client, record.recordType, record.id);
+                        }
+                        catch { /* ambiguous readback remains retryable */ }
+                        if (isVerifiedBoundCollision(observed, record))
+                            throw new QdrantContentHashCollisionError();
+                        throw new Error("Qdrant insertion failed");
+                    }
+                    const readback = await boundRetrieve(client, record.recordType, record.id);
+                    if (readback === null)
+                        throw new Error("Qdrant insert/readback is unavailable");
+                    if (isVerifiedBoundCollision(readback, record))
+                        throw new QdrantContentHashCollisionError();
+                    if (readback.contentHash !== record.contentHash)
+                        throw new Error("Qdrant insert/readback is unavailable");
+                    return result;
+                },
+                retrieve: async (recordType, id) => boundRetrieve(client, recordType, id),
+            });
+        } });
+}
+/** Bind an exact expected identity; callers cannot pass an independent allowlist. */
+export function bindQdrantDestination(factory, destination) {
+    if (typeof factory?.bind !== "function")
+        throw new TypeError("Qdrant destination factory is invalid");
+    return factory.bind(destination);
 }
 //# sourceMappingURL=write.js.map

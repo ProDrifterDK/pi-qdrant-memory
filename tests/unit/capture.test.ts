@@ -322,8 +322,20 @@ describe("Task 4 persisted capture", () => {
     const deps = { sessionId: "session-safe", host: "pi" as const, getEntries: () => entries.slice(), readActivation: async (key: string) => state.get(key), writeActivation: async (key: string, value: string) => { state.set(key, value); }, now: () => 10 };
     await activateCapture(deps); entries.push(msg("roundtrip-tool", "toolResult", "safe", { toolName: "shell", status: "failed", error: "Bearer raw-error-token-1234567890" }));
     const records = await capturePersistedEntries({ ...deps, lifecycle: "agent_end", activationDir: "/unused", producerId: "sk-abcdefghijklmnopqrstuvwxyz123456", nodeId: "Bearer raw-node-token-1234567890" });
-    expect(records).toHaveLength(1); expect(() => parsePersistedMemoryRecord(records[0]!)).not.toThrow(); expect(Object.keys(records[0]!).sort()).not.toContain("redactionStatus");
+    expect(records).toHaveLength(1); expect(() => parsePersistedMemoryRecord(records[0]!)).not.toThrow(); expect(records[0]).toMatchObject({ redactionStatus: "redacted", secretScan: "passed" });
     expect(JSON.stringify(records)).not.toContain("sk-abcdefghijklmnopqrstuvwxyz123456"); expect(JSON.stringify(records)).not.toContain("raw-error-token-1234567890"); expect(JSON.stringify(records)).not.toContain(sha256Hex("raw-error-token-1234567890"));
+  });
+
+  it("persists the actual structural-redaction state and scans exactly the future egress concatenation", async () => {
+    const state = new Map<string, string>(); const entries: Entry[] = [msg("before-final-bytes", "user", "old")];
+    const deps = { sessionId: "final-bytes", host: "pi" as const, getEntries: () => entries.slice(), readActivation: async (key: string) => state.get(key), writeActivation: async (key: string, value: string) => { state.set(key, value); }, now: () => 10 };
+    await activateCapture(deps);
+    entries.push(msg("redacted-final-bytes", "user", "password=hunter2long"));
+    const [record] = await capturePersistedEntries({ ...deps, lifecycle: "agent_end", activationDir: "/unused" });
+    expect(record).toMatchObject({ redactionStatus: "redacted", secretScan: "passed", text: "password: [password redacted]" });
+    // This exact text/toolArgs/toolName order is consumed by Task 7; no later
+    // scanner transformation may bless different bytes.
+    expect([record?.text, record?.toolArgs, record?.toolName].filter((value): value is string => value !== undefined).join("\n")).toBe(record?.text);
   });
 
   it("reloads persisted file state, keeps secrets out of returned episodes, and never accepts settled", async () => {
@@ -380,4 +392,21 @@ describe("Task 4 persisted capture", () => {
     const outside = join(dir, "outside"); const linked = join(dir, "linked"); await symlink(outside, linked);
     expect(await resolveCaptureAgentDirectory({ host: "pi", homeDir: dir, env: { PI_CODING_AGENT_DIR: linked } })).toBeNull();
   });
+
+  it("persists redacted provenance for surviving dropped/replaced fields and retains error-only fingerprints", async () => {
+    const state = new Map<string, string>(); const entries: Entry[] = [];
+    const deps = { sessionId: "provenance", lifecycle: "agent_end" as const, host: "pi" as const, getEntries: () => entries.slice(), readActivation: async (key: string) => state.get(key), writeActivation: async (key: string, value: string) => { state.set(key, value); }, now: () => 1 };
+    await activateCapture(deps);
+    entries.push(
+      msg("dropped-text", "toolResult", "Bearer secret-token-1234567890", { toolName: "shell", arguments: { value: "safe argument" }, status: "failed", isError: true }),
+      msg("replaced-tool", "toolResult", "safe output", { toolName: "Authorization: Bearer secret-token-1234567890", status: "failed", isError: true }),
+      msg("error-only", "toolResult", "", { toolName: "shell", status: "failed", isError: true, errorFingerprint: "a".repeat(32) }),
+    );
+    const episodes = await capturePersistedEntries(deps);
+    const dropped = episodes.find((entry) => entry.sourceEntryId === "dropped-text"); const replaced = episodes.find((entry) => entry.sourceEntryId === "replaced-tool"); const errorOnly = episodes.find((entry) => entry.sourceEntryId === "error-only");
+    expect(dropped).toMatchObject({ redactionStatus: "redacted", toolName: "shell", toolArgs: "{\"value\":\"safe argument\"}" }); expect(dropped?.text).not.toContain("secret-token");
+    expect(replaced?.redactionStatus).toBe("redacted"); expect(replaced?.toolName).not.toContain("secret-token");
+    expect(errorOnly).toMatchObject({ eventKind: "tool_error", redactionStatus: "unchanged" }); expect(errorOnly?.errorFingerprint).toMatch(/^[a-f0-9]{32}$/u);
+  });
+
 });

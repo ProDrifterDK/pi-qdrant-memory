@@ -183,6 +183,11 @@ export function selectPersistedEntries(entries, options = {}) {
             const item = { sourceEntryId: entry.id, messageId: str(message.id) ?? entry.id, partIdentity: 0, eventKind: explicitFailure ? "tool_error" : "tool_result" };
             if (text !== undefined)
                 item.text = text;
+            // Failed tool results may carry an independently bounded argument excerpt;
+            // it is structurally redacted again by episode materialization.
+            const args = explicitFailure ? cleanText(toolArgsFrom(message), toolArgsChars, homeDir) : undefined;
+            if (args !== undefined)
+                item.toolArgs = args;
             if (name !== undefined)
                 item.toolName = bounded(name, 256);
             if (status !== undefined)

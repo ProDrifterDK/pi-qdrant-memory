@@ -34,6 +34,8 @@ export interface EpisodeRecord extends RecordEnvelope {
     originProvider: string;
     destinationId: string;
     status: "active";
+    /** Structural redaction of the persisted text/tool excerpts; final scan remains passed. */
+    redactionStatus: "unchanged" | "redacted";
     secretScan: "passed";
     text?: string;
     toolName?: string;
@@ -43,6 +45,12 @@ export interface EpisodeRecord extends RecordEnvelope {
     producerId?: string;
     nodeId?: string;
 }
+/**
+ * The sole semantic projection that crosses Task 7 document egress.  It is
+ * deterministic, scanner-safe by construction, and never includes the
+ * high-entropy error fingerprint itself (only its safe presence marker).
+ */
+export declare function episodeSemanticProjection(episode: Pick<EpisodeRecord, "eventKind" | "text" | "toolName" | "toolArgs" | "errorFingerprint">): string;
 export interface CuratedMemoryRecord extends DerivedEnvelope {
     recordType: "curated_memory";
     id: string;

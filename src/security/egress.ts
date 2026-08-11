@@ -24,7 +24,7 @@ function scanDecodedPath(path: string): void {
   const checked = redactAndScan({ text: decoded, maxChars: 4096, homeDir: "/" });
   if (checked.dropped || checked.secretScan !== "passed" || checked.redactionStatus !== "unchanged" || checked.text !== decoded) throw new TypeError("Endpoint contains unsafe material");
 }
-function normalizeEndpoint(endpoint: string): string {
+export function canonicalEgressEndpoint(endpoint: string): string {
   if (typeof endpoint !== "string" || endpoint.length > 4096) throw new TypeError("Endpoint is unbounded");
   const checked = redactAndScan({ text: endpoint, maxChars: 4096, homeDir: "/" });
   if (checked.dropped || checked.secretScan !== "passed" || checked.redactionStatus !== "unchanged" || checked.text !== endpoint) throw new TypeError("Endpoint contains unsafe material");
@@ -43,12 +43,12 @@ function validLabels(labels: Pick<AuthorizedDestination, "residency" | "dataUse"
   if (typeof labels.residency !== "string" || labels.residency.length === 0 || labels.residency.length > 128 || typeof labels.dataUse !== "string" || labels.dataUse.length === 0 || labels.dataUse.length > 128 || !/^[A-Za-z0-9._:/ -]+$/u.test(labels.residency) || !/^[A-Za-z0-9._:/ -]+$/u.test(labels.dataUse) || /(?:api[-_]?key|token|secret|password)/iu.test(`${labels.residency} ${labels.dataUse}`)) throw new TypeError("Egress labels are required and redacted");
 }
 export function localDestinationId(endpoint: string, nodeId: string, labels: Pick<AuthorizedDestination, "residency" | "dataUse"> = { residency: "local", dataUse: "memory" }): string {
-  validNode(nodeId); validLabels(labels); const normalized = normalizeEndpoint(endpoint); if (!isLoopback(normalized)) throw new Error("local_only egress requires a loopback or Unix-socket endpoint");
+  validNode(nodeId); validLabels(labels); const normalized = canonicalEgressEndpoint(endpoint); if (!isLoopback(normalized)) throw new Error("local_only egress requires a loopback or Unix-socket endpoint");
   const digest = createHash("sha256").update(canonicalStringify({ dataUse: labels.dataUse, endpoint: normalized, nodeId, residency: labels.residency }), "utf8").digest("hex").slice(0, 32);
   return `local:${digest}`;
 }
 export function destinationForEndpoint(endpoint: string, nodeId: string, labels: Pick<AuthorizedDestination, "residency" | "dataUse"> = { residency: "local", dataUse: "memory" }): EgressDestination {
-  validNode(nodeId); validLabels(labels); const normalized = normalizeEndpoint(endpoint); if (!isLoopback(normalized)) throw new Error("local_only egress requires a loopback or Unix-socket endpoint");
+  validNode(nodeId); validLabels(labels); const normalized = canonicalEgressEndpoint(endpoint); if (!isLoopback(normalized)) throw new Error("local_only egress requires a loopback or Unix-socket endpoint");
   return { id: localDestinationId(normalized, nodeId, labels), residency: labels.residency, dataUse: labels.dataUse, endpoint: normalized, nodeId };
 }
 export type EgressMaterialGate = RedactionResult;
@@ -81,3 +81,38 @@ export function canEgress(input: { mode: RuntimeConfig["privacy"]["egressMode"];
   return isDestinationAllowed(input.mode, input.destination, input.allowlist, input.options);
 }
 export function assertEgressAllowed(input: Parameters<typeof canEgress>[0]): void { if (!canEgress(input)) throw new Error("Egress destination or final payload is not authorized by the processing policy"); }
+
+
+/**
+ * Pin a configured endpoint to one declared destination identity.  The caller
+ * supplies no separate ID allowlist: for remote allowlist mode the configured
+ * pair is the authorization object; for local-only mode the identity is
+ * recomputed from the canonical loopback/Unix endpoint and node ID.
+ */
+export function bindConfiguredDestination(input: {
+  endpoint: string;
+  configuredDestination: AuthorizedDestination;
+  requestedDestination: AuthorizedDestination;
+  egressMode: RuntimeConfig["privacy"]["egressMode"];
+  nodeId?: string;
+}): AuthorizedDestination {
+  if (input.egressMode !== "local_only" && input.egressMode !== "allowlist") throw new TypeError("Egress mode is invalid");
+  const exact = (left: AuthorizedDestination, right: AuthorizedDestination): boolean => left.id === right.id && left.residency === right.residency && left.dataUse === right.dataUse;
+  const valid = (destination: AuthorizedDestination): void => {
+    if (typeof destination?.id !== "string" || destination.id.length === 0 || destination.id.length > 256 || !/^[A-Za-z0-9._:/-]+$/u.test(destination.id)) throw new TypeError("Configured destination identity is invalid");
+    const checked = redactAndScan({ text: destination.id, maxChars: 256, homeDir: "/" });
+    if (checked.dropped || checked.redactionStatus !== "unchanged" || checked.text !== destination.id) throw new TypeError("Configured destination identity is unsafe");
+    validLabels(destination);
+  };
+  valid(input.configuredDestination); valid(input.requestedDestination);
+  // Canonicalize/reject endpoint syntax even for allowlist mode. The factory
+  // captures this exact string alongside the destination and exposes neither.
+  const endpoint = canonicalEgressEndpoint(input.endpoint);
+  if (!exact(input.configuredDestination, input.requestedDestination)) throw new Error("Configured destination does not match the requested destination identity");
+  if (input.egressMode === "local_only") {
+    if (input.nodeId === undefined) throw new TypeError("local_only destination binding requires a node ID");
+    const actual = destinationForEndpoint(endpoint, input.nodeId, input.configuredDestination);
+    if (!exact(actual, input.configuredDestination)) throw new Error("Configured local destination does not match its canonical endpoint identity");
+  }
+  return Object.freeze({ id: input.configuredDestination.id, residency: input.configuredDestination.residency, dataUse: input.configuredDestination.dataUse });
+}

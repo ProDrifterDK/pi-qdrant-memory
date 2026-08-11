@@ -7,7 +7,7 @@ const envelope = { ownerHost: "pi" as const, schemaRevision: 1 as const, created
 const derivedEnvelope = { ...envelope, coordinationPolicyHash: "coordination-hash", coordinationPolicyEpoch: 3 };
 const policyBase = { id: "pending", ownerHost: "pi" as const, destinationIds: { qdrant: "qdrant-local", embedding: "embedding-local", llm: "llm-local" }, originProvider: "provider-a", allowCrossProviderReplay: false, expiresAt: null, residency: "local", dataUse: "memory", policyRevision: "revision-1" };
 const policy = { ...policyBase, id: processingPolicyHash(policyBase) };
-const episode = (): MemoryRecord => ({ ...envelope, recordType: "episode", id: "episode-1", contentHash: "hash", sourceEntryId: "source-1", host: "pi", projectId: "project-1", projectIdentityKind: "registered", sessionId: "session-1", turnId: "turn-1", agentRole: "root", depth: 0, eventKind: "user", eventAt: "2026-08-10T00:00:00.000Z", modelId: "provider-model", embeddingDimension: 1024, originProvider: "provider-a", destinationId: "local-node-a", status: "active", secretScan: "passed", text: "safe" });
+const episode = (): MemoryRecord => ({ ...envelope, recordType: "episode", id: "episode-1", contentHash: "hash", sourceEntryId: "source-1", host: "pi", projectId: "project-1", projectIdentityKind: "registered", sessionId: "session-1", turnId: "turn-1", agentRole: "root", depth: 0, eventKind: "user", eventAt: "2026-08-10T00:00:00.000Z", modelId: "provider-model", embeddingDimension: 1024, originProvider: "provider-a", destinationId: "local-node-a", status: "active", redactionStatus: "unchanged", secretScan: "passed", text: "safe" });
 
 describe("v2 record schemas", () => {
   it("accepts every discriminated record type with provenance closure", () => {

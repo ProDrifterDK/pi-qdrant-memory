@@ -26,7 +26,7 @@ function scanDecodedPath(path) {
     if (checked.dropped || checked.secretScan !== "passed" || checked.redactionStatus !== "unchanged" || checked.text !== decoded)
         throw new TypeError("Endpoint contains unsafe material");
 }
-function normalizeEndpoint(endpoint) {
+export function canonicalEgressEndpoint(endpoint) {
     if (typeof endpoint !== "string" || endpoint.length > 4096)
         throw new TypeError("Endpoint is unbounded");
     const checked = redactAndScan({ text: endpoint, maxChars: 4096, homeDir: "/" });
@@ -68,7 +68,7 @@ function validLabels(labels) {
 export function localDestinationId(endpoint, nodeId, labels = { residency: "local", dataUse: "memory" }) {
     validNode(nodeId);
     validLabels(labels);
-    const normalized = normalizeEndpoint(endpoint);
+    const normalized = canonicalEgressEndpoint(endpoint);
     if (!isLoopback(normalized))
         throw new Error("local_only egress requires a loopback or Unix-socket endpoint");
     const digest = createHash("sha256").update(canonicalStringify({ dataUse: labels.dataUse, endpoint: normalized, nodeId, residency: labels.residency }), "utf8").digest("hex").slice(0, 32);
@@ -77,7 +77,7 @@ export function localDestinationId(endpoint, nodeId, labels = { residency: "loca
 export function destinationForEndpoint(endpoint, nodeId, labels = { residency: "local", dataUse: "memory" }) {
     validNode(nodeId);
     validLabels(labels);
-    const normalized = normalizeEndpoint(endpoint);
+    const normalized = canonicalEgressEndpoint(endpoint);
     if (!isLoopback(normalized))
         throw new Error("local_only egress requires a loopback or Unix-socket endpoint");
     return { id: localDestinationId(normalized, nodeId, labels), residency: labels.residency, dataUse: labels.dataUse, endpoint: normalized, nodeId };
@@ -121,4 +121,38 @@ export function canEgress(input) {
 }
 export function assertEgressAllowed(input) { if (!canEgress(input))
     throw new Error("Egress destination or final payload is not authorized by the processing policy"); }
+/**
+ * Pin a configured endpoint to one declared destination identity.  The caller
+ * supplies no separate ID allowlist: for remote allowlist mode the configured
+ * pair is the authorization object; for local-only mode the identity is
+ * recomputed from the canonical loopback/Unix endpoint and node ID.
+ */
+export function bindConfiguredDestination(input) {
+    if (input.egressMode !== "local_only" && input.egressMode !== "allowlist")
+        throw new TypeError("Egress mode is invalid");
+    const exact = (left, right) => left.id === right.id && left.residency === right.residency && left.dataUse === right.dataUse;
+    const valid = (destination) => {
+        if (typeof destination?.id !== "string" || destination.id.length === 0 || destination.id.length > 256 || !/^[A-Za-z0-9._:/-]+$/u.test(destination.id))
+            throw new TypeError("Configured destination identity is invalid");
+        const checked = redactAndScan({ text: destination.id, maxChars: 256, homeDir: "/" });
+        if (checked.dropped || checked.redactionStatus !== "unchanged" || checked.text !== destination.id)
+            throw new TypeError("Configured destination identity is unsafe");
+        validLabels(destination);
+    };
+    valid(input.configuredDestination);
+    valid(input.requestedDestination);
+    // Canonicalize/reject endpoint syntax even for allowlist mode. The factory
+    // captures this exact string alongside the destination and exposes neither.
+    const endpoint = canonicalEgressEndpoint(input.endpoint);
+    if (!exact(input.configuredDestination, input.requestedDestination))
+        throw new Error("Configured destination does not match the requested destination identity");
+    if (input.egressMode === "local_only") {
+        if (input.nodeId === undefined)
+            throw new TypeError("local_only destination binding requires a node ID");
+        const actual = destinationForEndpoint(endpoint, input.nodeId, input.configuredDestination);
+        if (!exact(actual, input.configuredDestination))
+            throw new Error("Configured local destination does not match its canonical endpoint identity");
+    }
+    return Object.freeze({ id: input.configuredDestination.id, residency: input.configuredDestination.residency, dataUse: input.configuredDestination.dataUse });
+}
 //# sourceMappingURL=egress.js.map

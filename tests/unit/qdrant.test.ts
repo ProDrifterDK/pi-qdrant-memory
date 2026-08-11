@@ -17,7 +17,7 @@ function episode(overrides: Partial<EpisodeRecord> = {}): EpisodeRecord {
     sourceEntryId: "entry-1", host: "pi" as const, projectId: "project-1", projectIdentityKind: "registered" as const,
     sessionId: "session-1", turnId: "turn-1", agentRole: "root" as const, depth: 0, eventKind: "user" as const,
     eventAt: "2026-08-10T00:00:00.000Z", modelId: "model-1", embeddingDimension: 1024, originProvider: "provider-1",
-    destinationId: "destination-1", status: "active" as const, secretScan: "passed" as const, text: "safe",
+    destinationId: "destination-1", status: "active" as const, redactionStatus: "unchanged" as const, secretScan: "passed" as const, text: "safe",
   } satisfies EpisodeRecord;
   const value = { ...base, ...overrides };
   return { ...value, contentHash: canonicalRecordHash(value) } as EpisodeRecord;

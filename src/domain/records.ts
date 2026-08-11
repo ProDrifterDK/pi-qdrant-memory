@@ -44,6 +44,8 @@ export interface EpisodeRecord extends RecordEnvelope {
   originProvider: string;
   destinationId: string;
   status: "active";
+  /** Structural redaction of the persisted text/tool excerpts; final scan remains passed. */
+  redactionStatus: "unchanged" | "redacted";
   secretScan: "passed";
   text?: string;
   toolName?: string;
@@ -53,6 +55,20 @@ export interface EpisodeRecord extends RecordEnvelope {
   producerId?: string;
   nodeId?: string;
 }
+/**
+ * The sole semantic projection that crosses Task 7 document egress.  It is
+ * deterministic, scanner-safe by construction, and never includes the
+ * high-entropy error fingerprint itself (only its safe presence marker).
+ */
+export function episodeSemanticProjection(episode: Pick<EpisodeRecord, "eventKind" | "text" | "toolName" | "toolArgs" | "errorFingerprint">): string {
+  const parts = [`event:${episode.eventKind}`];
+  if (episode.toolName !== undefined) parts.push(`tool:${episode.toolName}`);
+  if (episode.text !== undefined) parts.push(`text:${episode.text}`);
+  if (episode.toolArgs !== undefined) parts.push(`tool_args:${episode.toolArgs}`);
+  if (episode.errorFingerprint !== undefined) parts.push("error_fingerprint:present");
+  return parts.join("\n");
+}
+
 export interface CuratedMemoryRecord extends DerivedEnvelope {
   recordType: "curated_memory";
   id: string;
@@ -191,7 +207,7 @@ export interface RecordValidationContext {
 const COMMON_KEYS = new Set(["recordType", "id", "ownerHost", "schemaRevision", "createdAt", "privacyEpoch", "processingPolicyId", "expiresAt", "contentHash"]);
 const DERIVED_KEYS = new Set(["coordinationPolicyHash", "coordinationPolicyEpoch"]);
 const RECORD_KEYS: Record<string, ReadonlySet<string>> = {
-  episode: new Set([...COMMON_KEYS, "sourceEntryId", "host", "projectId", "projectIdentityKind", "sessionId", "turnId", "agentRole", "depth", "eventKind", "eventAt", "modelId", "embeddingDimension", "originProvider", "destinationId", "status", "secretScan", "text", "toolName", "toolArgs", "errorFingerprint", "vector", "producerId", "nodeId"]),
+  episode: new Set([...COMMON_KEYS, "sourceEntryId", "host", "projectId", "projectIdentityKind", "sessionId", "turnId", "agentRole", "depth", "eventKind", "eventAt", "modelId", "embeddingDimension", "originProvider", "destinationId", "status", "redactionStatus", "secretScan", "text", "toolName", "toolArgs", "errorFingerprint", "vector", "producerId", "nodeId"]),
   curated_memory: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "contentId", "observationId", "eventAt", "effectiveAt", "sourceEpisodeIds", "manifestHash", "primaryEvidenceEpisodeId", "effectiveOrder", "stateKey", "category", "scope", "subject", "predicate", "value", "text", "provenance", "confidence", "vector"]),
   curated_current: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "contentId", "observationId", "version", "stateKey", "resolution", "conflictManifestHash", "effectiveOrder", "sourceEpisodeIds", "text", "vector"]),
   raptor_summary: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "generationId", "clusterId", "membershipHash", "level", "memberIds", "manifestHash", "summary", "vector", "modelId", "embeddingDimension", "promptRevision", "algorithm", "seed", "jobId", "fencingToken", "temporalFrom", "temporalTo", "coveredProjects", "algorithmParameters"]),
@@ -249,7 +265,7 @@ function validate(value: PlainRecord, context: RecordValidationContext): MemoryR
   if (isDerived) derived(value, context);
   switch (recordType) {
     case "episode":
-      text("sourceEntryId", value.sourceEntryId); host("host", value.host); if (value.host !== value.ownerHost) fail("episode host mismatch"); text("projectId", value.projectId); if (value.projectIdentityKind !== "registered" && value.projectIdentityKind !== "local_only") fail("project identity kind invalid"); text("sessionId", value.sessionId); text("turnId", value.turnId); if (value.agentRole !== "root" && value.agentRole !== "child") fail("agent role invalid"); integer("depth", value.depth); if (!["user", "assistant", "tool_call", "tool_result", "tool_error"].includes(String(value.eventKind))) fail("event kind invalid"); isoDate("eventAt", value.eventAt); text("modelId", value.modelId); integer("embeddingDimension", value.embeddingDimension, 1, 65536); if (value.embeddingDimension !== (context.vectorDimension ?? 1024)) fail("embedding dimension mismatch"); text("originProvider", value.originProvider, MAX_ID_CHARS, false); text("destinationId", value.destinationId); if (value.status !== "active") fail("episode status invalid"); if (value.secretScan !== "passed") fail("secret scan invalid");
+      text("sourceEntryId", value.sourceEntryId); host("host", value.host); if (value.host !== value.ownerHost) fail("episode host mismatch"); text("projectId", value.projectId); if (value.projectIdentityKind !== "registered" && value.projectIdentityKind !== "local_only") fail("project identity kind invalid"); text("sessionId", value.sessionId); text("turnId", value.turnId); if (value.agentRole !== "root" && value.agentRole !== "child") fail("agent role invalid"); integer("depth", value.depth); if (!["user", "assistant", "tool_call", "tool_result", "tool_error"].includes(String(value.eventKind))) fail("event kind invalid"); isoDate("eventAt", value.eventAt); text("modelId", value.modelId); integer("embeddingDimension", value.embeddingDimension, 1, 65536); if (value.embeddingDimension !== (context.vectorDimension ?? 1024)) fail("embedding dimension mismatch"); text("originProvider", value.originProvider, MAX_ID_CHARS, false); text("destinationId", value.destinationId); if (value.status !== "active") fail("episode status invalid"); if (value.redactionStatus !== "unchanged" && value.redactionStatus !== "redacted") fail("redaction status invalid"); if (value.secretScan !== "passed") fail("secret scan invalid");
       if (value.text !== undefined) text("text", value.text, context.maxTextChars ?? MAX_TEXT_CHARS, false); if (value.toolName !== undefined) text("toolName", value.toolName, MAX_ID_CHARS, false); if (value.toolArgs !== undefined) text("toolArgs", value.toolArgs, context.maxTextChars ?? MAX_TEXT_CHARS, false); if (value.errorFingerprint !== undefined) text("errorFingerprint", value.errorFingerprint, MAX_ID_CHARS, false); if (value.producerId !== undefined) text("producerId", value.producerId); if (value.nodeId !== undefined) text("nodeId", value.nodeId); if (value.vector !== undefined) vector(value.vector, context.vectorDimension ?? 1024); return value as unknown as EpisodeRecord;
     case "curated_memory":
       text("contentId", value.contentId); text("observationId", value.observationId); isoDate("eventAt", value.eventAt); isoDate("effectiveAt", value.effectiveAt); try { validateEffectiveOrder(value.effectiveOrder); } catch { fail("effectiveOrder is invalid"); } if (value.sourceEpisodeIds !== undefined) ids("sourceEpisodeIds", value.sourceEpisodeIds); if (value.manifestHash !== undefined) text("manifestHash", value.manifestHash, MAX_ID_CHARS, false); if (value.primaryEvidenceEpisodeId !== undefined) text("primaryEvidenceEpisodeId", value.primaryEvidenceEpisodeId); if (value.sourceEpisodeIds === undefined && value.manifestHash === undefined && value.primaryEvidenceEpisodeId === undefined) fail("derived source/manifest closure missing"); if (value.provenance !== undefined) ids("provenance", value.provenance); optionalText("stateKey", value.stateKey); optionalText("category", value.category, MAX_ID_CHARS, false); optionalText("scope", value.scope, MAX_ID_CHARS, false); optionalText("subject", value.subject, MAX_ID_CHARS, false); optionalText("predicate", value.predicate, MAX_ID_CHARS, false); if (value.value !== undefined) { try { const serialized = canonicalStringify(value.value); if (serialized.length > (context.maxTextChars ?? MAX_TEXT_CHARS)) fail("value is unbounded"); } catch { fail("value is not canonical JSON"); } } if (value.text !== undefined) text("text", value.text, context.maxTextChars ?? MAX_TEXT_CHARS, false); if (value.confidence !== undefined) { finite("confidence", value.confidence); if (value.confidence < 0 || value.confidence > 1) fail("confidence invalid"); } if (value.vector !== undefined) vector(value.vector, context.vectorDimension ?? 1024); return value as unknown as CuratedMemoryRecord;
