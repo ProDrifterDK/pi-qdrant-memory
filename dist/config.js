@@ -550,7 +550,16 @@ export async function loadConfig(host, deps) {
             maxInputTokens: boundedInteger("curation.maxInputTokens", curation.maxInputTokens, 512, 65536),
         },
         memoryModel: {
-            ...(memoryModel.modelId === undefined ? {} : { modelId: boundedIdentifier("memoryModel.modelId", memoryModel.modelId, "", 256) }),
+            ...(memoryModel.modelId === undefined ? {} : {
+                modelId: (() => {
+                    // Match vendor prefixes and punctuation/whitespace aliases before generic ID validation.
+                    const rawModelId = stringValue("memoryModel.modelId", memoryModel.modelId, "");
+                    if (rawModelId.toLowerCase().replace(/[^a-z0-9]/gu, "").includes("bgem3")) {
+                        throw new Error("memoryModel.modelId must not select BGE-M3 for generation");
+                    }
+                    return boundedIdentifier("memoryModel.modelId", rawModelId, "", 256);
+                })(),
+            }),
             timeoutMs: boundedInteger("memoryModel.timeoutMs", memoryModel.timeoutMs, 1000, 120000),
             maxOutputTokens: boundedInteger("memoryModel.maxOutputTokens", memoryModel.maxOutputTokens, 128, 8192),
         },

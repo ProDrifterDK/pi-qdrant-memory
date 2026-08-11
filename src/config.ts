@@ -424,7 +424,7 @@ export async function loadConfig(host: HostId, deps: ConfigLoadDependencies): Pr
   const coordination = mergeRecords(defaults.coordination, section(file, "coordination", "coordination configuration"), section(hostOverrides, "coordination", `${host}.coordination configuration`));
   const outbox = mergeRecords(defaults.outbox as unknown as JsonRecord, section(file, "outbox", "outbox configuration"), section(hostOverrides, "outbox", `${host}.outbox configuration`));
   const curation = mergeRecords(defaults.curation, section(file, "curation", "curation configuration"), section(hostOverrides, "curation", `${host}.curation configuration`));
-  const memoryModel = mergeRecords(defaults.memoryModel, section(file, "memoryModel", "memoryModel configuration"), section(hostOverrides, "memoryModel", `${host}.memoryModel configuration`));
+  const memoryModel = mergeRecords(defaults.memoryModel as unknown as JsonRecord, section(file, "memoryModel", "memoryModel configuration"), section(hostOverrides, "memoryModel", `${host}.memoryModel configuration`));
   const raptor = mergeRecords(defaults.raptor, section(file, "raptor", "raptor configuration"), section(hostOverrides, "raptor", `${host}.raptor configuration`));
 
   const autoRecallRaw = deps.env[`${PREFIX}AUTO_RECALL`];
@@ -530,7 +530,16 @@ export async function loadConfig(host: HostId, deps: ConfigLoadDependencies): Pr
       maxInputTokens: boundedInteger("curation.maxInputTokens", curation.maxInputTokens, 512, 65536),
     },
     memoryModel: {
-      ...(memoryModel.modelId === undefined ? {} : { modelId: boundedIdentifier("memoryModel.modelId", memoryModel.modelId, "", 256) }),
+      ...(memoryModel.modelId === undefined ? {} : {
+        modelId: (() => {
+          // Match vendor prefixes and punctuation/whitespace aliases before generic ID validation.
+          const rawModelId = stringValue("memoryModel.modelId", memoryModel.modelId, "");
+          if (rawModelId.toLowerCase().replace(/[^a-z0-9]/gu, "").includes("bgem3")) {
+            throw new Error("memoryModel.modelId must not select BGE-M3 for generation");
+          }
+          return boundedIdentifier("memoryModel.modelId", rawModelId, "", 256);
+        })(),
+      }),
       timeoutMs: boundedInteger("memoryModel.timeoutMs", memoryModel.timeoutMs, 1000, 120000),
       maxOutputTokens: boundedInteger("memoryModel.maxOutputTokens", memoryModel.maxOutputTokens, 128, 8192),
     },

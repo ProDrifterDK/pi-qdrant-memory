@@ -38,6 +38,13 @@ export interface RetrievalConfig {
   childSearch: boolean;
 }
 
+/** Dedicated generation-model limits. BGE-M3 belongs exclusively to embeddings. */
+export interface MemoryModelConfig {
+  modelId?: string;
+  timeoutMs: number;
+  maxOutputTokens: number;
+}
+
 export interface RuntimeConfig {
   host: HostId;
   configPath: string;
@@ -89,11 +96,7 @@ export interface RuntimeConfig {
     toolTrigger: number;
     maxInputTokens: number;
   };
-  memoryModel: {
-    modelId?: string;
-    timeoutMs: number;
-    maxOutputTokens: number;
-  };
+  memoryModel: MemoryModelConfig;
   raptor: {
     rebuildEpisodeDelta: number;
     maxLevels: number;
