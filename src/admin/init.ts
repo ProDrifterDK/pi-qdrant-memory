@@ -1,13 +1,14 @@
 import { MemoryClientError } from "../clients/http.js";
 import { canonicalStringify, sha256Hex } from "../domain/canonical.js";
 import { parseMemoryRecord, type ControlRecord } from "../domain/records.js";
-import { QdrantAdminClient, readPolicy } from "../qdrant/client.js";
-import { COLLECTION_CONTROL_ID, COLLECTION_METADATA_ID, REQUIRED_INDEXES, V2_COLLECTION_METADATA, V2_CONTRACT_HASH, assertBootstrapControl, isBootstrapControlPayload, isCollectionMetadataPayload, isValidBootstrapControlPayload } from "../qdrant/schema.js";
+import { readPolicy, type QdrantClientOptions, type QdrantPoint } from "../qdrant/client.js";
+import { adminCollectionInfo, adminCreateCollection, adminCreatePayloadIndex, adminInsertInitialControlPoint, adminInsertMetadataPoint, adminRetrieve, adminServerInfo } from "./transport.js";
+import { COLLECTION_CONTROL_ID, COLLECTION_METADATA_ID, REQUIRED_INDEXES, V2_COLLECTION_METADATA, V2_CONTRACT_HASH, assertBootstrapControl, controlRecordFromPayload, isBootstrapControlPayload, isCollectionMetadataPayload } from "../qdrant/schema.js";
 import type { RuntimeConfig } from "../types.js";
 
 export interface InitializeDestinationResult { host: RuntimeConfig["host"]; collection: string; ownerHost: RuntimeConfig["host"]; schema: "pi-qdrant-memory-v2"; schemaRevision: 1; vector: { name: "semantic"; model: "bge-m3"; dimension: 1024; distance: "Cosine" }; capture: { enabled: boolean; episodeRetentionDays: RuntimeConfig["capture"]["episodeRetentionDays"] }; initialized: boolean; collectionCreated: boolean; qdrantVersion?: string; }
 export interface InitializeDestinationDependencies { signal?: AbortSignal; fetchImpl?: typeof fetch; adminApiKey?: string; now?: () => number; initialControl?: ControlRecord; retryAttempts?: number; retryDelayMs?: number; }
-function defaultControl(config: RuntimeConfig, now: () => number): ControlRecord { const instant = new Date(now()); if (!Number.isFinite(instant.getTime())) throw new TypeError("Initialization clock is invalid"); const base = { ownerHost: config.host, schemaRevision: 1 as const, createdAt: instant.toISOString(), privacyEpoch: 0, processingPolicyId: V2_CONTRACT_HASH, expiresAt: null, recordType: "collection_control" as const, id: COLLECTION_CONTROL_ID, version: 0, activeGeneration: null, activeBaseGeneration: null, coordinationPolicyEpoch: 0, coordinationPolicyHash: V2_CONTRACT_HASH, state: "active" as const, scanCursor: null, lastForgetBarrier: null, contentHash: "pending" }; const copy: Record<string, unknown> = { ...base }; delete copy.contentHash; delete copy.createdAt; return { ...base, contentHash: sha256Hex(canonicalStringify(copy)) }; }
+function defaultControl(config: RuntimeConfig, now: () => number): ControlRecord { const instant = new Date(now()); if (!Number.isFinite(instant.getTime())) throw new TypeError("Initialization clock is invalid"); const base = { ownerHost: config.host, schemaRevision: 1 as const, createdAt: instant.toISOString(), privacyEpoch: 0, processingPolicyId: V2_CONTRACT_HASH, expiresAt: null, recordType: "collection_control" as const, id: COLLECTION_CONTROL_ID, version: 0, activeGeneration: null, activeBaseGeneration: null, coordinationPolicyEpoch: 0, coordinationPolicyHash: V2_CONTRACT_HASH, state: "active" as const, scanCursor: null, lastForgetBarrier: null, revokedDestinationIds: [], contentHash: "pending" }; const copy: Record<string, unknown> = { ...base }; delete copy.contentHash; delete copy.createdAt; return { ...base, contentHash: sha256Hex(canonicalStringify(copy)) }; }
 function validateReplicaConfig(config: RuntimeConfig): void { const replication = config.qdrant.replicationFactor; const consistency = config.qdrant.writeConsistencyFactor; if (!Number.isSafeInteger(replication) || !Number.isSafeInteger(consistency) || replication < 1 || consistency < 1 || consistency > replication) throw new TypeError("Qdrant replica configuration is invalid"); if (replication === 1 && consistency !== 1) { if (consistency !== 1) throw new TypeError("Single-node Qdrant requires write consistency 1/1"); } else if (consistency < Math.ceil((replication + 1) / 2)) throw new TypeError("Qdrant write consistency is below the cluster majority"); }
 function notFound(error: unknown): boolean { return error instanceof MemoryClientError && error.category === "http" && error.status === 404; }
 function conflict(error: unknown): boolean { return error instanceof MemoryClientError && error.category === "http" && error.status === 409; }
@@ -16,43 +17,69 @@ function validateIndexes(schema: Record<string, unknown> | undefined): void { if
 function metadataPolicy(config: RuntimeConfig, now: number) { return readPolicy({ ownerHost: config.host, purpose: "metadata", recordTypes: ["collection_metadata"], now, maxClockSkewMs: config.coordination.maxClockSkewMs }); }
 function controlPolicy(config: RuntimeConfig, now: number) { return readPolicy({ ownerHost: config.host, purpose: "control", recordTypes: ["collection_control"], now, maxClockSkewMs: config.coordination.maxClockSkewMs }); }
 async function delay(ms: number): Promise<void> { if (ms > 0) await new Promise((resolve) => setTimeout(resolve, ms)); }
+/**
+ * EXACT initialization retrieve: the response must be zero points (when
+ * missing is permitted) or exactly ONE point whose OUTER id equals the
+ * requested id. Extras, duplicates or unrequested/alias physical points
+ * THROW — a single unrequested physical point carrying a valid payload is
+ * never accepted at any preflight, concurrent retry or post-insert readback.
+ */
+function exactRetrieve(points: readonly QdrantPoint[], requestedId: string, allowMissing: boolean): QdrantPoint | undefined {
+  const matches = points.filter((point) => point.id === requestedId);
+  if (points.length !== matches.length || matches.length > 1) throw new Error("Qdrant initialization readback is ambiguous");
+  const point = matches[0];
+  if (point === undefined) {
+    if (allowMissing) return undefined;
+    throw new Error(`Qdrant initialization point is missing: ${requestedId}`);
+  }
+  return point;
+}
 
 /** Destination initialization never consults ambient process credentials. */
 export async function initializeDestination(config: RuntimeConfig, deps: InitializeDestinationDependencies = {}): Promise<InitializeDestinationResult> {
   if (deps.fetchImpl === undefined && deps.adminApiKey === undefined) return result(config, false, false);
   validateReplicaConfig(config); if (deps.adminApiKey === undefined || deps.adminApiKey.trim() === "") throw new TypeError("Human Qdrant admin key is required");
-  const admin = new QdrantAdminClient({ baseUrl: config.qdrant.url, collection: config.qdrant.collection, ownerHost: config.host, apiKey: deps.adminApiKey, timeoutMs: config.retrieval.timeoutMs, ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }), ...(deps.signal === undefined ? {} : { signal: deps.signal }), readConsistency: config.coordination.readConsistency, maxClockSkewMs: config.coordination.maxClockSkewMs, replicationFactor: config.qdrant.replicationFactor, writeConsistencyFactor: config.qdrant.writeConsistencyFactor });
+  // The admin transport is LEXICAL inside admin/transport.ts; the CLI only
+  // calls named admin operations with validated options. No admin
+  // constructor/factory/writer is reachable from any package module.
+  const adminOptions: QdrantClientOptions & { apiKey: string } = { baseUrl: config.qdrant.url, collection: config.qdrant.collection, ownerHost: config.host, apiKey: deps.adminApiKey, timeoutMs: config.retrieval.timeoutMs, ...(deps.signal === undefined ? {} : { signal: deps.signal }), readConsistency: config.coordination.readConsistency, maxClockSkewMs: config.coordination.maxClockSkewMs, replicationFactor: config.qdrant.replicationFactor, writeConsistencyFactor: config.qdrant.writeConsistencyFactor };
+  const fetchImpl: typeof fetch = deps.fetchImpl ?? (typeof globalThis !== "undefined" ? globalThis.fetch : fetch);
   const now = deps.now ?? (() => Date.now()); const control = deps.initialControl ?? defaultControl(config, now); assertBootstrapControl(control, config.host);
-  const qdrantVersion = await admin.serverInfo(); let created = false; let concurrentWinner = false;
-  try { await admin.collectionInfo(); } catch (error: unknown) {
+  const qdrantVersion = await adminServerInfo(adminOptions, fetchImpl); let created = false; let concurrentWinner = false;
+  try { await adminCollectionInfo(adminOptions, fetchImpl); } catch (error: unknown) {
     if (!notFound(error)) throw error;
-    try { await admin.createCollection(); created = true; await admin.collectionInfo(); } catch (createError: unknown) {
+    try { await adminCreateCollection(adminOptions, fetchImpl); created = true; await adminCollectionInfo(adminOptions, fetchImpl); } catch (createError: unknown) {
       if (!conflict(createError)) throw createError; concurrentWinner = true;
       const attempts = Math.max(1, Math.min(5, deps.retryAttempts ?? 3)); let reread = false;
-      for (let attempt = 0; attempt < attempts; attempt += 1) { try { await admin.collectionInfo(); reread = true; break; } catch (error: unknown) { if (!notFound(error)) throw error; await delay(deps.retryDelayMs ?? 0); } }
+      for (let attempt = 0; attempt < attempts; attempt += 1) { try { await adminCollectionInfo(adminOptions, fetchImpl); reread = true; break; } catch (error: unknown) { if (!notFound(error)) throw error; await delay(deps.retryDelayMs ?? 0); } }
       if (!reread) throw new Error("Concurrent collection creation did not become readable");
     }
   }
-  const metadataPolicyValue = metadataPolicy(config, now()); let metadata = await admin.retrieve([COLLECTION_METADATA_ID], metadataPolicyValue);
-  if (concurrentWinner && metadata.length === 0) { const attempts = Math.max(1, Math.min(5, deps.retryAttempts ?? 3)); for (let attempt = 1; attempt < attempts && metadata.length === 0; attempt += 1) { await delay(deps.retryDelayMs ?? 0); metadata = await admin.retrieve([COLLECTION_METADATA_ID], metadataPolicy(config, now())); } }
+  const metadataPolicyValue = metadataPolicy(config, now()); let metadataPoint = exactRetrieve(await adminRetrieve(adminOptions, fetchImpl, [COLLECTION_METADATA_ID], metadataPolicyValue), COLLECTION_METADATA_ID, true);
+  if (concurrentWinner && metadataPoint === undefined) { const attempts = Math.max(1, Math.min(5, deps.retryAttempts ?? 3)); for (let attempt = 1; attempt < attempts && metadataPoint === undefined; attempt += 1) { await delay(deps.retryDelayMs ?? 0); metadataPoint = exactRetrieve(await adminRetrieve(adminOptions, fetchImpl, [COLLECTION_METADATA_ID], metadataPolicy(config, now())), COLLECTION_METADATA_ID, true); } }
   if (created) {
-    if (metadata.length !== 0) throw new Error("New collection unexpectedly contains metadata before initialization");
-    await admin.insertMetadataPoint(config.host);
-    const metadataReadback = await admin.retrieve([COLLECTION_METADATA_ID], metadataPolicy(config, now()));
-    if (metadataReadback.length !== 1 || !isCollectionMetadataPayload(metadataReadback[0]!.payload, config.host)) throw new Error("Qdrant collection metadata contract mismatch");
+    if (metadataPoint !== undefined) throw new Error("New collection unexpectedly contains metadata before initialization");
+    await adminInsertMetadataPoint(adminOptions, fetchImpl, config.host);
+    const metadataReadback = exactRetrieve(await adminRetrieve(adminOptions, fetchImpl, [COLLECTION_METADATA_ID], metadataPolicy(config, now())), COLLECTION_METADATA_ID, false);
+    if (metadataReadback === undefined || !isCollectionMetadataPayload(metadataReadback.payload, config.host)) throw new Error("Qdrant collection metadata contract mismatch");
   } else {
-    if (metadata.length !== 1 || !isCollectionMetadataPayload(metadata[0]!.payload, config.host)) throw new Error("Pre-existing collection metadata is missing or foreign");
-    let existingControl = await admin.retrieve([COLLECTION_CONTROL_ID], controlPolicy(config, now()));
-    if (concurrentWinner && existingControl.length === 0) { const attempts = Math.max(1, Math.min(5, deps.retryAttempts ?? 3)); for (let attempt = 1; attempt < attempts && existingControl.length === 0; attempt += 1) { await delay(deps.retryDelayMs ?? 0); existingControl = await admin.retrieve([COLLECTION_CONTROL_ID], controlPolicy(config, now())); } }
-    if (existingControl.length !== 1 || !isValidBootstrapControlPayload(existingControl[0]!.payload, config.host)) throw new Error("Pre-existing collection control is missing or invalid");
+    if (metadataPoint === undefined || !isCollectionMetadataPayload(metadataPoint.payload, config.host)) throw new Error("Pre-existing collection metadata is missing or foreign");
+    let existingControlPoint = exactRetrieve(await adminRetrieve(adminOptions, fetchImpl, [COLLECTION_CONTROL_ID], controlPolicy(config, now())), COLLECTION_CONTROL_ID, true);
+    if (concurrentWinner && existingControlPoint === undefined) { const attempts = Math.max(1, Math.min(5, deps.retryAttempts ?? 3)); for (let attempt = 1; attempt < attempts && existingControlPoint === undefined; attempt += 1) { await delay(deps.retryDelayMs ?? 0); existingControlPoint = exactRetrieve(await adminRetrieve(adminOptions, fetchImpl, [COLLECTION_CONTROL_ID], controlPolicy(config, now())), COLLECTION_CONTROL_ID, true); } }
+    // Idempotent admin restart after legitimate control evolution: for a
+    // PRE-EXISTING collection the current control may be ANY valid version/
+    // state (active/draining/retired) after policy/privacy CAS — it is only
+    // validated exactly (controlRecordFromPayload), never reset or mutated.
+    if (existingControlPoint === undefined) throw new Error("Pre-existing collection control is missing or invalid");
+    try { controlRecordFromPayload(existingControlPoint.payload, config.host); } catch { throw new Error("Pre-existing collection control is missing or invalid"); }
   }
-  const info = await admin.collectionInfo(); if (info.dimension !== V2_COLLECTION_METADATA.embedding_dimension || info.distance !== V2_COLLECTION_METADATA.distance) throw new Error("Qdrant collection vector contract mismatch");
-  for (const [field, schema] of REQUIRED_INDEXES) await admin.createPayloadIndex(field, schema);
-  validateIndexes((await admin.collectionInfo()).payloadSchema);
+  const info = await adminCollectionInfo(adminOptions, fetchImpl); if (info.dimension !== V2_COLLECTION_METADATA.embedding_dimension || info.distance !== V2_COLLECTION_METADATA.distance) throw new Error("Qdrant collection vector contract mismatch");
+  for (const [field, schema] of REQUIRED_INDEXES) await adminCreatePayloadIndex(adminOptions, fetchImpl, field, schema);
+  validateIndexes((await adminCollectionInfo(adminOptions, fetchImpl)).payloadSchema);
   if (created) {
-    await admin.insertInitialControlPoint(control);
-    const readback = await admin.retrieve([COLLECTION_CONTROL_ID], controlPolicy(config, now()));
-    if (readback.length !== 1 || !isBootstrapControlPayload(readback[0]!.payload, control, config.host)) throw new Error("Bootstrap control readback mismatch");
+    await adminInsertInitialControlPoint(adminOptions, fetchImpl, control);
+    const readback = exactRetrieve(await adminRetrieve(adminOptions, fetchImpl, [COLLECTION_CONTROL_ID], controlPolicy(config, now())), COLLECTION_CONTROL_ID, false);
+    if (readback === undefined || !isBootstrapControlPayload(readback.payload, control, config.host)) throw new Error("Bootstrap control readback mismatch");
   }
   return result(config, true, created, qdrantVersion.version);
 }

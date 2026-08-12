@@ -96,7 +96,22 @@ export function bindConfiguredDestination(input: {
   egressMode: RuntimeConfig["privacy"]["egressMode"];
   nodeId?: string;
 }): AuthorizedDestination {
-  if (input.egressMode !== "local_only" && input.egressMode !== "allowlist") throw new TypeError("Egress mode is invalid");
+  // GLOBAL RULE: snapshot every untrusted field EXACTLY ONCE; no getter is
+  // ever re-read and no caller object is spread.
+  const endpoint = input.endpoint;
+  const configuredInput = input.configuredDestination;
+  const requestedInput = input.requestedDestination;
+  const configuredId = configuredInput.id;
+  const configuredResidency = configuredInput.residency;
+  const configuredDataUse = configuredInput.dataUse;
+  const requestedId = requestedInput.id;
+  const requestedResidency = requestedInput.residency;
+  const requestedDataUse = requestedInput.dataUse;
+  const egressMode = input.egressMode;
+  const nodeId = input.nodeId;
+  const configuredDestination = Object.freeze({ id: configuredId, residency: configuredResidency, dataUse: configuredDataUse });
+  const requestedDestination = Object.freeze({ id: requestedId, residency: requestedResidency, dataUse: requestedDataUse });
+  if (egressMode !== "local_only" && egressMode !== "allowlist") throw new TypeError("Egress mode is invalid");
   const exact = (left: AuthorizedDestination, right: AuthorizedDestination): boolean => left.id === right.id && left.residency === right.residency && left.dataUse === right.dataUse;
   const valid = (destination: AuthorizedDestination): void => {
     if (typeof destination?.id !== "string" || destination.id.length === 0 || destination.id.length > 256 || !/^[A-Za-z0-9._:/-]+$/u.test(destination.id)) throw new TypeError("Configured destination identity is invalid");
@@ -104,15 +119,15 @@ export function bindConfiguredDestination(input: {
     if (checked.dropped || checked.redactionStatus !== "unchanged" || checked.text !== destination.id) throw new TypeError("Configured destination identity is unsafe");
     validLabels(destination);
   };
-  valid(input.configuredDestination); valid(input.requestedDestination);
+  valid(configuredDestination); valid(requestedDestination);
   // Canonicalize/reject endpoint syntax even for allowlist mode. The factory
   // captures this exact string alongside the destination and exposes neither.
-  const endpoint = canonicalEgressEndpoint(input.endpoint);
-  if (!exact(input.configuredDestination, input.requestedDestination)) throw new Error("Configured destination does not match the requested destination identity");
-  if (input.egressMode === "local_only") {
-    if (input.nodeId === undefined) throw new TypeError("local_only destination binding requires a node ID");
-    const actual = destinationForEndpoint(endpoint, input.nodeId, input.configuredDestination);
-    if (!exact(actual, input.configuredDestination)) throw new Error("Configured local destination does not match its canonical endpoint identity");
+  const canonicalEndpoint = canonicalEgressEndpoint(endpoint);
+  if (!exact(configuredDestination, requestedDestination)) throw new Error("Configured destination does not match the requested destination identity");
+  if (egressMode === "local_only") {
+    if (nodeId === undefined) throw new TypeError("local_only destination binding requires a node ID");
+    const actual = destinationForEndpoint(canonicalEndpoint, nodeId, configuredDestination);
+    if (!exact(actual, configuredDestination)) throw new Error("Configured local destination does not match its canonical endpoint identity");
   }
-  return Object.freeze({ id: input.configuredDestination.id, residency: input.configuredDestination.residency, dataUse: input.configuredDestination.dataUse });
+  return Object.freeze({ id: configuredDestination.id, residency: configuredDestination.residency, dataUse: configuredDestination.dataUse });
 }

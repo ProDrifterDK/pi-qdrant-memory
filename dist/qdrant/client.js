@@ -1,214 +1,38 @@
 import { fetchJson, fetchOk, MemoryClientError } from "../clients/http.js";
-import { canonicalStringify } from "../domain/canonical.js";
+import { canonicalStringify, deterministicUuid } from "../domain/canonical.js";
 import { assertBootstrapControl, collectionControlPoint, collectionMetadataPoint, collectionVectors, isPhysicalPointId } from "./schema.js";
 /** The only collection an owner may write or read through this client family. */
 export function expectedQdrantCollection(ownerHost) { return ownerHost === "pi" ? "pi_memory" : "prime_memory"; }
-function validatePurpose(purpose, recordTypes) { if (!["memory", "control", "metadata", "query", "internal", "write_verification"].includes(purpose))
+export function validatePurpose(purpose, recordTypes) { if (!["memory", "control", "metadata", "query", "internal", "write_verification"].includes(purpose))
     throw new TypeError("Read purpose is invalid"); if ((purpose === "metadata" && (recordTypes.length !== 1 || recordTypes[0] !== "collection_metadata")) || (purpose === "control" && (recordTypes.length !== 1 || recordTypes[0] !== "collection_control")) || ((purpose === "memory" || purpose === "query") && (recordTypes.length === 0 || recordTypes.some((type) => !["episode", "curated_memory", "curated_current", "raptor_summary"].includes(type)))) || ((purpose === "internal" || purpose === "write_verification") && recordTypes.length === 0))
     throw new TypeError("Read purpose and record types do not match"); }
 export function readPolicy(input) {
-    if (input.ownerHost !== "pi" && input.ownerHost !== "prime")
-        throw new TypeError("Read owner is invalid");
-    if (!Array.isArray(input.recordTypes) || input.recordTypes.length === 0 || input.recordTypes.some((type) => !["episode", "curated_memory", "curated_current", "raptor_summary", "collection_control", "processing_policy", "job", "coverage", "evidence_link", "tombstone", "collection_metadata"].includes(type)))
-        throw new TypeError("Read record type policy is invalid");
+    // GLOBAL RULE: snapshot every field EXACTLY ONCE; the returned policy is
+    // built EXPLICITLY (no caller spread — smuggled keys are never carried).
+    const ownerHost = input.ownerHost;
+    const purpose = input.purpose;
+    const recordTypes = [...input.recordTypes];
+    const projectId = input.projectId;
+    const processingPolicyId = input.processingPolicyId;
     const now = input.now ?? Date.now();
     const skew = input.maxClockSkewMs ?? 0;
+    if (ownerHost !== "pi" && ownerHost !== "prime")
+        throw new TypeError("Read owner is invalid");
+    if (recordTypes.length === 0 || recordTypes.some((type) => !["episode", "curated_memory", "curated_current", "raptor_summary", "collection_control", "processing_policy", "job", "lease", "proposal", "coverage", "evidence_link", "tombstone", "collection_metadata"].includes(type)))
+        throw new TypeError("Read record type policy is invalid");
     if (!Number.isFinite(now) || !Number.isFinite(skew) || skew < 0)
         throw new TypeError("Read expiry policy is invalid");
-    if (typeof input.projectId !== "undefined" && (typeof input.projectId !== "string" || input.projectId.length === 0) || typeof input.processingPolicyId !== "undefined" && (typeof input.processingPolicyId !== "string" || input.processingPolicyId.length === 0))
+    if (projectId !== undefined && (typeof projectId !== "string" || projectId.length === 0) || processingPolicyId !== undefined && (typeof processingPolicyId !== "string" || processingPolicyId.length === 0))
         throw new TypeError("Read scope policy is invalid");
-    validatePurpose(input.purpose, input.recordTypes);
-    return { ...input, now, maxClockSkewMs: skew, requireStatus: "active", requireSecretScan: "passed" };
+    validatePurpose(purpose, recordTypes);
+    const policy = { ownerHost, purpose, recordTypes, now, maxClockSkewMs: skew, requireStatus: "active", requireSecretScan: "passed" };
+    if (projectId !== undefined)
+        policy.projectId = projectId;
+    if (processingPolicyId !== undefined)
+        policy.processingPolicyId = processingPolicyId;
+    return policy;
 }
-function isRecord(value) { return typeof value === "object" && value !== null && !Array.isArray(value); }
-function failInput(message) { throw new MemoryClientError("configuration", message); }
-function failResponse(message) { throw new MemoryClientError("invalid-response", message); }
-function validId(value) { return isPhysicalPointId(value); }
-function validateId(value) { if (!validId(value))
-    failInput("Point ID must be a UUID"); }
-function validateResponseId(value) { if (!validId(value))
-    failResponse("Qdrant point ID is invalid"); }
-function validateCollection(value) { if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/u.test(value))
-    failInput("Collection name is invalid"); }
-function baseUrl(value) { let parsed; try {
-    parsed = new URL(value);
+export function physicalPointIdFor(recordType, logicalId) {
+    return isPhysicalPointId(logicalId) ? logicalId : deterministicUuid("pi-qdrant-memory-v2:point", recordType, logicalId);
 }
-catch {
-    return failInput("Qdrant endpoint is invalid");
-} if (!["http:", "https:"].includes(parsed.protocol) || parsed.username !== "" || parsed.password !== "" || parsed.search !== "" || parsed.hash !== "")
-    failInput("Qdrant endpoint is invalid"); return parsed.toString().replace(/\/+$/u, ""); }
-function validateTimeout(value) { if (typeof value !== "number" || !Number.isFinite(value) || value <= 0)
-    failInput("Request timeout is invalid"); }
-function headers(key, json = false) { const result = {}; if (json)
-    result["content-type"] = "application/json"; if (key !== undefined)
-    result["api-key"] = key; return result; }
-function requestOptions(options) { const result = { timeoutMs: options.timeoutMs }; if (options.signal !== undefined)
-    result.signal = options.signal; if (options.fetchImpl !== undefined)
-    result.fetchImpl = options.fetchImpl; return result; }
-function collectionPath(options, suffix = "") { return `${options.baseUrl}/collections/${encodeURIComponent(options.collection)}${suffix}`; }
-function consistency(url, value) { if (value === undefined)
-    return url; const parsed = new URL(url); parsed.searchParams.set("consistency", String(value)); return parsed.toString(); }
-function validQdrantVersion(value) { const match = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u.exec(value); if (match === null)
-    return false; const [major, minor, patch] = value.split("+")[0].split(".").map((part) => Number(part)); return [major, minor, patch].every((part) => Number.isSafeInteger(part)); }
-function pointWriteUrl(options) { const parsed = new URL(collectionPath(options, "/points")); parsed.searchParams.set("wait", "true"); parsed.searchParams.set("ordering", "strong"); return parsed.toString(); }
-function isFiniteVector(value) { return Array.isArray(value) && value.length === 1024 && value.every((part) => typeof part === "number" && Number.isFinite(part)); }
-function validatePayload(value, response = false) { if (!isRecord(value)) {
-    if (response)
-        failResponse("Qdrant payload must be an object");
-    failInput("Qdrant payload must be an object");
-} try {
-    canonicalStringify(value);
-}
-catch {
-    if (response)
-        failResponse("Qdrant payload must be finite canonical JSON");
-    failInput("Qdrant payload must be finite canonical JSON");
-} return value; }
-function normalizePoint(value) { if (!isRecord(value) || !validId(value.id))
-    failInput("Prepared point ID must be a UUID"); const payload = validatePayload(value.payload); const point = { id: value.id, payload }; if (value.vector !== undefined) {
-    if (!isRecord(value.vector) || Object.keys(value.vector).length !== 1 || !isFiniteVector(value.vector.semantic))
-        failInput("Prepared point must contain one finite semantic vector");
-    point.vector = { semantic: [...value.vector.semantic] };
-} return point; }
-function envelope(value) { if (!isRecord(value) || !("result" in value))
-    failResponse("Qdrant JSON envelope is invalid"); if (value.status !== undefined && value.status !== "ok")
-    failResponse("Qdrant envelope status is invalid"); return value.result; }
-function updateEnvelope(value) { const result = envelope(value); if (result === true)
-    return; if (!isRecord(result) || !["acknowledged", "completed", "ok"].includes(String(result.status)))
-    failResponse("Qdrant update did not complete"); if (result.operation_id !== undefined && result.operation_id !== null && (!Number.isSafeInteger(result.operation_id) || Number(result.operation_id) < 0))
-    failResponse("Qdrant operation ID is invalid"); }
-function validatePolicy(policy, configuredOwner) { if (!isRecord(policy) || policy.ownerHost !== configuredOwner || (policy.ownerHost !== "pi" && policy.ownerHost !== "prime") || policy.requireStatus !== "active" || policy.requireSecretScan !== "passed" || !Number.isFinite(policy.now) || !Number.isFinite(policy.maxClockSkewMs) || policy.maxClockSkewMs < 0 || !Array.isArray(policy.recordTypes) || policy.recordTypes.length === 0 || policy.recordTypes.some((type) => !["episode", "curated_memory", "curated_current", "raptor_summary", "collection_control", "processing_policy", "job", "coverage", "evidence_link", "tombstone", "collection_metadata"].includes(type)))
-    failInput("Read policy is invalid"); try {
-    validatePurpose(policy.purpose, policy.recordTypes);
-}
-catch {
-    failInput("Read policy purpose is invalid");
-} if (policy.projectId !== undefined && (typeof policy.projectId !== "string" || policy.projectId.length === 0) || policy.processingPolicyId !== undefined && (typeof policy.processingPolicyId !== "string" || policy.processingPolicyId.length === 0))
-    failInput("Read policy scope is invalid"); }
-function validatePayloadForPolicy(payload, policy) {
-    if (payload.owner_host !== policy.ownerHost)
-        failResponse("Qdrant point owner is missing or foreign");
-    if (typeof payload.record_type !== "string" || !policy.recordTypes.includes(payload.record_type))
-        failResponse("Qdrant point record type is outside the read policy");
-    if (payload.status !== policy.requireStatus || payload.secret_scan !== policy.requireSecretScan)
-        failResponse("Qdrant point status/secret policy is invalid");
-    const expiry = payload.expires_at;
-    if (policy.purpose !== "metadata" && expiry !== null && (typeof expiry !== "string" || !Number.isFinite(Date.parse(expiry)) || Date.parse(expiry) <= policy.now + policy.maxClockSkewMs))
-        failResponse("Qdrant point is expired or has an invalid expiry");
-    if (payload.record_type === "tombstone" && policy.purpose !== "internal" && policy.purpose !== "write_verification")
-        failResponse("Qdrant tombstones are not readable memory points");
-    if (policy.projectId !== undefined && payload.project_id !== policy.projectId)
-        failResponse("Qdrant point project policy mismatch");
-    if (policy.processingPolicyId !== undefined && payload.processing_policy_id !== policy.processingPolicyId)
-        failResponse("Qdrant processing policy mismatch");
-}
-function point(value, policy, includeVector) { if (!isRecord(value) || !validId(value.id))
-    failResponse("Qdrant point ID is invalid"); const payload = validatePayload(value.payload, true); validatePayloadForPolicy(payload, policy); let vector; if (value.vector !== undefined) {
-    if (!isRecord(value.vector) || Object.keys(value.vector).length !== 1 || !isFiniteVector(value.vector.semantic))
-        failResponse("Qdrant named vector is invalid");
-    if (includeVector)
-        vector = { semantic: [...value.vector.semantic] };
-} return vector === undefined ? { id: value.id, payload } : { id: value.id, payload, vector }; }
-function responsePoints(value, policy, includeVector) { if (!Array.isArray(value))
-    failResponse("Qdrant points result is invalid"); return value.map((item) => point(item, policy, includeVector)); }
-function serverFilter(policy) { validatePolicy(policy, policy.ownerHost); const must = [{ key: "owner_host", match: { value: policy.ownerHost } }, { key: "status", match: { value: "active" } }, { key: "secret_scan", match: { value: "passed" } }]; if (policy.recordTypes.length === 1)
-    must.push({ key: "record_type", match: { value: policy.recordTypes[0] } });
-else
-    must.push({ key: "record_type", match: { any: [...policy.recordTypes] } }); if (policy.projectId !== undefined)
-    must.push({ key: "project_id", match: { value: policy.projectId } }); if (policy.processingPolicyId !== undefined)
-    must.push({ key: "processing_policy_id", match: { value: policy.processingPolicyId } }); return { must, must_not: policy.purpose === "internal" || policy.purpose === "write_verification" ? [] : [{ key: "record_type", match: { value: "tombstone" } }], should: [{ is_null: { key: "expires_at" } }, { key: "expires_at", range: { gt: new Date(policy.now + policy.maxClockSkewMs).toISOString() } }] }; }
-function responseCollection(value) { const result = envelope(value); if (!isRecord(result) || !isRecord(result.config) || !isRecord(result.config.params) || !isRecord(result.config.params.vectors))
-    failResponse("Collection configuration is invalid"); const vectors = result.config.params.vectors; if (!isRecord(vectors) || Object.keys(vectors).length !== 1 || !isRecord(vectors.semantic) || vectors.semantic.size !== 1024 || vectors.semantic.distance !== "Cosine")
-    failResponse("Collection must have exactly semantic 1024/Cosine vector"); let pointsCount = null; if (result.points_count !== undefined && result.points_count !== null) {
-    if (!Number.isSafeInteger(result.points_count) || Number(result.points_count) < 0)
-        failResponse("Collection point count is invalid");
-    pointsCount = result.points_count;
-} let payloadSchema; if (result.payload_schema !== undefined) {
-    if (!isRecord(result.payload_schema))
-        failResponse("Collection payload schema is invalid");
-    payloadSchema = {};
-    for (const [field, value] of Object.entries(result.payload_schema)) {
-        if (!isRecord(value) || typeof value.data_type !== "string" || !["keyword", "integer", "datetime", "text"].includes(value.data_type))
-            failResponse("Collection payload schema entry is invalid");
-        payloadSchema[field] = value;
-    }
-} const status = typeof result.status === "string" ? result.status : undefined; return { ...(status === undefined ? {} : { status }), dimension: 1024, distance: "Cosine", vectors: { semantic: { size: 1024, distance: "Cosine" } }, pointsCount, ...(payloadSchema === undefined ? {} : { payloadSchema }), raw: value }; }
-function freezeOptions(input) { const endpoint = baseUrl(input.baseUrl); validateCollection(input.collection); if (input.ownerHost !== "pi" && input.ownerHost !== "prime")
-    failInput("Owner host is invalid"); if (input.collection !== expectedQdrantCollection(input.ownerHost))
-    failInput("Qdrant collection does not match owner host"); if (input.apiKey !== undefined && (typeof input.apiKey !== "string" || input.apiKey.trim() === ""))
-    failInput("Qdrant API key is invalid"); validateTimeout(input.timeoutMs); if (input.maxClockSkewMs !== undefined && (!Number.isFinite(input.maxClockSkewMs) || input.maxClockSkewMs < 0))
-    failInput("Clock skew is invalid"); return Object.freeze({ ...input, baseUrl: endpoint, maxClockSkewMs: input.maxClockSkewMs ?? 0 }); }
-class RestQdrantReadClient {
-    endpoint;
-    ownerHost;
-    collection;
-    maxClockSkewMs;
-    options;
-    constructor(options) { this.options = freezeOptions(options); this.endpoint = this.options.baseUrl; this.ownerHost = this.options.ownerHost; this.collection = expectedQdrantCollection(this.ownerHost); this.maxClockSkewMs = this.options.maxClockSkewMs ?? 0; Object.freeze(this); }
-    async health() { const response = await fetchOk(`${this.options.baseUrl}/healthz`, { method: "GET", headers: headers(this.options.apiKey) }, requestOptions(this.options)); const text = await response.text(); if (text.trim() === "healthz check passed")
-        return text; let parsed; try {
-        parsed = JSON.parse(text);
-    }
-    catch {
-        throw new MemoryClientError("invalid-json", "Health response was not valid JSON");
-    } if (!isRecord(parsed) || !("result" in parsed))
-        failResponse("Health response is invalid"); const result = envelope(parsed); if (!isRecord(result) || result.status !== "ok")
-        failResponse("Health response is invalid"); return parsed; }
-    async collectionInfo() { return responseCollection(await fetchJson(consistency(collectionPath(this.options), this.options.readConsistency), { method: "GET", headers: headers(this.options.apiKey) }, requestOptions(this.options))); }
-    async retrieve(ids, policy, options = {}) { validatePolicy(policy, this.ownerHost); if (!Array.isArray(ids) || ids.length === 0 || ids.length > 1024 || ids.some((id) => !validId(id)))
-        failInput("Retrieve IDs are invalid"); const response = await fetchJson(consistency(collectionPath(this.options, "/points/retrieve"), this.options.readConsistency), { method: "POST", headers: headers(this.options.apiKey, true), body: JSON.stringify({ ids, with_payload: true, with_vector: options.includeVector === true }) }, requestOptions(this.options)); return responsePoints(envelope(response), policy, options.includeVector === true); }
-    async scroll(input) { validatePolicy(input.policy, this.ownerHost); if (input.offset !== undefined && !validId(input.offset))
-        failInput("Scroll offset is invalid"); const limit = input.limit ?? 256; if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1024)
-        failInput("Scroll limit is invalid"); const response = await fetchJson(consistency(collectionPath(this.options, "/points/scroll"), this.options.readConsistency), { method: "POST", headers: headers(this.options.apiKey, true), body: JSON.stringify({ offset: input.offset ?? null, limit, with_payload: true, with_vector: false, filter: serverFilter(input.policy) }) }, requestOptions(this.options)); const result = envelope(response); if (!isRecord(result) || !Array.isArray(result.points))
-        failResponse("Scroll response is invalid"); const next = result.next_page_offset; if (next !== undefined && next !== null)
-        validateResponseId(next); return next === undefined || next === null ? { points: responsePoints(result.points, input.policy, false) } : { points: responsePoints(result.points, input.policy, false), nextOffset: next }; }
-    async search(input) { validatePolicy(input.policy, this.ownerHost); if (!isFiniteVector(input.vector))
-        failInput("Search vector must contain finite 1024-dimensional numbers"); if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 1024)
-        failInput("Search limit is invalid"); const response = await fetchJson(consistency(collectionPath(this.options, "/points/search"), this.options.readConsistency), { method: "POST", headers: headers(this.options.apiKey, true), body: JSON.stringify({ vector: { name: "semantic", vector: [...input.vector] }, limit: input.limit, filter: serverFilter(input.policy), with_payload: true, with_vector: false }) }, requestOptions(this.options)); const result = envelope(response); if (!Array.isArray(result))
-        failResponse("Search response is invalid"); return result.map((value) => { if (!isRecord(value) || !validId(value.id) || typeof value.score !== "number" || !Number.isFinite(value.score))
-        failResponse("Search hit is invalid"); const payload = validatePayload(value.payload, true); validatePayloadForPolicy(payload, input.policy); return { id: value.id, score: value.score, payload }; }); }
-    async count(policy) { validatePolicy(policy, this.ownerHost); const response = await fetchJson(consistency(collectionPath(this.options, "/points/count"), this.options.readConsistency), { method: "POST", headers: headers(this.options.apiKey, true), body: JSON.stringify({ exact: true, filter: serverFilter(policy) }) }, requestOptions(this.options)); const result = envelope(response); if (!isRecord(result) || !Number.isSafeInteger(result.count) || Number(result.count) < 0)
-        failResponse("Count response is invalid"); return result.count; }
-}
-class RestQdrantSessionWriter extends RestQdrantReadClient {
-    async upsertPoints(points, mode, precondition) { if (!Array.isArray(points) || points.length === 0 || points.length > 1024 || points.some((point) => !isRecord(point) || !isPhysicalPointId(point.id)))
-        failInput("Prepared points are invalid"); if (mode !== "insert_only" && mode !== "update_only")
-        failInput("Upsert mode is invalid"); if (mode === "update_only" && precondition === undefined)
-        failInput("Update-only precondition is required"); if (precondition !== undefined)
-        validatePrecondition(precondition, this.ownerHost); const normalized = points.map(normalizePoint); for (const point of normalized)
-        if (point.payload.owner_host !== this.ownerHost)
-            failInput("Point owner does not match configured owner"); const body = { points: normalized, update_mode: mode }; if (precondition !== undefined)
-        body.update_filter = wirePrecondition(precondition); const response = await fetchJson(pointWriteUrl(this.options), { method: "PUT", headers: headers(this.options.apiKey, true), body: JSON.stringify(body) }, requestOptions(this.options)); updateEnvelope(response); }
-}
-function validatePrecondition(value, owner) { if (!isRecord(value) || value.kind !== "collection-control-cas" || value.ownerHost !== owner || value.recordType !== "collection_control" || !["active", "draining", "retired"].includes(value.expectedState) || !Number.isSafeInteger(value.expectedVersion) || value.expectedVersion < 0 || !Number.isSafeInteger(value.expectedEpoch) || value.expectedEpoch < 0 || !Number.isSafeInteger(value.expectedPrivacyEpoch) || value.expectedPrivacyEpoch < 0 || (value.expectedBaseGeneration !== undefined && value.expectedBaseGeneration !== null && (typeof value.expectedBaseGeneration !== "string" || value.expectedBaseGeneration.length === 0)))
-    failInput("Closed control precondition is invalid"); }
-function wirePrecondition(value) { const must = [{ key: "owner_host", match: { value: value.ownerHost } }, { key: "record_type", match: { value: "collection_control" } }, { key: "version", match: { value: value.expectedVersion } }, { key: "privacy_epoch", match: { value: value.expectedPrivacyEpoch } }, { key: "coordination_policy_epoch", match: { value: value.expectedEpoch } }, { key: "state", match: { value: value.expectedState } }]; if (value.expectedBaseGeneration === null)
-    must.push({ is_null: { key: "active_base_generation" } });
-else if (value.expectedBaseGeneration !== undefined)
-    must.push({ key: "active_base_generation", match: { value: value.expectedBaseGeneration } }); return { must, must_not: [], should: [] }; }
-class RestQdrantAdminClient extends RestQdrantReadClient {
-    constructor(options) { super({ ...options, apiKey: options.apiKey }); if (options.apiKey.trim() === "")
-        failInput("Administrative API key is required"); }
-    async createCollection() { const response = await fetchJson(collectionPath(this.options), { method: "PUT", headers: headers(this.options.apiKey, true), body: JSON.stringify({ vectors: collectionVectors(), ...(this.options.replicationFactor === undefined ? {} : { replication_factor: this.options.replicationFactor }), ...(this.options.writeConsistencyFactor === undefined ? {} : { write_consistency_factor: this.options.writeConsistencyFactor }) }) }, requestOptions(this.options)); const result = envelope(response); if (result !== true && !(isRecord(result) && ["acknowledged", "completed", "ok"].includes(String(result.status))))
-        failResponse("Collection creation response is invalid"); }
-    async createPayloadIndex(field, schema) { if (!/^[a-z][a-z0-9_]{0,127}$/u.test(field) || !["keyword", "integer", "datetime", "text"].includes(schema))
-        failInput("Payload index declaration is invalid"); const url = new URL(collectionPath(this.options, "/index")); url.searchParams.set("wait", "true"); const response = await fetchJson(url.toString(), { method: "PUT", headers: headers(this.options.apiKey, true), body: JSON.stringify({ field_name: field, field_schema: schema }) }, requestOptions(this.options)); updateEnvelope(response); }
-    async deletePoints(ids) { if (!Array.isArray(ids) || ids.length === 0 || ids.length > 1024 || ids.some((id) => !validId(id)))
-        failInput("Delete IDs are invalid"); const url = new URL(collectionPath(this.options, "/points/delete")); url.searchParams.set("wait", "true"); const response = await fetchJson(url.toString(), { method: "POST", headers: headers(this.options.apiKey, true), body: JSON.stringify({ points: ids }) }, requestOptions(this.options)); updateEnvelope(response); }
-    async insertMetadataPoint(owner) { if (owner !== this.ownerHost)
-        failInput("Metadata owner mismatch"); const response = await fetchJson(pointWriteUrl(this.options), { method: "PUT", headers: headers(this.options.apiKey, true), body: JSON.stringify({ points: [collectionMetadataPoint(owner)], update_mode: "insert_only" }) }, requestOptions(this.options)); updateEnvelope(response); }
-    async insertInitialControlPoint(control) { assertBootstrapControl(control, this.ownerHost); const response = await fetchJson(pointWriteUrl(this.options), { method: "PUT", headers: headers(this.options.apiKey, true), body: JSON.stringify({ points: [collectionControlPoint(control)], update_mode: "insert_only" }) }, requestOptions(this.options)); updateEnvelope(response); }
-    async serverInfo() { const response = await fetchJson(`${this.options.baseUrl}/`, { method: "GET", headers: headers(this.options.apiKey) }, requestOptions(this.options)); if (!isRecord(response) || typeof response.version !== "string" || !validQdrantVersion(response.version))
-        failResponse("Qdrant root version is invalid"); const [major, minor, patch] = response.version.split("+")[0].split(".").map((part) => Number(part)); if (major < 1 || (major === 1 && (minor < 17 || (minor === 17 && patch < 0))))
-        failResponse("Qdrant version must be at least 1.17.0"); return { version: response.version }; }
-}
-export const QdrantReadClient = RestQdrantReadClient;
-export const QdrantSessionWriter = RestQdrantSessionWriter;
-export const QdrantAdminClient = RestQdrantAdminClient;
-export function createQdrantReadClient(options) { return new RestQdrantReadClient(options); }
-export function createQdrantSessionWriter(options) { return new RestQdrantSessionWriter(options); }
-export function createQdrantAdminClient(options) { return new RestQdrantAdminClient(options); }
-export const qdrantReadClient = createQdrantReadClient;
-export const sessionWriter = createQdrantSessionWriter;
-export const adminClient = createQdrantAdminClient;
 //# sourceMappingURL=client.js.map

@@ -13,7 +13,8 @@ describe("producer processing policy", () => {
     expect(result).not.toBeNull();
     expect(result?.destinationIds).toEqual({ qdrant: "q", embedding: "e", llm: "l" });
     expect(result?.expiresAt).toBe("2026-08-12T00:00:00.000Z");
-    expect(result?.policyRevision).toBe("worker-r");
+    expect(result?.policyRevision).toMatch(/^intersection:/);
+    expect(result?.originProvider).toBe("provider-a");
     expect(result?.id).toBe(processingPolicyHash(result!));
   });
   it("fails closed on owner, capability, residency/data-use, and provider mismatches", () => {
@@ -30,11 +31,54 @@ describe("producer processing policy", () => {
     const worker = policy({ allowCrossProviderReplay: true });
     expect(intersectPolicies([source], worker)?.allowCrossProviderReplay).toBe(false);
   });
-  it("requires explicit cross-provider replay and preserves revision while hashing it", () => {
+  it("requires explicit cross-provider replay and preserves the producer content origin", () => {
     const result = intersectPolicies([policy({ originProvider: "provider-b", allowCrossProviderReplay: true })], policy({ allowCrossProviderReplay: true, policyRevision: "worker-r" }));
+    expect(result).not.toBeNull();
     expect(result?.allowCrossProviderReplay).toBe(true);
-    expect(result?.policyRevision).toBe("worker-r");
+    // The producer origin is preserved even though a different worker provider replays.
+    expect(result?.originProvider).toBe("provider-b");
+    expect(result?.policyRevision).toMatch(/^intersection:/);
     expect(processingPolicyHash(policy({ policyRevision: "r1" }))).not.toBe(processingPolicyHash(policy({ policyRevision: "r2" })));
+    // A later worker WITHOUT replay cannot treat the same content as same-provider.
+    expect(intersectPolicies([policy({ originProvider: "provider-b" })], policy({ allowCrossProviderReplay: false }))).toBeNull();
+  });
+  it("returns fresh exact worker clones for empty and identical intersections — never caller-owned aliases", () => {
+    const workerPolicy = policy({ policyRevision: "worker-r" });
+    // Empty producer list: a fresh exact copy of the worker policy.
+    const empty = intersectPolicies([], workerPolicy);
+    expect(empty).not.toBeNull();
+    expect(empty).not.toBe(workerPolicy);
+    expect(empty?.id).toBe(workerPolicy.id);
+    expect(empty?.policyRevision).toBe(workerPolicy.policyRevision);
+    expect(empty?.destinationIds).toEqual(workerPolicy.destinationIds);
+    expect(empty?.destinationIds).not.toBe(workerPolicy.destinationIds);
+    // Identical producer/worker: a fresh clone, never the caller-owned object.
+    const identical = intersectPolicies([workerPolicy], workerPolicy);
+    expect(identical).not.toBeNull();
+    expect(identical).not.toBe(workerPolicy);
+    expect(identical?.id).toBe(workerPolicy.id);
+    expect(identical?.destinationIds).toEqual(workerPolicy.destinationIds);
+    expect(identical?.destinationIds).not.toBe(workerPolicy.destinationIds);
+    expect(identical?.expiresAt).toBe(workerPolicy.expiresAt);
+    // Mutating the clone's destinations never touches the caller's policy.
+    (identical?.destinationIds as { qdrant: string }).qdrant = "qdrant:mutated";
+    expect(workerPolicy.destinationIds.qdrant).toBe("q");
+    expect(empty?.destinationIds.qdrant).toBe("q");
+  });
+
+  it("fails closed on multiple producer origins and converges identical producer/worker policies", () => {
+    expect(intersectPolicies([policy({ originProvider: "provider-b" }), policy({ originProvider: "provider-c" })], policy())).toBeNull();
+    const identical = policy({ policyRevision: "same-r" });
+    expect(intersectPolicies([identical], identical)?.id).toBe(identical.id);
+    // Permuting the producer list yields the same effective identity.
+    const a = policy({ policyRevision: "rev-a" });
+    const b = policy({ policyRevision: "rev-b" });
+    const ab = intersectPolicies([a, b], policy());
+    const ba = intersectPolicies([b, a], policy());
+    if (ab !== null && ba !== null) {
+      expect(ab.id).toBe(ba.id);
+      expect(ab.policyRevision).toBe(ba.policyRevision);
+    }
   });
   it("keeps local-only destinations node-bound and rejects forged or unauthorized egress", () => {
     const local = destinationForEndpoint("http://127.0.0.1:6333", "node-a");

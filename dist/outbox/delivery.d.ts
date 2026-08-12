@@ -1,6 +1,5 @@
-import { type EpisodeRecord, type ProcessingPolicyRecord } from "../domain/records.js";
 import { type ProcessingPolicy } from "../domain/policy.js";
-import type { AuthorizedDestination } from "../types.js";
+import { BoundIngestRuntime } from "../coordination/ingest.js";
 import type { OutboxFileSystem, OutboxJob } from "./store.js";
 export interface OutboxJobProcessor {
     process(job: OutboxJob, input: {
@@ -49,36 +48,19 @@ export interface IngestControlReader {
         revokedDestinationIds: readonly string[];
     }>;
 }
-/** Opaque Qdrant capability created only by the validated destination factory. */
-export interface BoundQdrantDestination {
-    readonly destination: AuthorizedDestination;
-    /** Immutable host/physical collection pairing of the opaque writer. */
-    readonly ownerHost: "pi" | "prime";
-    readonly collection: "pi_memory" | "prime_memory";
-    /** Independently pinned control policy; never an episode processing-policy ID. */
-    readonly coordination: {
-        readonly policyHash: string;
-        readonly policyEpoch: number;
-    };
-    insertAndReadback(record: ProcessingPolicyRecord | EpisodeRecord): Promise<"inserted" | "existing">;
-    retrieve<T extends ProcessingPolicyRecord | EpisodeRecord>(recordType: T["recordType"], id: string): Promise<T | null>;
-}
-/** Opaque BGE-M3-only capability created only by the validated destination factory. */
-export interface BoundEmbeddingDestination {
-    readonly destination: AuthorizedDestination;
-    embed(input: {
-        model: string;
-        text: string;
-        signal?: AbortSignal;
-    }): Promise<readonly number[]>;
+/**
+ * Task 8 tombstone barrier: returns the subset of episode IDs that are
+ * logically tombstoned at read time (batch-read with configured consistency).
+ */
+export interface IngestTombstoneReader {
+    readTombstoned(episodeIds: readonly string[]): Promise<readonly string[]>;
 }
 export interface IngestInput {
     job: OutboxJob;
     now: number;
     localPolicy: ProcessingPolicy;
-    qdrant: BoundQdrantDestination;
-    embedding: BoundEmbeddingDestination;
-    control: IngestControlReader;
+    /** ONE production ingest bundle (store + qdrant + embedding + control + tombstones), brand-checked. */
+    runtime: BoundIngestRuntime;
     maxClockSkewMs: number;
 }
 /**

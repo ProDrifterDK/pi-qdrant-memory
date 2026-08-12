@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import { initializeDestination } from "../../src/admin/init.js";
 import { memoryStatus } from "../../src/admin/status.js";
 import { defaultCliDependencies } from "../../src/admin/cli.js";
-import { collectionMetadataPayload, COLLECTION_METADATA_ID, COLLECTION_CONTROL_ID, REQUIRED_INDEXES, bootstrapControlHash, controlPayload, V2_CONTRACT_HASH } from "../../src/qdrant/schema.js";
+import { collectionMetadataPayload, COLLECTION_METADATA_ID, COLLECTION_CONTROL_ID, REQUIRED_INDEXES, assertBootstrapControl, bootstrapControlHash, controlPayload, V2_CONTRACT_HASH } from "../../src/qdrant/schema.js";
+import { canonicalRecordHash, type ControlRecord } from "../../src/domain/records.js";
 import type { RuntimeConfig } from "../../src/types.js";
 
 function config(): RuntimeConfig {
@@ -39,7 +40,7 @@ describe("destination-only v2 admin shell", () => {
 
 
 describe("Qdrant 1.17 initialization and runtime status probes", () => {
-  const existingControl = (() => { const base = { ownerHost: "pi" as const, schemaRevision: 1 as const, createdAt: "2026-08-10T00:00:00.000Z", privacyEpoch: 0, processingPolicyId: V2_CONTRACT_HASH, expiresAt: null, recordType: "collection_control" as const, id: COLLECTION_CONTROL_ID, version: 0, activeGeneration: null, activeBaseGeneration: null, coordinationPolicyEpoch: 0, coordinationPolicyHash: V2_CONTRACT_HASH, state: "active" as const, scanCursor: null, lastForgetBarrier: null, contentHash: "pending" }; return { ...base, contentHash: bootstrapControlHash(base) }; })();
+  const existingControl = (() => { const base = { ownerHost: "pi" as const, schemaRevision: 1 as const, createdAt: "2026-08-10T00:00:00.000Z", privacyEpoch: 0, processingPolicyId: V2_CONTRACT_HASH, expiresAt: null, recordType: "collection_control" as const, id: COLLECTION_CONTROL_ID, version: 0, activeGeneration: null, activeBaseGeneration: null, coordinationPolicyEpoch: 0, coordinationPolicyHash: V2_CONTRACT_HASH, state: "active" as const, scanCursor: null, lastForgetBarrier: null, revokedDestinationIds: [], contentHash: "pending" }; return { ...base, contentHash: bootstrapControlHash(base) }; })();
   function collectionResponse(): unknown {
     const payload_schema: Record<string, unknown> = {};
     for (const [field, data_type] of REQUIRED_INDEXES) payload_schema[field] = { data_type };
@@ -140,6 +141,92 @@ describe("Qdrant 1.17 initialization and runtime status probes", () => {
   it("fails CLI initialization closed when the human admin key is absent", async () => {
     const deps = defaultCliDependencies({ env: { PI_QDRANT_MEMORY_HOST: "pi", PI_QDRANT_MEMORY_QDRANT_API_KEY: "runtime-only" } });
     expect(() => deps.initialize(config())).toThrow(/human.*admin.*key/i);
+  });
+
+  it("rejects alias-only or ambiguous physical responses at every initialization readback phase", async () => {
+    const intendedMetadata = { id: COLLECTION_METADATA_ID, payload: collectionMetadataPayload("pi") };
+    const foreignMetadata = { id: "00000000-0000-5000-8000-000000000099", payload: collectionMetadataPayload("pi") };
+    // Metadata preflight: ONE unrequested physical point carrying a valid
+    // metadata payload is an alias and must never initialize the destination.
+    const aliasFetch: typeof fetch = async (input, init = {}) => {
+      const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[] };
+      if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 });
+      if (url.includes("/points/retrieve")) return new Response(JSON.stringify({ result: (body?.ids ?? [])[0] === COLLECTION_METADATA_ID ? [foreignMetadata] : [{ id: COLLECTION_CONTROL_ID, payload: controlPayload(existingControl) }] }), { status: 200 });
+      if (url.includes("/collections/pi_memory") && init.method === "GET") return new Response(JSON.stringify(collectionResponse()), { status: 200 });
+      return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 });
+    };
+    await expect(initializeDestination(config(), { adminApiKey: "human-admin", fetchImpl: aliasFetch })).rejects.toThrow(/ambiguous|missing|metadata/i);
+    // Control preflight: the valid control payload at a FOREIGN point id is an alias.
+    const controlAliasFetch: typeof fetch = async (input, init = {}) => {
+      const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[] };
+      if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 });
+      if (url.includes("/points/retrieve")) return new Response(JSON.stringify({ result: (body?.ids ?? [])[0] === COLLECTION_METADATA_ID ? [intendedMetadata] : [{ id: "00000000-0000-5000-8000-000000000098", payload: controlPayload(existingControl) }] }), { status: 200 });
+      if (url.includes("/collections/pi_memory") && init.method === "GET") return new Response(JSON.stringify(collectionResponse()), { status: 200 });
+      return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 });
+    };
+    await expect(initializeDestination(config(), { adminApiKey: "human-admin", fetchImpl: controlAliasFetch })).rejects.toThrow(/ambiguous|control|invalid/i);
+    // Metadata preflight: intended + extra / duplicate responses are ambiguous.
+    for (const result of [[intendedMetadata, foreignMetadata], [intendedMetadata, intendedMetadata]]) {
+      const ambiguousFetch: typeof fetch = async (input, init = {}) => {
+        const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[] };
+        if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 });
+        if (url.includes("/points/retrieve")) return new Response(JSON.stringify({ result: (body?.ids ?? [])[0] === COLLECTION_METADATA_ID ? result : [{ id: COLLECTION_CONTROL_ID, payload: controlPayload(existingControl) }] }), { status: 200 });
+        if (url.includes("/collections/pi_memory") && init.method === "GET") return new Response(JSON.stringify(collectionResponse()), { status: 200 });
+        return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 });
+      };
+      await expect(initializeDestination(config(), { adminApiKey: "human-admin", fetchImpl: ambiguousFetch })).rejects.toThrow(/ambiguous|missing|metadata/i);
+    }
+    // Post-insert readback (created branch): a duplicate control readback is ambiguous.
+    let createdCollection = false; let metadata = false;
+    const postFetch: typeof fetch = async (input, init = {}) => {
+      const url = String(input); const method = init.method ?? "GET"; const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[]; points?: Array<{ payload?: Record<string, unknown> }> };
+      if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 });
+      if (url.includes("/collections/pi_memory") && method === "GET" && !url.includes("/points")) { if (!createdCollection) return new Response("missing", { status: 404 }); return new Response(JSON.stringify(collectionResponse()), { status: 200 }); }
+      if (url.includes("/points/retrieve")) { const ids = (body?.ids ?? []) as string[]; if (ids[0] === COLLECTION_METADATA_ID) return new Response(JSON.stringify({ result: metadata ? [{ id: COLLECTION_METADATA_ID, payload: collectionMetadataPayload("pi") }] : [] }), { status: 200 }); return new Response(JSON.stringify({ result: [{ id: COLLECTION_CONTROL_ID, payload: controlPayload(existingControl) }, { id: COLLECTION_CONTROL_ID, payload: controlPayload(existingControl) }] }), { status: 200 }); }
+      if (url.endsWith("/collections/pi_memory") && method === "PUT") { createdCollection = true; return new Response(JSON.stringify({ result: true, status: "ok" }), { status: 200 }); }
+      if (url.includes("/points?") && method === "PUT") { const points = (body?.points ?? []) as Array<{ payload?: Record<string, unknown> }>; if (points[0]?.payload?.record_type === "collection_metadata") metadata = true; return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 }); }
+      return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 });
+    };
+    await expect(initializeDestination(config(), { adminApiKey: "human-admin", fetchImpl: postFetch })).rejects.toThrow(/ambiguous|readback/i);
+  });
+
+  it("rejects a content-hash-valid version-0 bootstrap control with a nonzero coordination epoch before any insert", async () => {
+    const epochOneBase = { ownerHost: "pi" as const, schemaRevision: 1 as const, createdAt: "2026-08-10T00:00:00.000Z", privacyEpoch: 0, processingPolicyId: V2_CONTRACT_HASH, expiresAt: null, recordType: "collection_control" as const, id: COLLECTION_CONTROL_ID, version: 0, activeGeneration: null, activeBaseGeneration: null, coordinationPolicyEpoch: 1, coordinationPolicyHash: V2_CONTRACT_HASH, state: "active" as const, scanCursor: null, lastForgetBarrier: null, revokedDestinationIds: [], contentHash: "pending" };
+    const epochOne = { ...epochOneBase, contentHash: bootstrapControlHash(epochOneBase) };
+    // The epoch-zero invariant holds in the shared validator.
+    expect(() => assertBootstrapControl(epochOne as ControlRecord, "pi")).toThrow(/bootstrap|epoch|invalid/i);
+    let puts = 0;
+    const fetchImpl: typeof fetch = async (input, init = {}) => { const url = String(input); const method = init.method ?? "GET"; if (method === "PUT") puts += 1; if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 }); return new Response(JSON.stringify(collectionResponse()), { status: 200 }); };
+    await expect(initializeDestination(config(), { adminApiKey: "human-admin", fetchImpl, initialControl: epochOne as ControlRecord })).rejects.toThrow(/bootstrap|epoch|invalid/i);
+    expect(puts).toBe(0);
+    // The default v0 bootstrap remains valid.
+    expect(() => assertBootstrapControl(existingControl as ControlRecord, "pi")).not.toThrow();
+  });
+
+  it("accepts a legitimately evolved current control on admin restart without reset", async () => {
+    const evolvedBase = { ownerHost: "pi" as const, schemaRevision: 1 as const, createdAt: "2026-08-10T00:00:00.000Z", privacyEpoch: 2, processingPolicyId: "policy-evolved", expiresAt: null, recordType: "collection_control" as const, id: COLLECTION_CONTROL_ID, version: 3, activeGeneration: "gen-9", activeBaseGeneration: null, coordinationPolicyEpoch: 2, coordinationPolicyHash: "policy-hash-evolved", state: "draining" as const, scanCursor: "cursor-9", lastForgetBarrier: null, revokedDestinationIds: ["qdrant:pi"], contentHash: "pending" };
+    const evolved = { ...evolvedBase, contentHash: canonicalRecordHash(evolvedBase) } as ControlRecord;
+    const calls: Array<{ url: string; method: string; body?: Record<string, unknown> }> = [];
+    const fetchImpl: typeof fetch = async (input, init = {}) => {
+      const url = String(input); const method = init.method ?? "GET"; const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as Record<string, unknown>; calls.push({ url, method, ...(body === undefined ? {} : { body }) });
+      if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 });
+      if (url.includes("/points/retrieve")) { const ids = (body?.ids ?? []) as string[]; return new Response(JSON.stringify({ result: [{ id: ids[0], payload: ids[0] === COLLECTION_METADATA_ID ? collectionMetadataPayload("pi") : controlPayload(evolved) }] }), { status: 200 }); }
+      if (url.includes("/collections/pi_memory") && method === "GET") return new Response(JSON.stringify(collectionResponse()), { status: 200 });
+      return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 });
+    };
+    const result = await initializeDestination(config(), { adminApiKey: "human-admin", fetchImpl });
+    expect(result).toMatchObject({ initialized: true, collectionCreated: false });
+    // The current control is validated but NEVER reset/mutated.
+    expect(calls.filter((call) => call.method === "PUT" && call.url.includes("/points?")).map((call) => call.body?.update_mode)).toEqual([]);
+    // A malformed/noncanonical/foreign current control still rejects.
+    const badFetch: typeof fetch = async (input, init = {}) => {
+      const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[] };
+      if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 });
+      if (url.includes("/points/retrieve")) return new Response(JSON.stringify({ result: (body?.ids ?? [])[0] === COLLECTION_METADATA_ID ? [{ id: COLLECTION_METADATA_ID, payload: collectionMetadataPayload("pi") }] : [{ id: COLLECTION_CONTROL_ID, payload: { ...controlPayload(evolved), content_hash: "bogus" } }] }), { status: 200 });
+      if (url.includes("/collections/pi_memory") && init.method === "GET") return new Response(JSON.stringify(collectionResponse()), { status: 200 });
+      return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 });
+    };
+    await expect(initializeDestination(config(), { adminApiKey: "human-admin", fetchImpl: badFetch })).rejects.toThrow(/control|invalid/i);
   });
 
 });

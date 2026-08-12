@@ -11,8 +11,15 @@
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
     "skipLibCheck": true,
-    "verbatimModuleSyntax": true
+    "verbatimModuleSyntax": true,
+    "stripInternal": true
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["tests", "dist", "node_modules"]
+  "include": [
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "tests",
+    "dist",
+    "node_modules"
+  ]
 }

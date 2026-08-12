@@ -131,6 +131,8 @@ export interface ControlRecord extends RecordEnvelope {
     state: "active" | "draining" | "retired";
     scanCursor: string | null;
     lastForgetBarrier: string | null;
+    /** Bounded, exact, redacted, monotonic collection-wide destination revocations. */
+    revokedDestinationIds: string[];
 }
 export interface ProcessingPolicyRecord extends RecordEnvelope {
     recordType: "processing_policy";
@@ -139,6 +141,11 @@ export interface ProcessingPolicyRecord extends RecordEnvelope {
     canonicalHash: string;
     expiresAt: string | null;
 }
+/**
+ * Immutable explicit-membership job identity. `policyId` is the serialized
+ * producer-policy intersection. Mutable claim/acceptance state lives only on
+ * the per-job `lease` point; proposals are immutable outputs.
+ */
 export interface JobRecord extends DerivedEnvelope {
     recordType: "job";
     id: string;
@@ -146,12 +153,36 @@ export interface JobRecord extends DerivedEnvelope {
     policyHash: string;
     policyEpoch: number;
     membership: string[];
-    state: "pending" | "leased" | "accepted" | "completed" | "failed" | "retired";
-    leaseExpiresAt: string | null;
+    extractorRevision: string;
+}
+/**
+ * Mutable per-job lease/claim point: version and fencing token are monotonic;
+ * acceptance is the single authority recorded here (exactly one proposal).
+ */
+export interface LeaseRecord extends DerivedEnvelope {
+    recordType: "lease";
+    id: string;
+    jobId: string;
+    ownerId: string;
+    version: number;
     fencingToken: number;
-    leaseOwner: string | null;
+    expiresAt: string;
+    state: "leased" | "accepted" | "released";
     acceptedProposalId: string | null;
     acceptedManifestHash: string | null;
+}
+/** Immutable proposal output: bounded canonical membership + validated content. */
+export interface ProposalRecord extends DerivedEnvelope {
+    recordType: "proposal";
+    id: string;
+    jobId: string;
+    /** Nominal producing root identity (derived from the LeaseAuthority nodeId); immutable. */
+    ownerId: string;
+    proposalHash: string;
+    manifestHash: string;
+    fencingToken: number;
+    membership: string[];
+    content: unknown;
 }
 export interface CoverageRecord extends DerivedEnvelope {
     recordType: "coverage";
@@ -174,7 +205,7 @@ export interface TombstoneRecord extends RecordEnvelope {
     targetId: string;
     provenanceId?: string;
 }
-export type MemoryRecord = EpisodeRecord | CuratedMemoryRecord | CuratedCurrentRecord | RaptorSummaryRecord | ControlRecord | ProcessingPolicyRecord | JobRecord | CoverageRecord | EvidenceLinkRecord | TombstoneRecord;
+export type MemoryRecord = EpisodeRecord | CuratedMemoryRecord | CuratedCurrentRecord | RaptorSummaryRecord | ControlRecord | ProcessingPolicyRecord | JobRecord | LeaseRecord | ProposalRecord | CoverageRecord | EvidenceLinkRecord | TombstoneRecord;
 export interface RecordValidationContext {
     ownerHost?: HostId;
     schemaRevision?: number;

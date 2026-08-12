@@ -1,5 +1,4 @@
-import { type PayloadIndexSchema, type PointRecordType } from "./schema.js";
-import type { ControlRecord } from "../domain/records.js";
+import { type PointRecordType } from "./schema.js";
 import type { HostId } from "../types.js";
 type JsonRecord = Record<string, unknown>;
 type Consistency = number | "majority" | "quorum" | "all";
@@ -72,7 +71,7 @@ export interface PreparedPoint {
         semantic: readonly number[];
     };
 }
-export interface ControlUpdatePrecondition {
+export type ControlCasPrecondition = {
     kind: "collection-control-cas";
     ownerHost: HostId;
     recordType: "collection_control";
@@ -81,7 +80,36 @@ export interface ControlUpdatePrecondition {
     expectedPrivacyEpoch: number;
     expectedState: "active" | "draining" | "retired";
     expectedBaseGeneration?: string | null;
-}
+};
+/**
+ * Typed lease/claim CAS: pins owner, version, fencing token, policy hash+epoch,
+ * privacy epoch, state, exact current acceptance, and optional conservative
+ * expiry cut (steal/reacquire) or live-expiry floor (acceptance). The claim
+ * point is the single acceptance authority.
+ */
+export type LeaseCasPrecondition = {
+    kind: "lease-cas";
+    ownerHost: HostId;
+    recordType: "lease";
+    jobId: string;
+    expectedVersion: number;
+    expectedFencingToken: number;
+    expectedPolicyEpoch: number;
+    expectedPolicyHash: string;
+    expectedPrivacyEpoch: number;
+    expectedState: "leased" | "accepted" | "released";
+    /** Every lease CAS pins the exact current owner (never null). */
+    expectedOwner: string;
+    expectedAcceptedProposalId: string | null;
+    expectedAcceptedManifestHash: string | null;
+    /** Immutable-current binding: exact processing-policy intersection, createdAt and canonical content hash. */
+    expectedProcessingPolicyId: string;
+    expectedCreatedAt: string;
+    expectedContentHash: string;
+    expiresBefore?: number;
+    expiresAfter?: number;
+};
+export type TypedUpdatePrecondition = ControlCasPrecondition | LeaseCasPrecondition;
 export interface QdrantReadClient {
     readonly endpoint: string;
     readonly ownerHost: HostId;
@@ -102,14 +130,7 @@ export interface QdrantReadClient {
     }): Promise<QdrantSearchHit[]>;
     count(policy: QdrantReadPolicy): Promise<number>;
 }
-export interface QdrantSessionWriter extends QdrantReadClient {
-    upsertPoints(points: readonly PreparedPoint[], mode: "insert_only" | "update_only", precondition?: ControlUpdatePrecondition): Promise<void>;
-}
-export interface QdrantAdminClient extends QdrantReadClient {
-    createCollection(): Promise<void>;
-    createPayloadIndex(field: string, schema: PayloadIndexSchema): Promise<void>;
-    deletePoints(ids: readonly PointId[]): Promise<void>;
-}
+export declare function validatePurpose(purpose: ReadPurpose, recordTypes: readonly PointRecordType[]): void;
 export declare function readPolicy(input: {
     ownerHost: HostId;
     purpose: ReadPurpose;
@@ -119,55 +140,6 @@ export declare function readPolicy(input: {
     projectId?: string;
     processingPolicyId?: string;
 }): QdrantReadPolicy;
-declare class RestQdrantReadClient implements QdrantReadClient {
-    readonly endpoint: string;
-    readonly ownerHost: HostId;
-    readonly collection: HostScopedQdrantCollection;
-    readonly maxClockSkewMs: number;
-    protected readonly options: QdrantClientOptions;
-    constructor(options: QdrantClientOptions);
-    health(): Promise<unknown>;
-    collectionInfo(): Promise<QdrantCollectionInfo>;
-    retrieve(ids: readonly PointId[], policy: QdrantReadPolicy, options?: ReadOptions): Promise<QdrantPoint[]>;
-    scroll(input: {
-        policy: QdrantReadPolicy;
-        offset?: PointId;
-        limit?: number;
-    }): Promise<QdrantScrollResult>;
-    search(input: {
-        vector: readonly number[];
-        limit: number;
-        policy: QdrantReadPolicy;
-    }): Promise<QdrantSearchHit[]>;
-    count(policy: QdrantReadPolicy): Promise<number>;
-}
-declare class RestQdrantSessionWriter extends RestQdrantReadClient implements QdrantSessionWriter {
-    upsertPoints(points: readonly PreparedPoint[], mode: "insert_only" | "update_only", precondition?: ControlUpdatePrecondition): Promise<void>;
-}
-declare class RestQdrantAdminClient extends RestQdrantReadClient implements QdrantAdminClient {
-    constructor(options: QdrantClientOptions & {
-        apiKey: string;
-    });
-    createCollection(): Promise<void>;
-    createPayloadIndex(field: string, schema: PayloadIndexSchema): Promise<void>;
-    deletePoints(ids: readonly PointId[]): Promise<void>;
-    insertMetadataPoint(owner: HostId): Promise<void>;
-    insertInitialControlPoint(control: ControlRecord): Promise<void>;
-    serverInfo(): Promise<{
-        version: string;
-    }>;
-}
 export type QdrantReadCapabilities = QdrantReadClient;
-export type QdrantSessionWriteCapabilities = QdrantSessionWriter;
-export declare const QdrantReadClient: typeof RestQdrantReadClient;
-export declare const QdrantSessionWriter: typeof RestQdrantSessionWriter;
-export declare const QdrantAdminClient: typeof RestQdrantAdminClient;
-export declare function createQdrantReadClient(options: QdrantClientOptions): QdrantReadClient;
-export declare function createQdrantSessionWriter(options: QdrantClientOptions): QdrantSessionWriter;
-export declare function createQdrantAdminClient(options: QdrantClientOptions & {
-    apiKey: string;
-}): QdrantAdminClient;
-export declare const qdrantReadClient: typeof createQdrantReadClient;
-export declare const sessionWriter: typeof createQdrantSessionWriter;
-export declare const adminClient: typeof createQdrantAdminClient;
+export declare function physicalPointIdFor(recordType: string, logicalId: string): string;
 export {};

@@ -1,5 +1,6 @@
 import { MemoryClientError } from "../clients/http.js";
-import { QdrantReadClient, readPolicy } from "../qdrant/client.js";
+import { readPolicy } from "../qdrant/client.js";
+import { statusCollectionInfo, statusHealth, statusRetrieve } from "./transport.js";
 import { COLLECTION_METADATA_ID, isCollectionMetadataPayload } from "../qdrant/schema.js";
 function isMissing(error) { return error instanceof MemoryClientError && error.category === "http" && error.status === 404; }
 /** Probe only the configured host collection with its collection-scoped key. */
@@ -14,17 +15,19 @@ export async function memoryStatus(config, deps = {}) {
     };
     if (deps.fetchImpl === undefined)
         return base;
-    const client = new QdrantReadClient({ baseUrl: config.qdrant.url, collection: config.qdrant.collection, ownerHost: config.host, ...(config.qdrant.apiKey === undefined ? {} : { apiKey: config.qdrant.apiKey }), timeoutMs: config.retrieval.timeoutMs, fetchImpl: deps.fetchImpl, ...(deps.signal === undefined ? {} : { signal: deps.signal }), readConsistency: config.coordination.readConsistency, maxClockSkewMs: config.coordination.maxClockSkewMs });
+    // The read transport is LEXICAL inside admin/transport.ts; status only
+    // calls named status operations with validated options.
+    const statusOptions = { baseUrl: config.qdrant.url, collection: config.qdrant.collection, ownerHost: config.host, ...(config.qdrant.apiKey === undefined ? {} : { apiKey: config.qdrant.apiKey }), timeoutMs: config.retrieval.timeoutMs, ...(deps.signal === undefined ? {} : { signal: deps.signal }), readConsistency: config.coordination.readConsistency, maxClockSkewMs: config.coordination.maxClockSkewMs };
     base.qdrant.probed = true;
     try {
-        await client.health();
+        await statusHealth(statusOptions, deps.fetchImpl);
         base.qdrant.healthy = true;
     }
     catch { /* status is a bounded diagnostic, not an error channel */ }
     try {
-        await client.collectionInfo();
+        await statusCollectionInfo(statusOptions, deps.fetchImpl);
         base.destination.exists = true;
-        const metadata = await client.retrieve([COLLECTION_METADATA_ID], readPolicy({ ownerHost: config.host, purpose: "metadata", recordTypes: ["collection_metadata"], maxClockSkewMs: config.coordination.maxClockSkewMs }));
+        const metadata = await statusRetrieve(statusOptions, deps.fetchImpl, [COLLECTION_METADATA_ID], readPolicy({ ownerHost: config.host, purpose: "metadata", recordTypes: ["collection_metadata"], maxClockSkewMs: config.coordination.maxClockSkewMs }));
         base.destination.healthy = metadata.length === 1 && isCollectionMetadataPayload(metadata[0].payload, config.host);
         base.qdrant.destinationHealthy = base.destination.healthy;
     }

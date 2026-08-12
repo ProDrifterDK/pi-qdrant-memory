@@ -56,13 +56,23 @@ function earliestExpiry(policies: readonly ProcessingPolicy[]): string | null {
   return dates.length === 0 ? null : new Date(Math.min(...dates)).toISOString();
 }
 
-/** Intersect exact destination capabilities and labels across producer and worker policies. */
+/**
+ * Intersect exact destination capabilities and labels across producer and
+ * worker policies, preserving the producer CONTENT ORIGIN. For one canonical
+ * producer origin the effective origin is that producer origin even when a
+ * different worker provider replays (with every allow flag set). Multiple
+ * producer origins fail closed until a provider-set schema exists. The
+ * effective policy revision is content-addressed from the sorted producer
+ * identities plus the distinguished worker identity.
+ */
 export function intersectPolicies(policies: readonly ProcessingPolicy[], worker: ProcessingPolicy): ProcessingPolicy | null {
   validPolicy(worker); policies.forEach(validPolicy);
+  // Empty producer list converges to a FRESH exact copy of the worker policy
+  // (never the caller-owned object, never an intersection revision).
+  if (policies.length === 0) return { ...worker, destinationIds: { ...worker.destinationIds } };
   const all = [...policies, worker];
   if (all.some((policy) => policy.ownerHost !== worker.ownerHost)) return null;
-  const first = all[0];
-  if (first === undefined) return { ...worker, destinationIds: { ...worker.destinationIds } };
+  const first = all[0]!;
   if (all.some((policy) => policy.residency !== first.residency || policy.dataUse !== first.dataUse)) return null;
   const capabilities = ["qdrant", "embedding", "llm"] as const;
   const destinationIds: ProcessingPolicy["destinationIds"] = { qdrant: first.destinationIds.qdrant, embedding: first.destinationIds.embedding };
@@ -72,8 +82,17 @@ export function intersectPolicies(policies: readonly ProcessingPolicy[], worker:
     if (present && values.some((value) => value === undefined || value !== values[0])) return null;
     if (capability === "llm" && values[0] !== undefined) destinationIds.llm = values[0];
   }
-  const providers = new Set(policies.map((policy) => policy.originProvider).concat(worker.originProvider));
-  if (providers.size > 1 && (!worker.allowCrossProviderReplay || policies.some((policy) => !policy.allowCrossProviderReplay))) return null;
+  // Producer content origin: multiple producer origins fail closed; one origin is preserved.
+  const producerOrigins = new Set(policies.map((policy) => policy.originProvider));
+  if (producerOrigins.size > 1) return null;
+  const origin = producerOrigins.size === 1 ? [...producerOrigins][0]! : worker.originProvider;
+  if (origin !== worker.originProvider && (!worker.allowCrossProviderReplay || policies.some((policy) => !policy.allowCrossProviderReplay))) return null;
+  // Identical producer/worker policy converges to the unchanged policy as a
+  // FRESH clone (never a caller-owned mutable alias).
+  if (policies.length === 1 && policies[0]!.id === worker.id) return { ...worker, destinationIds: { ...worker.destinationIds } };
+  // Content-addressed effective revision from sorted producer identities + worker identity.
+  const producerIdentities = [...policies].map((policy) => ({ id: policy.id, policyRevision: policy.policyRevision })).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const intersectionRevision = `intersection:${sha256Hex(canonicalStringify({ producers: producerIdentities, workerId: worker.id, workerRevision: worker.policyRevision }))}`;
   const result: ProcessingPolicy = {
     ...worker,
     destinationIds,
@@ -81,6 +100,8 @@ export function intersectPolicies(policies: readonly ProcessingPolicy[], worker:
     expiresAt: earliestExpiry(all),
     residency: first.residency,
     dataUse: first.dataUse,
+    originProvider: origin,
+    policyRevision: intersectionRevision,
   };
   return { ...result, id: processingPolicyHash(result) };
 }

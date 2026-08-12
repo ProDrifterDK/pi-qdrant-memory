@@ -6,6 +6,7 @@ import { canonicalStringify, deterministicUuid, sha256Hex } from "../domain/cano
 import { canonicalRecordHash, episodeSemanticProjection } from "../domain/records.js";
 import { intersectPolicies, isPolicyExpired, processingPolicyHash } from "../domain/policy.js";
 import { redactAndScan } from "../security/redaction.js";
+import { BoundIngestRuntime } from "../coordination/ingest.js";
 import { parseOutboxJob } from "./store.js";
 import { activeAdmissionLocks, isAdmissionProtocolArtifact, retireOwnedAdmissionLock } from "./reservation-protocol.js";
 import { assertPseudonymousNodeId } from "../security/egress.js";
@@ -2036,7 +2037,34 @@ function sameEpisodeReadback(readback, source) {
         return false;
     try {
         const candidate = readback;
-        return candidate.recordType === "episode" && candidate.id === source.id && candidate.contentHash === source.contentHash && canonicalRecordHash(candidate) === candidate.contentHash && candidate.ownerHost === source.ownerHost && candidate.schemaRevision === source.schemaRevision && candidate.privacyEpoch === source.privacyEpoch && candidate.processingPolicyId === source.processingPolicyId && candidate.expiresAt === source.expiresAt && candidate.secretScan === "passed" && candidate.redactionStatus === source.redactionStatus && candidate.vector !== undefined && validVector(candidate.vector);
+        // The committed hash must be vector-bound: canonicalRecordHash now commits
+        // the exact 1024 floats, so a vector altered while retaining the old hash
+        // fails here and is never delivered.
+        if (candidate.recordType !== "episode" || candidate.id !== source.id || candidate.contentHash !== canonicalRecordHash(candidate) || candidate.ownerHost !== source.ownerHost || candidate.schemaRevision !== source.schemaRevision || candidate.privacyEpoch !== source.privacyEpoch || candidate.processingPolicyId !== source.processingPolicyId || candidate.expiresAt !== source.expiresAt || candidate.secretScan !== "passed" || candidate.redactionStatus !== source.redactionStatus)
+            return false;
+        if (source.vector !== undefined) {
+            // Expected carries the exact committed vector: the FULL EpisodeRecord
+            // must equal exactly — every field including createdAt/producerId/nodeId
+            // (which canonicalRecordHash intentionally excludes) plus the exact
+            // vector and the vector-bound hash.
+            if (candidate.vector === undefined || !validVector(candidate.vector))
+                return false;
+            try {
+                return canonicalStringify(candidate) === canonicalStringify(source);
+            }
+            catch {
+                return false;
+            }
+        }
+        // Partial retry BEFORE embedding (expected is the effective no-vector
+        // episode): accept without re-embedding only when the committed candidate
+        // carries a verified vector-bound hash (checked above) AND its base —
+        // stripped of vector/contentHash — equals the expected episode EXACTLY.
+        if (candidate.vector === undefined || !validVector(candidate.vector))
+            return false;
+        const { vector: _candidateVector, contentHash: _candidateHash, ...candidateBase } = candidate;
+        const { vector: _sourceVector, contentHash: _sourceHash, ...sourceBase } = source;
+        return canonicalStringify(candidateBase) === canonicalStringify(sourceBase);
     }
     catch {
         return false;
@@ -2052,26 +2080,49 @@ function verifiedDifferentCanonicalHash(readback, expected) {
         return false;
     }
 }
-function policyRecord(job, privacyEpoch) {
+function policyRecord(job, privacyEpoch, effective) {
+    // Persist the EFFECTIVE producer/local intersection, never the producer
+    // policy alone: id/hash/expiry/destinations all come from the intersection.
     const pending = {
-        recordType: "processing_policy", id: job.policy.id, ownerHost: job.ownerHost, schemaRevision: 1, createdAt: job.createdAt,
-        privacyEpoch, processingPolicyId: job.policy.id, expiresAt: job.policy.expiresAt, contentHash: "pending",
-        policy: job.policy, canonicalHash: job.policy.id,
+        recordType: "processing_policy", id: effective.id, ownerHost: job.ownerHost, schemaRevision: 1, createdAt: job.createdAt,
+        privacyEpoch, processingPolicyId: effective.id, expiresAt: effective.expiresAt, contentHash: "pending",
+        policy: effective, canonicalHash: effective.id,
     };
     return { ...pending, contentHash: canonicalRecordHash(pending) };
+}
+/** Fresh frozen material derived from the durable source under the effective policy. */
+function effectiveEpisode(source, effective) {
+    const derived = {
+        ...source, processingPolicyId: effective.id, expiresAt: effective.expiresAt,
+        originProvider: effective.originProvider, destinationId: effective.destinationIds.qdrant, contentHash: "pending",
+    };
+    const final = { ...derived, contentHash: canonicalRecordHash(derived) };
+    return Object.freeze(final);
 }
 function policyRecordReadbackIsExact(readback, expected) {
     if (!record(readback))
         return false;
     try {
         const candidate = readback;
-        return candidate.recordType === "processing_policy" && candidate.id === expected.id && candidate.contentHash === expected.contentHash && canonicalRecordHash(candidate) === candidate.contentHash && candidate.ownerHost === expected.ownerHost && candidate.schemaRevision === expected.schemaRevision && candidate.privacyEpoch === expected.privacyEpoch && candidate.processingPolicyId === expected.processingPolicyId && candidate.expiresAt === expected.expiresAt && candidate.canonicalHash === expected.canonicalHash && canonicalStringify(candidate.policy) === canonicalStringify(expected.policy);
+        // The processing-policy point identity is content-addressed by the policy
+        // itself; the envelope privacy epoch is observed-at-insert metadata and is
+        // excluded from the canonical identity, so an unchanged policy reused after
+        // a privacy-epoch increment converges instead of colliding (never silently
+        // overwriting the stored point).
+        return candidate.recordType === "processing_policy" && candidate.id === expected.id && candidate.contentHash === expected.contentHash && canonicalRecordHash(candidate) === candidate.contentHash && candidate.ownerHost === expected.ownerHost && candidate.schemaRevision === expected.schemaRevision && candidate.processingPolicyId === expected.processingPolicyId && candidate.expiresAt === expected.expiresAt && candidate.canonicalHash === expected.canonicalHash && canonicalStringify(candidate.policy) === canonicalStringify(expected.policy);
     }
     catch {
         return false;
     }
 }
-function staticIngestValidation(input, now) {
+/**
+ * Shared job-level policy/destination/owner validation plus EPISODE-LEVEL
+ * checks applied ONLY to the post-barrier ACTIVE episodes (`activeEpisodes`):
+ * a tombstoned/skipped episode is never inspected again (its scanner
+ * projection, shape or hash cannot poison the job). Job-level checks remain
+ * shared regardless of skipped episodes.
+ */
+function staticIngestValidation(input, now, activeEpisodes) {
     const count = Array.isArray(input.job?.episodes) && input.job.episodes.length > 0 ? input.job.episodes.length : 1;
     if (!Number.isSafeInteger(input.maxClockSkewMs) || input.maxClockSkewMs < 0 || input.maxClockSkewMs > 3_600_000)
         return ingestResult("quarantined", count, "policy_invalid");
@@ -2081,13 +2132,13 @@ function staticIngestValidation(input, now) {
         const effective = intersectPolicies([input.job.policy], input.localPolicy);
         if (effective === null)
             return ingestResult("pending", count, "policy_unauthorized");
-        if (!exactDestination(input.qdrant.destination, destinationFor(effective, "qdrant")) || !exactDestination(input.embedding.destination, destinationFor(effective, "embedding")))
+        if (!exactDestination(input.runtime.qdrant.destination, destinationFor(effective, "qdrant")) || !exactDestination(input.runtime.embedding.destination, destinationFor(effective, "embedding")))
             return ingestResult("pending", count, "policy_unauthorized");
-        if (input.qdrant.ownerHost !== input.job.ownerHost || input.qdrant.collection !== expectedQdrantCollection(input.job.ownerHost))
+        if (input.runtime.qdrant.ownerHost !== input.job.ownerHost || input.runtime.qdrant.collection !== expectedQdrantCollection(input.job.ownerHost))
             return ingestResult("pending", count, "policy_unauthorized");
         if (isExpired(effective, now, input.maxClockSkewMs))
             return ingestResult("quarantined", count, "expired");
-        for (const episode of input.job.episodes) {
+        for (const episode of activeEpisodes) {
             if (episode.recordType !== "episode" || episode.ownerHost !== input.job.ownerHost || episode.host !== input.job.ownerHost || episode.processingPolicyId !== input.job.policy.id || episode.expiresAt !== input.job.policy.expiresAt || episode.originProvider !== input.job.policy.originProvider || episode.destinationId !== input.job.policy.destinationIds.qdrant || episode.vector !== undefined || episode.secretScan !== "passed" || !finalEpisodeMaterialIsSafe(episode) || episode.contentHash !== canonicalRecordHash(episode))
                 return ingestResult("quarantined", count, episode.secretScan === "passed" ? "episode_invalid" : "scanner_rejected");
         }
@@ -2099,15 +2150,59 @@ function staticIngestValidation(input, now) {
 }
 async function readStableControl(input) {
     try {
-        const snapshot = await input.control.read();
-        return validControlSnapshot(snapshot, input.qdrant) ? snapshot : undefined;
+        const snapshot = await input.runtime.control.read();
+        return validControlSnapshot(snapshot, input.runtime.qdrant) ? snapshot : undefined;
     }
     catch {
         return undefined;
     }
 }
 function controlAllows(snapshot, input, privacyEpoch) {
-    return snapshot.privacyEpoch === privacyEpoch && !isRevoked(snapshot, input.qdrant.destination) && !isRevoked(snapshot, input.embedding.destination);
+    return snapshot.privacyEpoch === privacyEpoch && !isRevoked(snapshot, input.runtime.qdrant.destination) && !isRevoked(snapshot, input.runtime.embedding.destination);
+}
+function validTombstoneOutput(value, requested) {
+    if (!Array.isArray(value) || value.length > 1024)
+        return false;
+    const requestedSet = new Set(requested);
+    const seen = new Set();
+    for (const id of value) {
+        if (typeof id !== "string" || id.length === 0 || id.length > 512 || !requestedSet.has(id) || seen.has(id))
+            return false;
+        seen.add(id);
+    }
+    return true;
+}
+function sameActiveControl(left, right) {
+    return left.state === right.state && left.privacyEpoch === right.privacyEpoch && left.coordinationPolicyEpoch === right.coordinationPolicyEpoch && left.policyHash === right.policyHash && left.revokedDestinationIds.length === right.revokedDestinationIds.length && left.revokedDestinationIds.every((id, index) => id === right.revokedDestinationIds[index]);
+}
+/**
+ * Stable control -> tombstones -> fresh control barrier. Returns the EXACT
+ * tombstoned subset of the requested episode IDs (never quarantining the whole
+ * requested set): callers skip only the tombstoned episodes and continue the
+ * remaining ones independently. Full control->tombstones->control stability is
+ * preserved; no egress may follow an observed tombstone for that source.
+ */
+async function readBarrier(input, episodeIds, count, signal) {
+    const before = await readStableControl(input);
+    if (before === undefined)
+        return ingestResult("pending", count, "control_unavailable");
+    if (signal?.aborted)
+        return ingestResult("pending", count, "aborted");
+    let tombstoned;
+    try {
+        tombstoned = await input.runtime.tombstones.readTombstoned(episodeIds);
+    }
+    catch {
+        return ingestResult("pending", count, "control_unavailable");
+    }
+    if (!validTombstoneOutput(tombstoned, episodeIds))
+        return ingestResult("pending", count, "control_unavailable");
+    if (signal?.aborted)
+        return ingestResult("pending", count, "aborted");
+    const after = await readStableControl(input);
+    if (after === undefined || !sameActiveControl(before, after))
+        return ingestResult("pending", count, "control_unavailable");
+    return { snapshot: after, tombstoned };
 }
 async function ingestAttempt(rawInput, clock, signal) {
     // This is a public direct-call seam as well as the Task 5 callback: parse
@@ -2121,170 +2216,297 @@ async function ingestAttempt(rawInput, clock, signal) {
     }
     const input = { ...rawInput, job };
     const count = job.episodes.length;
+    // The production ingest bundle is mandatory even on the direct seam: one
+    // nominal runtime binding the real store with its qdrant/embedding/control/
+    // tombstones members, brand-checked before clock/control/egress.
+    if (input.runtime === undefined || !BoundIngestRuntime.isValid(input.runtime))
+        return ingestResult("pending", count, "control_unavailable");
+    if (input.runtime.qdrant.ownerHost !== job.ownerHost)
+        return ingestResult("pending", count, "control_unavailable");
+    // Per-episode tombstone tracking: skipped/tombstoned episode IDs never block
+    // unrelated episodes and never sacrifice active ones.
+    const skipped = new Set();
+    let activeDelivered = 0;
+    // EXACT partial-result partition on EVERY path: the fields always sum to
+    // `count` (delivered + pending + quarantined === count) and the tombstoned
+    // metadata is the exact skipped subset.
+    const attemptResult = (kind, category) => {
+        const skippedCount = skipped.size;
+        const partition = kind === "pending"
+            ? { delivered: activeDelivered, pending: count - activeDelivered - skippedCount, quarantined: skippedCount }
+            : kind === "quarantined"
+                ? { delivered: activeDelivered, pending: 0, quarantined: count - activeDelivered }
+                : { delivered: count - skippedCount, pending: 0, quarantined: skippedCount };
+        return category === undefined ? { result: partition, tombstoned: skippedCount } : { result: partition, category, tombstoned: skippedCount };
+    };
+    const firstBarrier = await readBarrier(input, job.episodes.map((episode) => episode.id), count, signal);
+    // The initial barrier failure happens before any skipped subset is known:
+    // pending=count is the exact partition then.
+    if ("result" in firstBarrier)
+        return firstBarrier;
+    const first = firstBarrier.snapshot;
+    for (const id of firstBarrier.tombstoned)
+        skipped.add(id);
+    const remaining = job.episodes.filter((episode) => !skipped.has(episode.id));
+    if (signal?.aborted)
+        return attemptResult("pending", "aborted");
+    // ALL episodes tombstoned: terminal-forgotten IMMEDIATELY, BEFORE the clock,
+    // effective-policy validation, revocation/controlAllows, privacy-epoch or
+    // expiry checks. A durable parseable job whose every episode carries an
+    // exact current tombstone is disposable even when the local policy changed,
+    // the destination is revoked, the clock fails or the privacy epoch advanced.
+    // No policy insert/embedding/write happens.
+    if (remaining.length === 0)
+        return { result: { delivered: 0, pending: 0, quarantined: count }, category: "tombstoned", tombstoned: count };
+    // Only active episodes remain: sample the clock, validate the effective
+    // policy and apply egress controls.
     let started;
     try {
         started = clockValue(clock);
     }
     catch {
-        return ingestResult("pending", count, "control_unavailable");
+        return attemptResult("pending", "control_unavailable");
     }
     if (signal?.aborted)
-        return ingestResult("pending", count, "aborted");
-    const initial = staticIngestValidation(input, started);
+        return attemptResult("pending", "aborted");
+    // Static validation inspects ONLY the remaining ACTIVE episodes (never a
+    // tombstoned/skipped one) and its outcome is mapped through the exact
+    // partition so skipped tombstones stay in metadata and the processor
+    // disposition is correct.
+    const initial = staticIngestValidation(input, started, remaining);
     if ("result" in initial)
-        return initial;
-    const first = await readStableControl(input);
-    if (signal?.aborted)
-        return ingestResult("pending", count, "aborted");
+        return attemptResult(initial.result.quarantined > 0 ? "quarantined" : "pending", initial.category);
     let beforePolicyNow;
     try {
         beforePolicyNow = clockValue(clock);
     }
     catch {
-        return ingestResult("pending", count, "control_unavailable");
+        return attemptResult("pending", "control_unavailable");
     }
     // An embedding-only revocation is deliberately stricter: it suppresses the
     // policy point too, so no part of the job egresses after either revocation.
-    if (first === undefined || !controlAllows(first, input, first.privacyEpoch))
-        return ingestResult("pending", count, "control_unavailable");
-    if (job.episodes.some((episode) => episode.privacyEpoch !== first.privacyEpoch))
-        return ingestResult("pending", count, "control_unavailable");
+    if (!controlAllows(first, input, first.privacyEpoch))
+        return attemptResult("pending", "control_unavailable");
+    if (remaining.some((episode) => episode.privacyEpoch !== first.privacyEpoch))
+        return attemptResult("pending", "control_unavailable");
     if (isExpired(initial.effective, beforePolicyNow, input.maxClockSkewMs))
-        return ingestResult("quarantined", count, "expired");
+        return attemptResult("quarantined", "expired");
     if (signal?.aborted)
-        return ingestResult("pending", count, "aborted");
-    const policy = policyRecord(job, first.privacyEpoch);
+        return attemptResult("pending", "aborted");
+    // FRESH stable control->tombstones->control barrier immediately before the
+    // processing-policy write: the cached initial barrier never authorizes the
+    // policy insert. Control privacy/revocation/draining changes or new
+    // tombstones observed during clock/static validation re-partition here.
+    const prePolicyBarrier = await readBarrier(input, remaining.map((episode) => episode.id), count, signal);
+    if ("result" in prePolicyBarrier)
+        return attemptResult("pending", prePolicyBarrier.category);
+    const prePolicy = prePolicyBarrier.snapshot;
+    for (const id of prePolicyBarrier.tombstoned)
+        skipped.add(id);
+    const remainingAfterPolicy = remaining.filter((episode) => !skipped.has(episode.id));
+    let prePolicyNow;
     try {
-        await input.qdrant.insertAndReadback(policy);
+        prePolicyNow = clockValue(clock);
+    }
+    catch {
+        return attemptResult("pending", "control_unavailable");
+    }
+    if (!controlAllows(prePolicy, input, prePolicy.privacyEpoch))
+        return attemptResult("pending", "control_unavailable");
+    if (remainingAfterPolicy.some((episode) => episode.privacyEpoch !== prePolicy.privacyEpoch))
+        return attemptResult("pending", "control_unavailable");
+    if (isExpired(initial.effective, prePolicyNow, input.maxClockSkewMs))
+        return attemptResult("quarantined", "expired");
+    if (signal?.aborted)
+        return attemptResult("pending", "aborted");
+    // Newly all tombstoned: terminal dispose WITHOUT any policy insert.
+    if (remainingAfterPolicy.length === 0)
+        return { result: { delivered: 0, pending: 0, quarantined: count }, category: "tombstoned", tombstoned: count };
+    const policy = policyRecord(job, prePolicy.privacyEpoch, initial.effective);
+    try {
+        await input.runtime.qdrant.insertAndReadback(policy);
     }
     catch (error) {
         const collision = error instanceof QdrantContentHashCollisionError;
-        return ingestResult(collision ? "quarantined" : "pending", count, collision ? "hash_collision" : "qdrant_failed");
+        return attemptResult(collision ? "quarantined" : "pending", collision ? "hash_collision" : "qdrant_failed");
     }
     if (signal?.aborted)
-        return ingestResult("pending", count, "aborted");
+        return attemptResult("pending", "aborted");
     let policyReadback;
     try {
-        policyReadback = await input.qdrant.retrieve("processing_policy", policy.id);
+        policyReadback = await input.runtime.qdrant.retrieve("processing_policy", policy.id);
     }
     catch {
-        return ingestResult("pending", count, "qdrant_failed");
+        return attemptResult("pending", "qdrant_failed");
     }
     if (signal?.aborted)
-        return ingestResult("pending", count, "aborted");
+        return attemptResult("pending", "aborted");
     if (!policyRecordReadbackIsExact(policyReadback, policy))
-        return ingestResult(verifiedDifferentCanonicalHash(policyReadback, policy) ? "quarantined" : "pending", count, verifiedDifferentCanonicalHash(policyReadback, policy) ? "hash_collision" : "qdrant_failed");
-    for (const source of job.episodes) {
+        return attemptResult(verifiedDifferentCanonicalHash(policyReadback, policy) ? "quarantined" : "pending", verifiedDifferentCanonicalHash(policyReadback, policy) ? "hash_collision" : "qdrant_failed");
+    for (const source of remainingAfterPolicy) {
         if (signal?.aborted)
-            return ingestResult("pending", count, "aborted");
-        const beforeEmbed = await readStableControl(input);
+            return attemptResult("pending", "aborted");
+        // Fresh frozen material under the EFFECTIVE intersection: the durable outbox
+        // job/source object is never mutated or persisted directly.
+        const material = effectiveEpisode(source, initial.effective);
+        const beforeEmbedBarrier = await readBarrier(input, [source.id], count, signal);
+        if ("result" in beforeEmbedBarrier)
+            return attemptResult("pending", beforeEmbedBarrier.category);
+        if (beforeEmbedBarrier.tombstoned.length > 0) {
+            skipped.add(source.id);
+            continue;
+        }
+        const beforeEmbed = beforeEmbedBarrier.snapshot;
         if (signal?.aborted)
-            return ingestResult("pending", count, "aborted");
+            return attemptResult("pending", "aborted");
         let beforeNow;
         try {
             beforeNow = clockValue(clock);
         }
         catch {
-            return ingestResult("pending", count, "control_unavailable");
+            return attemptResult("pending", "control_unavailable");
         }
         const beforeExpired = isExpired(initial.effective, beforeNow, input.maxClockSkewMs);
-        if (beforeEmbed === undefined || !controlAllows(beforeEmbed, input, first.privacyEpoch) || beforeExpired || signal?.aborted)
-            return ingestResult(beforeExpired ? "quarantined" : "pending", count, signal?.aborted ? "aborted" : beforeExpired ? "expired" : "control_unavailable");
+        if (!controlAllows(beforeEmbed, input, first.privacyEpoch) || beforeExpired || signal?.aborted)
+            return attemptResult(beforeExpired ? "quarantined" : "pending", signal?.aborted ? "aborted" : beforeExpired ? "expired" : "control_unavailable");
         if (signal?.aborted)
-            return ingestResult("pending", count, "aborted");
+            return attemptResult("pending", "aborted");
         let existing;
         try {
-            existing = await input.qdrant.retrieve("episode", source.id);
+            existing = await input.runtime.qdrant.retrieve("episode", source.id);
         }
-        catch {
-            return ingestResult("pending", count, "qdrant_failed");
+        catch (error) {
+            // A verified legacy vector-excluding hash collision is terminal.
+            if (error instanceof QdrantContentHashCollisionError)
+                return attemptResult("quarantined", "hash_collision");
+            return attemptResult("pending", "qdrant_failed");
         }
         if (signal?.aborted)
-            return ingestResult("pending", count, "aborted");
+            return attemptResult("pending", "aborted");
         if (existing !== null) {
-            if (sameEpisodeReadback(existing, source)) {
-                const finalExisting = await readStableControl(input);
+            if (sameEpisodeReadback(existing, material)) {
+                const finalExistingBarrier = await readBarrier(input, [source.id], count, signal);
+                if ("result" in finalExistingBarrier)
+                    return attemptResult("pending", finalExistingBarrier.category);
+                if (finalExistingBarrier.tombstoned.length > 0) {
+                    skipped.add(source.id);
+                    continue;
+                }
                 if (signal?.aborted)
-                    return ingestResult("pending", count, "aborted");
+                    return attemptResult("pending", "aborted");
                 let finalExistingNow;
                 try {
                     finalExistingNow = clockValue(clock);
                 }
                 catch {
-                    return ingestResult("pending", count, "control_unavailable");
+                    return attemptResult("pending", "control_unavailable");
                 }
                 const existingExpired = isExpired(initial.effective, finalExistingNow, input.maxClockSkewMs);
-                if (finalExisting === undefined || !controlAllows(finalExisting, input, first.privacyEpoch) || existingExpired)
-                    return ingestResult(existingExpired ? "quarantined" : "pending", count, existingExpired ? "expired" : "control_unavailable");
+                if (!controlAllows(finalExistingBarrier.snapshot, input, first.privacyEpoch) || existingExpired)
+                    return attemptResult(existingExpired ? "quarantined" : "pending", existingExpired ? "expired" : "control_unavailable");
+                activeDelivered += 1;
                 continue;
             }
-            return ingestResult(verifiedDifferentCanonicalHash(existing, source) ? "quarantined" : "pending", count, verifiedDifferentCanonicalHash(existing, source) ? "hash_collision" : "qdrant_failed");
+            return attemptResult(verifiedDifferentCanonicalHash(existing, material) ? "quarantined" : "pending", verifiedDifferentCanonicalHash(existing, material) ? "hash_collision" : "qdrant_failed");
         }
         // A null lookup is also an authorization boundary: it may have taken long
-        // enough for revocation, state, privacy epoch, or expiry to change.
-        const afterLookup = await readStableControl(input);
+        // enough for revocation, state, privacy epoch, expiry, or tombstones to
+        // change, so the FULL control -> tombstones -> fresh control barrier runs
+        // again immediately before BGE (never a control-only read).
+        const afterLookupBarrier = await readBarrier(input, [source.id], count, signal);
+        if ("result" in afterLookupBarrier)
+            return attemptResult("pending", afterLookupBarrier.category);
+        if (afterLookupBarrier.tombstoned.length > 0) {
+            skipped.add(source.id);
+            continue;
+        }
+        const afterLookup = afterLookupBarrier.snapshot;
         if (signal?.aborted)
-            return ingestResult("pending", count, "aborted");
+            return attemptResult("pending", "aborted");
         let afterLookupNow;
         try {
             afterLookupNow = clockValue(clock);
         }
         catch {
-            return ingestResult("pending", count, "control_unavailable");
+            return attemptResult("pending", "control_unavailable");
         }
         const afterLookupExpired = isExpired(initial.effective, afterLookupNow, input.maxClockSkewMs);
-        if (afterLookup === undefined || !controlAllows(afterLookup, input, first.privacyEpoch) || afterLookupExpired)
-            return ingestResult(afterLookupExpired ? "quarantined" : "pending", count, afterLookupExpired ? "expired" : "control_unavailable");
+        if (!controlAllows(afterLookup, input, first.privacyEpoch) || afterLookupExpired)
+            return attemptResult(afterLookupExpired ? "quarantined" : "pending", afterLookupExpired ? "expired" : "control_unavailable");
         if (signal?.aborted)
-            return ingestResult("pending", count, "aborted");
+            return attemptResult("pending", "aborted");
         let vector;
         try {
-            vector = await input.embedding.embed({ model: "bge-m3", text: episodeText(source), ...(signal === undefined ? {} : { signal }) });
+            vector = await input.runtime.embedding.embed({ model: "bge-m3", text: episodeText(material), ...(signal === undefined ? {} : { signal }) });
         }
         catch {
-            return ingestResult("pending", count, signal?.aborted ? "aborted" : "embedding_failed");
+            return attemptResult("pending", signal?.aborted ? "aborted" : "embedding_failed");
         }
         if (signal?.aborted)
-            return ingestResult("pending", count, "aborted");
+            return attemptResult("pending", "aborted");
         if (!validVector(vector))
-            return ingestResult("pending", count, "embedding_invalid");
-        const final = await readStableControl(input);
+            return attemptResult("pending", "embedding_invalid");
+        const finalBarrier = await readBarrier(input, [source.id], count, signal);
+        if ("result" in finalBarrier)
+            return attemptResult("pending", finalBarrier.category);
+        if (finalBarrier.tombstoned.length > 0) {
+            skipped.add(source.id);
+            continue;
+        }
+        const final = finalBarrier.snapshot;
         if (signal?.aborted)
-            return ingestResult("pending", count, "aborted");
+            return attemptResult("pending", "aborted");
         let now;
         try {
             now = clockValue(clock);
         }
         catch {
-            return ingestResult("pending", count, "control_unavailable");
+            return attemptResult("pending", "control_unavailable");
         }
         const finalExpired = isExpired(initial.effective, now, input.maxClockSkewMs);
-        if (final === undefined || !controlAllows(final, input, first.privacyEpoch) || finalExpired)
-            return ingestResult(finalExpired ? "quarantined" : "pending", count, finalExpired ? "expired" : "control_unavailable");
-        const materialized = { ...source, vector: [...vector] };
+        if (!controlAllows(final, input, first.privacyEpoch) || finalExpired)
+            return attemptResult(finalExpired ? "quarantined" : "pending", finalExpired ? "expired" : "control_unavailable");
+        // Fresh materialized episode: the vector-bound content hash commits the
+        // exact 1024 floats; the durable source object and its hash never change.
+        const materializedPending = { ...material, vector: [...vector], contentHash: "pending" };
+        const materialized = Object.freeze({ ...materializedPending, contentHash: canonicalRecordHash(materializedPending) });
         if (signal?.aborted)
-            return ingestResult("pending", count, "aborted");
+            return attemptResult("pending", "aborted");
         try {
-            await input.qdrant.insertAndReadback(materialized);
+            await input.runtime.qdrant.insertAndReadback(materialized);
         }
         catch (error) {
             const collision = error instanceof QdrantContentHashCollisionError;
-            return ingestResult(collision ? "quarantined" : "pending", count, collision ? "hash_collision" : "qdrant_failed");
+            return attemptResult(collision ? "quarantined" : "pending", collision ? "hash_collision" : "qdrant_failed");
         }
         if (signal?.aborted)
-            return ingestResult("pending", count, "aborted");
+            return attemptResult("pending", "aborted");
         let episodeReadback;
         try {
-            episodeReadback = await input.qdrant.retrieve("episode", materialized.id);
+            episodeReadback = await input.runtime.qdrant.retrieve("episode", materialized.id);
         }
-        catch {
-            return ingestResult("pending", count, "qdrant_failed");
+        catch (error) {
+            // A verified legacy vector-excluding hash collision is terminal.
+            if (error instanceof QdrantContentHashCollisionError)
+                return attemptResult("quarantined", "hash_collision");
+            return attemptResult("pending", "qdrant_failed");
         }
         if (signal?.aborted)
-            return ingestResult("pending", count, "aborted");
+            return attemptResult("pending", "aborted");
         if (!sameEpisodeReadback(episodeReadback, materialized))
-            return ingestResult(verifiedDifferentCanonicalHash(episodeReadback, materialized) ? "quarantined" : "pending", count, verifiedDifferentCanonicalHash(episodeReadback, materialized) ? "hash_collision" : "qdrant_failed");
+            return attemptResult(verifiedDifferentCanonicalHash(episodeReadback, materialized) ? "quarantined" : "pending", verifiedDifferentCanonicalHash(episodeReadback, materialized) ? "hash_collision" : "qdrant_failed");
+        activeDelivered += 1;
     }
+    // Exact result accounting: success = delivered count-skipped, pending 0,
+    // quarantined = skipped; the processor disposes the immutable job as
+    // delivered only when delivered + tombstoned === original count with
+    // pending 0 and quarantined === tombstoned. Before any count-derived
+    // success, fail closed unless EVERY episode is accounted for (regression
+    // guard; an unaccounted episode must never be optimistically delivered).
+    if (activeDelivered + skipped.size !== count)
+        return attemptResult("pending", "control_unavailable");
+    if (skipped.size > 0)
+        return { result: { delivered: count - skipped.size, pending: 0, quarantined: skipped.size }, category: "tombstoned", tombstoned: skipped.size };
     return ingestResult("delivered", count);
 }
 function safeIngestCount(value) {
@@ -2300,13 +2522,21 @@ export async function ingestPendingJobs(input) { return (await ingestAttempt(inp
 export function createIngestProcessor(input) {
     if (typeof input.now !== "function")
         throw new TypeError("Ingest processor requires a clock");
+    if (input.runtime === undefined || !BoundIngestRuntime.isValid(input.runtime))
+        throw new TypeError("Ingest processor requires a bound ingest runtime");
     return Object.freeze({
         process: async (job, processInput) => {
             const count = safeIngestCount(job);
             const attempt = await ingestAttempt({ ...input, job, now: 0 }, input.now, processInput.signal).catch(() => ingestResult("pending", count, "control_unavailable"));
-            if (attempt.result.delivered === count)
+            // The immutable whole outbox job is disposed as DELIVERED only when every
+            // episode is accounted for: active deliveries plus terminal-forgotten
+            // tombstoned episodes, pending 0, and quarantined === tombstoned.
+            const tombstoned = attempt.tombstoned ?? 0;
+            if (attempt.result.delivered + tombstoned === count && attempt.result.pending === 0 && attempt.result.quarantined === tombstoned)
                 return { status: "delivered" };
-            if (attempt.result.quarantined > 0)
+            // A non-tombstone fatal quarantine remains fatal; tombstoned-only counts
+            // never quarantine the job.
+            if (attempt.result.quarantined > tombstoned)
                 return { status: "quarantined", category: attempt.category ?? "episode_invalid" };
             return { status: "pending", category: attempt.category ?? "control_unavailable" };
         },

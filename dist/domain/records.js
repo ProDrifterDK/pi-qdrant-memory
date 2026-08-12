@@ -1,5 +1,5 @@
 import { canonicalStringify, sha256Hex } from "./canonical.js";
-import { manifestHash as canonicalManifestHash, validateEffectiveOrder } from "./ids.js";
+import { coverageId, jobId, leasePointId, manifestHash as canonicalManifestHash, proposalContentHash, proposalIdFor, tombstoneId, validateEffectiveOrder } from "./ids.js";
 import { processingPolicyHash } from "./policy.js";
 export const RECORD_SCHEMA_REVISION = 1;
 const MAX_TEXT_CHARS = 16_000;
@@ -31,9 +31,11 @@ const RECORD_KEYS = {
     curated_memory: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "contentId", "observationId", "eventAt", "effectiveAt", "sourceEpisodeIds", "manifestHash", "primaryEvidenceEpisodeId", "effectiveOrder", "stateKey", "category", "scope", "subject", "predicate", "value", "text", "provenance", "confidence", "vector"]),
     curated_current: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "contentId", "observationId", "version", "stateKey", "resolution", "conflictManifestHash", "effectiveOrder", "sourceEpisodeIds", "text", "vector"]),
     raptor_summary: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "generationId", "clusterId", "membershipHash", "level", "memberIds", "manifestHash", "summary", "vector", "modelId", "embeddingDimension", "promptRevision", "algorithm", "seed", "jobId", "fencingToken", "temporalFrom", "temporalTo", "coveredProjects", "algorithmParameters"]),
-    collection_control: new Set([...COMMON_KEYS, "version", "activeGeneration", "activeBaseGeneration", "privacyEpoch", "coordinationPolicyEpoch", "coordinationPolicyHash", "state", "scanCursor", "lastForgetBarrier"]),
+    collection_control: new Set([...COMMON_KEYS, "version", "activeGeneration", "activeBaseGeneration", "privacyEpoch", "coordinationPolicyEpoch", "coordinationPolicyHash", "state", "scanCursor", "lastForgetBarrier", "revokedDestinationIds"]),
     processing_policy: new Set([...COMMON_KEYS, "policy", "canonicalHash"]),
-    job: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "policyId", "policyHash", "policyEpoch", "membership", "state", "leaseExpiresAt", "fencingToken", "leaseOwner", "acceptedProposalId", "acceptedManifestHash"]),
+    job: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "policyId", "policyHash", "policyEpoch", "membership", "extractorRevision"]),
+    lease: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "jobId", "ownerId", "version", "fencingToken", "state", "acceptedProposalId", "acceptedManifestHash"]),
+    proposal: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "jobId", "ownerId", "proposalHash", "manifestHash", "fencingToken", "membership", "content"]),
     coverage: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "episodeId", "extractorRevision"]),
     evidence_link: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "sourceId", "targetId", "jobId", "extractorRevision"]),
     tombstone: new Set([...COMMON_KEYS, "scope", "targetId", "provenanceId"]),
@@ -63,6 +65,9 @@ function host(name, value) { if (value !== "pi" && value !== "prime")
     fail(`${name} is invalid`); }
 function ids(name, value) { if (!Array.isArray(value) || value.length === 0 || value.length > MAX_ARRAY)
     fail(`${name} must be bounded IDs`); value.forEach((item) => text(name, item, MAX_ID_CHARS, true)); }
+function strictlySorted(name, value) { for (let index = 1; index < value.length; index += 1)
+    if (value[index - 1] >= value[index])
+        fail(`${name} must be strictly sorted and unique`); }
 function vector(value, expected) { if (!Array.isArray(value) || (expected !== undefined && value.length !== expected))
     fail("vector dimension is invalid"); value.forEach((item) => finite("vector element", item)); }
 function optionalText(name, value, max = MAX_ID_CHARS, redact = name.toLowerCase().includes("id")) { if (value !== undefined && value !== null)
@@ -116,7 +121,7 @@ function validate(value, context) {
         if (!RECORD_KEYS[recordType].has(key))
             fail(`unknown field ${key}`);
     common(value, context);
-    const isDerived = ["curated_memory", "curated_current", "raptor_summary", "job", "coverage", "evidence_link"].includes(recordType);
+    const isDerived = ["curated_memory", "curated_current", "raptor_summary", "job", "lease", "proposal", "coverage", "evidence_link"].includes(recordType);
     if (isDerived)
         derived(value, context);
     switch (recordType) {
@@ -292,6 +297,12 @@ function validate(value, context) {
                 text("scanCursor", value.scanCursor);
             if (value.lastForgetBarrier !== null)
                 isoDate("lastForgetBarrier", value.lastForgetBarrier);
+            if (!Array.isArray(value.revokedDestinationIds) || value.revokedDestinationIds.length > 1024)
+                fail("revokedDestinationIds must be bounded");
+            value.revokedDestinationIds.forEach((destination, index) => { if (typeof destination !== "string" || destination.length === 0 || destination.length > 256 || !/^[A-Za-z0-9._:/-]+$/u.test(destination) || SECRET_ID.test(destination))
+                fail(`revokedDestinationIds[${index}] must be an exact redacted destination ID`); });
+            if (new Set(value.revokedDestinationIds).size !== value.revokedDestinationIds.length)
+                fail("revokedDestinationIds must not repeat");
             return value;
         case "processing_policy":
             validatePolicy(value.policy);
@@ -302,50 +313,141 @@ function validate(value, context) {
             if (value.canonicalHash !== processingPolicyHash(value.policy) || value.id !== value.canonicalHash || value.canonicalHash !== value.policy.id)
                 fail("processing policy canonical hash mismatch");
             return value;
-        case "job":
+        case "job": {
             text("policyId", value.policyId);
             if (value.policyId !== value.processingPolicyId)
                 fail("job policy ID mismatch");
             text("policyHash", value.policyHash, MAX_ID_CHARS, false);
+            if (value.policyHash !== value.coordinationPolicyHash)
+                fail("job policy hash mismatch");
             integer("policyEpoch", value.policyEpoch);
+            if (value.policyEpoch !== value.coordinationPolicyEpoch)
+                fail("job policy epoch mismatch");
             ids("membership", value.membership);
-            if (!["pending", "leased", "accepted", "completed", "failed", "retired"].includes(String(value.state)))
-                fail("job state invalid");
-            if (value.leaseExpiresAt !== null)
-                isoDate("leaseExpiresAt", value.leaseExpiresAt);
+            strictlySorted("job membership", value.membership);
+            text("extractorRevision", value.extractorRevision, MAX_ID_CHARS, true);
+            const jobOwner = value.ownerHost;
+            host("job.ownerHost", jobOwner);
+            integer("job.privacyEpoch", value.privacyEpoch);
+            try {
+                if (value.id !== jobId(jobOwner, value.membership, value.policyHash, value.extractorRevision, value.policyEpoch, value.policyId, value.privacyEpoch))
+                    fail("job ID formula mismatch");
+            }
+            catch {
+                fail("job ID formula mismatch");
+            }
+            if (context.policyEpoch !== undefined && value.policyEpoch !== context.policyEpoch)
+                fail("policy epoch mismatch");
+            return value;
+        }
+        case "lease":
+            text("jobId", value.jobId);
+            text("ownerId", value.ownerId);
+            integer("version", value.version, 1);
             integer("fencingToken", value.fencingToken);
-            if (value.leaseOwner !== null)
-                text("leaseOwner", value.leaseOwner);
+            if (value.expiresAt === null)
+                fail("lease requires an expiry");
+            isoDate("expiresAt", value.expiresAt);
+            if (value.state !== "leased" && value.state !== "accepted" && value.state !== "released")
+                fail("lease state invalid");
             if (value.acceptedProposalId !== null)
                 text("acceptedProposalId", value.acceptedProposalId);
             if (value.acceptedManifestHash !== null)
                 text("acceptedManifestHash", value.acceptedManifestHash, MAX_ID_CHARS, false);
-            if (value.state === "pending" && (value.leaseOwner !== null || value.leaseExpiresAt !== null || value.acceptedProposalId !== null || value.acceptedManifestHash !== null))
-                fail("pending job cannot carry lease or accepted proposal");
-            if (value.state === "leased" && (value.leaseOwner === null || value.leaseExpiresAt === null || value.acceptedProposalId !== null || value.acceptedManifestHash !== null))
-                fail("leased job requires only an active lease");
-            if (["accepted", "completed"].includes(String(value.state)) && (value.acceptedProposalId === null || value.acceptedManifestHash === null))
-                fail("accepted job requires proposal and manifest");
-            if (context.policyEpoch !== undefined && value.policyEpoch !== context.policyEpoch)
-                fail("policy epoch mismatch");
+            if ((value.acceptedProposalId === null) !== (value.acceptedManifestHash === null))
+                fail("lease acceptance fields must move together");
+            if (value.state === "leased" && value.acceptedProposalId !== null)
+                fail("leased claim cannot carry acceptance");
+            if (value.state === "accepted" && value.acceptedProposalId === null)
+                fail("accepted claim requires proposal and manifest");
+            try {
+                if (value.id !== leasePointId(value.jobId))
+                    fail("lease ID formula mismatch");
+            }
+            catch {
+                fail("lease ID formula mismatch");
+            }
             return value;
-        case "coverage":
+        case "proposal": {
+            text("jobId", value.jobId);
+            text("ownerId", value.ownerId);
+            if (!/^[0-9a-f]{64}$/u.test(String(value.proposalHash)))
+                fail("proposal hash must be a SHA-256 hex digest");
+            text("manifestHash", value.manifestHash, MAX_ID_CHARS, false);
+            integer("fencingToken", value.fencingToken);
+            ids("membership", value.membership);
+            strictlySorted("proposal membership", value.membership);
+            if (value.manifestHash !== canonicalManifestHash(value.membership))
+                fail("proposal manifest hash mismatch");
+            const proposalOwner = value.ownerHost;
+            host("proposal.ownerHost", proposalOwner);
+            text("proposal.coordinationPolicyHash", value.coordinationPolicyHash, MAX_ID_CHARS, false);
+            integer("proposal.coordinationPolicyEpoch", value.coordinationPolicyEpoch);
+            integer("proposal.privacyEpoch", value.privacyEpoch);
+            text("proposal.processingPolicyId", value.processingPolicyId);
+            try {
+                const content = canonicalStringify(value.content);
+                if (content.length > (context.maxTextChars ?? MAX_TEXT_CHARS))
+                    fail("proposal content is unbounded");
+                const recomputed = proposalContentHash({ ownerHost: proposalOwner, jobId: value.jobId, ownerId: value.ownerId, membership: value.membership, content: value.content, policyHash: value.coordinationPolicyHash, policyEpoch: value.coordinationPolicyEpoch, fencingToken: value.fencingToken, privacyEpoch: value.privacyEpoch, policyIntersectionId: value.processingPolicyId });
+                if (value.proposalHash !== recomputed)
+                    fail("proposal content hash mismatch");
+            }
+            catch {
+                fail("proposal content is not canonical");
+            }
+            try {
+                if (value.id !== proposalIdFor(value.jobId, value.proposalHash, value.coordinationPolicyEpoch, value.fencingToken))
+                    fail("proposal ID formula mismatch");
+            }
+            catch {
+                fail("proposal ID formula mismatch");
+            }
+            return value;
+        }
+        case "coverage": {
             text("episodeId", value.episodeId);
             text("extractorRevision", value.extractorRevision, MAX_ID_CHARS, true);
+            integer("coverage.coordinationPolicyEpoch", value.coordinationPolicyEpoch);
+            text("coverage.coordinationPolicyHash", value.coordinationPolicyHash, MAX_ID_CHARS, false);
+            text("coverage.processingPolicyId", value.processingPolicyId);
+            integer("coverage.privacyEpoch", value.privacyEpoch);
+            const coverageOwner = value.ownerHost;
+            host("coverage.ownerHost", coverageOwner);
+            try {
+                if (value.id !== coverageId({ ownerHost: coverageOwner, episodeId: value.episodeId, extractorRevision: value.extractorRevision, coordinationPolicyHash: value.coordinationPolicyHash, coordinationPolicyEpoch: value.coordinationPolicyEpoch, policyIntersectionId: value.processingPolicyId, privacyEpoch: value.privacyEpoch }))
+                    fail("coverage ID formula mismatch");
+            }
+            catch {
+                fail("coverage ID formula mismatch");
+            }
             return value;
+        }
         case "evidence_link":
             text("sourceId", value.sourceId);
             text("targetId", value.targetId);
             text("jobId", value.jobId);
             text("extractorRevision", value.extractorRevision, MAX_ID_CHARS, true);
             return value;
-        case "tombstone":
+        case "tombstone": {
             if (value.scope !== "occurrence" && value.scope !== "content" && value.scope !== "state")
                 fail("tombstone scope invalid");
             text("targetId", value.targetId);
             if (value.provenanceId !== undefined)
                 text("provenanceId", value.provenanceId);
+            const tombOwner = value.ownerHost;
+            host("tombstone.ownerHost", tombOwner);
+            if (!(value.scope === "occurrence" ? /^(?:occurrence:[0-9a-f]{64}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/iu.test(String(value.targetId)) : value.scope === "content" ? /^content:[0-9a-f]{64}$/u.test(String(value.targetId)) : /^state:[0-9a-f]{64}$/u.test(String(value.targetId))))
+                fail("tombstone target does not match its scope");
+            try {
+                if (value.id !== tombstoneId(tombOwner, value.targetId))
+                    fail("tombstone ID formula mismatch");
+            }
+            catch {
+                fail("tombstone ID formula mismatch");
+            }
             return value;
+        }
     }
     return fail("unknown record type");
 }
@@ -359,7 +461,37 @@ export function isMemoryRecord(value, context = {}) { try {
 catch {
     return false;
 } }
-export function canonicalRecordHash(record) { const validated = parseMemoryRecord(record); const copy = { ...validated }; delete copy.contentHash; delete copy.createdAt; delete copy.vector; delete copy.producerId; delete copy.nodeId; return sha256Hex(canonicalStringify(copy)); }
+export function canonicalRecordHash(record) {
+    const validated = parseMemoryRecord(record);
+    const copy = { ...validated };
+    delete copy.contentHash;
+    delete copy.createdAt;
+    delete copy.producerId;
+    delete copy.nodeId;
+    // The episode content hash COMMITS the exact embedded vector (1024 floats):
+    // a changed/missing vector changes the hash, so a persisted point's hash
+    // cryptographically binds the vector readback. Other record types keep the
+    // contractual exclusion (vectors are query artifacts, not identity).
+    if (record.recordType !== "episode")
+        delete copy.vector;
+    // The processing-policy point identity is content-addressed by the policy
+    // itself; the observed envelope privacy epoch is not part of that identity,
+    // so reusing an unchanged policy after a privacy-epoch increment converges
+    // (insert-only "existing") instead of colliding on a same-ID/different-hash.
+    if (record.recordType === "processing_policy")
+        delete copy.privacyEpoch;
+    // Tombstone identity is target/scope-stable under the fixed
+    // H(owner,"tombstone",target) formula: the envelope privacy epoch and
+    // processing-policy intersection are informational (occurrence visibility is
+    // permanent), so repeated same-target forget across privacy AND
+    // processing-policy changes converges deterministically even under
+    // concurrency instead of content-hash colliding.
+    if (record.recordType === "tombstone") {
+        delete copy.privacyEpoch;
+        delete copy.processingPolicyId;
+    }
+    return sha256Hex(canonicalStringify(copy));
+}
 export function assertCanonicalRecordHash(record) { if (record.contentHash !== canonicalRecordHash(record))
     throw new TypeError("Memory record canonical hash mismatch"); }
 export function parsePersistedMemoryRecord(value, context = {}) {
