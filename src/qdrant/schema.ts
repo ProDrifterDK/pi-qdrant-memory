@@ -19,7 +19,7 @@ export const REQUIRED_INDEXES = [
 export const COLLECTION_METADATA_ID = deterministicUuid("pi-qdrant-memory-v2", "collection_metadata");
 export const COLLECTION_CONTROL_ID = deterministicUuid("pi-qdrant-memory-v2", "collection_control");
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
-export type PointRecordType = "episode" | "curated_memory" | "curated_current" | "raptor_summary" | "collection_control" | "processing_policy" | "job" | "lease" | "proposal" | "coverage" | "evidence_link" | "tombstone" | "collection_metadata";
+export type PointRecordType = "episode" | "curated_memory" | "curated_current" | "conflict_manifest" | "raptor_summary" | "collection_control" | "processing_policy" | "job" | "lease" | "proposal" | "coverage" | "evidence_link" | "tombstone" | "collection_metadata";
 export function isPhysicalPointId(value: unknown): value is string { return typeof value === "string" && UUID.test(value); }
 /** Qdrant point IDs are UUIDs. Logical IDs remain in payload and are domain-mapped when needed. */
 export function physicalPointId(recordType: string, logicalId: string): string {

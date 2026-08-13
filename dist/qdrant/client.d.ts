@@ -97,7 +97,7 @@ export type LeaseCasPrecondition = {
     expectedPolicyEpoch: number;
     expectedPolicyHash: string;
     expectedPrivacyEpoch: number;
-    expectedState: "leased" | "accepted" | "released";
+    expectedState: "leased" | "accepted" | "released" | "completed";
     /** Every lease CAS pins the exact current owner (never null). */
     expectedOwner: string;
     expectedAcceptedProposalId: string | null;
@@ -109,7 +109,30 @@ export type LeaseCasPrecondition = {
     expiresBefore?: number;
     expiresAfter?: number;
 };
-export type TypedUpdatePrecondition = ControlCasPrecondition | LeaseCasPrecondition;
+/**
+ * OCC precondition for the single mutable `curated_current` point of one
+ * logical state key under one coordination policy epoch. The update_filter
+ * pins owner/record/version/epoch/hash/privacy/resolution and the exact
+ * resolved content (content_id) or conflict manifest, so a concurrent current
+ * write can never be overwritten silently (the CAS returns false instead).
+ */
+export type CuratedCurrentCasPrecondition = {
+    kind: "current-cas";
+    ownerHost: HostId;
+    recordType: "curated_current";
+    id: string;
+    expectedVersion: number;
+    expectedEpoch: number;
+    expectedPolicyHash: string;
+    expectedProcessingPolicyId: string;
+    expectedExpiresAt: string | null;
+    expectedPrivacyEpoch: number;
+    expectedResolution: "resolved" | "conflict";
+    expectedContentId: string | null;
+    expectedConflictManifestHash: string | null;
+    expectedContentHash: string;
+};
+export type TypedUpdatePrecondition = ControlCasPrecondition | LeaseCasPrecondition | CuratedCurrentCasPrecondition;
 export interface QdrantReadClient {
     readonly endpoint: string;
     readonly ownerHost: HostId;

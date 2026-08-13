@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { types as nodeTypes } from "node:util";
 import { chmod, mkdir, open, readFile, rename, rm, stat, lstat } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
 import type { HostId, RedactionStatus, SecretScanStatus } from "../types.js";
@@ -234,27 +235,53 @@ function parseDepth(value: unknown): number | undefined {
   if (typeof value === "string" && /^\d{1,4}$/u.test(value)) { const parsed = Number(value); if (parsed <= 1000) return parsed; }
   return undefined;
 }
-function obj(value: unknown): Record<string, unknown> | undefined { return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined; }
+function obj(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value) && !nodeTypes.isProxy(value) ? value as Record<string, unknown> : undefined;
+}
+/** Read only own data descriptors for contractual marker keys. Unknown keys are
+ * intentionally ignored, so secret-bearing accessors are never enumerated. */
+function markerSnapshot(value: unknown, keys: readonly string[]): { valid: boolean; values: Record<string, unknown> } {
+  if (value === undefined || value === null) return { valid: true, values: {} };
+  if (typeof value !== "object" || Array.isArray(value) || nodeTypes.isProxy(value)) return { valid: false, values: {} };
+  const values: Record<string, unknown> = {};
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined) continue;
+    if (!("value" in descriptor)) return { valid: false, values: {} };
+    values[key] = descriptor.value;
+  }
+  return { valid: true, values };
+}
 /** Resolve child markers without trusting ambiguous or malformed host metadata. */
 export function resolveAgentMarker(input: AgentMarkerInput): AgentMarker {
-  if (input.host !== "pi" && input.host !== "prime") return { role: "child", depth: 1, valid: false, rootWorkAllowed: false };
-  const header = obj(input.header); const env = input.env ?? {};
-  let valid = input.header === undefined || input.header === null || header !== undefined;
+  if (nodeTypes.isProxy(input) || input === null || typeof input !== "object") return { role: "child", depth: 1, valid: false, rootWorkAllowed: false };
+  const host = input.host;
+  const rawHeader = input.header;
+  const rawEnv = input.env;
+  if (host !== "pi" && host !== "prime") return { role: "child", depth: 1, valid: false, rootWorkAllowed: false };
+  const headerSnapshot = markerSnapshot(rawHeader, ["rlmDepth", "parentSession"]);
+  const envSnapshot = markerSnapshot(rawEnv, ["RLM_DEPTH", "PI_SUBAGENT_CHILD", "PI_SUBAGENT_DEPTH"]);
+  const header = headerSnapshot.values; const env = envSnapshot.values;
+  let valid = headerSnapshot.valid && envSnapshot.valid;
   let depth = 0; let child = false;
-  if (input.host === "prime") {
-    const headerDepth = header?.rlmDepth === undefined ? undefined : parseDepth(header.rlmDepth);
-    if (header?.rlmDepth !== undefined && headerDepth === undefined) valid = false;
-    const envDepth = env.RLM_DEPTH === undefined ? undefined : parseDepth(env.RLM_DEPTH);
-    if (env.RLM_DEPTH !== undefined && envDepth === undefined) valid = false;
+  if (host === "prime") {
+    const rawHeaderDepth = header.rlmDepth;
+    const rawEnvDepth = env.RLM_DEPTH;
+    const headerDepth = rawHeaderDepth === undefined ? undefined : parseDepth(rawHeaderDepth);
+    const envDepth = rawEnvDepth === undefined ? undefined : parseDepth(rawEnvDepth);
+    if (rawHeaderDepth !== undefined && headerDepth === undefined) valid = false;
+    if (rawEnvDepth !== undefined && envDepth === undefined) valid = false;
     if (headerDepth !== undefined && envDepth !== undefined && headerDepth !== envDepth) valid = false;
     depth = headerDepth ?? envDepth ?? 0; child = depth > 0;
   } else {
-    const parent = header?.parentSession;
+    const parent = header.parentSession;
     if (parent !== undefined && parent !== null && typeof parent !== "string" && typeof parent !== "object") valid = false;
+    if (parent !== undefined && parent !== null && typeof parent === "object" && nodeTypes.isProxy(parent)) valid = false;
     child = parent !== undefined && parent !== null && parent !== false;
     const childMarker = env.PI_SUBAGENT_CHILD;
-    const markerDepth = env.PI_SUBAGENT_DEPTH === undefined ? undefined : parseDepth(env.PI_SUBAGENT_DEPTH);
-    if (env.PI_SUBAGENT_DEPTH !== undefined && markerDepth === undefined) valid = false;
+    const rawMarkerDepth = env.PI_SUBAGENT_DEPTH;
+    const markerDepth = rawMarkerDepth === undefined ? undefined : parseDepth(rawMarkerDepth);
+    if (rawMarkerDepth !== undefined && markerDepth === undefined) valid = false;
     if (childMarker !== undefined && childMarker !== "0" && childMarker !== "1") valid = false;
     if (childMarker === "1") child = true;
     if (markerDepth !== undefined && markerDepth > 0) child = true;
@@ -273,11 +300,15 @@ function projectAllowed(input: CaptureInput): boolean {
   const allow = input.projectAllowlist ?? [];
   return allow.length === 0 || (id !== undefined && allow.includes(id));
 }
-function finalField(value: string | undefined, maxChars: number, homeDir: string): { text?: string; status: RedactionStatus } {
+function finalField(value: string | undefined, priorStatus: RedactionStatus | undefined, maxChars: number, homeDir: string): { text?: string; status: RedactionStatus } {
   if (value === undefined) return { status: "unchanged" };
   const bound = Number.isSafeInteger(maxChars) && maxChars >= 0 ? Math.min(maxChars, 16_000) : 0;
   const redacted = redactStructure({ text: value, maxChars: bound, homeDir });
-  return redacted.text.length === 0 ? { status: "dropped" } : { text: redacted.text, status: redacted.redactionStatus };
+  if (redacted.text.length === 0) return { status: "dropped" };
+  // Provenance is typed by selector output; do not infer status from literal
+  // marker-looking user text (e.g. the unchanged bytes "[password redacted]").
+  const status: RedactionStatus = priorStatus === "redacted" || redacted.redactionStatus === "redacted" ? "redacted" : redacted.redactionStatus;
+  return { text: redacted.text, status };
 }
 type MaterializedOutcome = { record?: CaptureEpisodeRecord; category?: CaptureQuarantineCategory };
 function safeFingerprint(value: string | undefined, homeDir = "/"): string | undefined {
@@ -292,8 +323,8 @@ function safeFingerprint(value: string | undefined, homeDir = "/"): string | und
 function episodeMaterial(entry: SelectedCaptureEntry, input: CaptureInput, marker: AgentMarker, fallbackAt: number): MaterializedOutcome {
   const maxText = Number.isSafeInteger(input.maxTextChars) && (input.maxTextChars ?? 0) >= 0 ? Math.min(input.maxTextChars ?? 16_000, 16_000) : 16_000;
   const homeDir = input.homeDir ?? "/";
-  const textField = finalField(entry.text, entry.eventKind.startsWith("tool_") ? (input.toolResultChars ?? 4_000) : maxText, homeDir);
-  const argsField = finalField(entry.toolArgs, input.toolArgsChars ?? 2_000, homeDir);
+  const textField = finalField(entry.text, entry.textRedactionStatus, entry.eventKind.startsWith("tool_") ? (input.toolResultChars ?? 4_000) : maxText, homeDir);
+  const argsField = finalField(entry.toolArgs, entry.toolArgsRedactionStatus, input.toolArgsChars ?? 2_000, homeDir);
   const text = textField.text; const toolArgs = argsField.text;
   const safeToolName = entry.toolName === undefined ? undefined : boundedId(entry.toolName, "tool", homeDir);
   // Non-error entries still need a surviving, structurally redacted semantic
@@ -314,6 +345,7 @@ function episodeMaterial(entry: SelectedCaptureEntry, input: CaptureInput, marke
   const fingerprint = safeFingerprint(entry.errorFingerprint, homeDir); if (fingerprint !== undefined) record.errorFingerprint = fingerprint;
   if (input.producerId !== undefined) record.producerId = boundedId(input.producerId, "producer", homeDir);
   if (input.nodeId !== undefined) record.nodeId = boundedId(input.nodeId, "node", homeDir);
+  if (entry.sessionSequence !== undefined && Number.isSafeInteger(entry.sessionSequence) && entry.sessionSequence >= 0) record.sessionSequence = entry.sessionSequence;
   const semantic = episodeSemanticProjection(record); const finalCheck = redactAndScan({ text: semantic, maxChars: Math.min(16_000, semantic.length), homeDir, ...(input.scan === undefined ? {} : { scan: input.scan }) });
   if (finalCheck.dropped || finalCheck.secretScan !== "passed" || finalCheck.text !== semantic) return { category: finalCheck.secretScan === "error" ? "scanner_error" : finalCheck.secretScan === "rejected" ? "scanner_rejected" : "redaction" };
   if (finalCheck.redactionStatus === "redacted") record.redactionStatus = "redacted";
@@ -408,7 +440,7 @@ export async function capturePersistedEntries(input: CaptureInput): Promise<Capt
     }
     const entries = snapshot.entries;
     const candidates = afterTail(entries, active.state, input.homeDir ?? "/"); if (candidates === undefined) return [];
-    const selected = selectPersistedEntries(candidates, { homeDir: input.homeDir ?? "/", ...(input.toolArgsChars === undefined ? {} : { toolArgsChars: input.toolArgsChars }), ...(input.toolResultChars === undefined ? {} : { toolResultChars: input.toolResultChars }) });
+    const selected = selectPersistedEntries(candidates, { homeDir: input.homeDir ?? "/", sequenceOffset: active.state.tailCount, ...(input.toolArgsChars === undefined ? {} : { toolArgsChars: input.toolArgsChars }), ...(input.toolResultChars === undefined ? {} : { toolResultChars: input.toolResultChars }) });
     const durableCaptured = new Set(active.state.capturedIds);
     const durableQuarantine = new Set(active.state.quarantineIds);
     const pendingEpisodeIds = new Set<string>();

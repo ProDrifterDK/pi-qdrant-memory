@@ -1,5 +1,6 @@
 import type { AuthorizedDestination, RedactedEgressMaterial, RuntimeConfig } from "../types.js";
 import type { RedactionResult } from "./redaction.js";
+import { type SecretScanner } from "./redaction.js";
 export interface EgressDestination extends AuthorizedDestination {
     endpoint: string;
     nodeId: string;
@@ -22,6 +23,19 @@ export interface EgressCheckOptions {
 }
 export declare function isFinalEgressMaterial(value: EgressMaterialGate | undefined, options?: EgressPayloadOptions): value is RedactedEgressMaterial;
 export declare function assertFinalEgressMaterial(value: EgressMaterialGate, options: EgressPayloadOptions): asserts value is RedactedEgressMaterial;
+export interface CuratedEgressOptions {
+    maxChars?: number;
+    homeDir?: string;
+    scan?: SecretScanner;
+}
+/**
+ * ONE gate for derived curated text before BGE-M3 embedding: the canonical
+ * curated text is structurally redacted AND final-scanned in a single call;
+ * only `secret_scan="passed"` material returns (a scanner reject/error yields
+ * a dropped result that the caller must treat as quarantine with NO text
+ * egress and NO embedding). The returned material is an owned plain object.
+ */
+export declare function gateCuratedEgressText(text: string, options?: CuratedEgressOptions): RedactedEgressMaterial;
 export declare function isDestinationAllowed(mode: RuntimeConfig["privacy"]["egressMode"], destination: AuthorizedDestination | EgressDestination, allowlist: readonly AuthorizedDestination[], options?: EgressCheckOptions): boolean;
 export declare function canEgress(input: {
     mode: RuntimeConfig["privacy"]["egressMode"];

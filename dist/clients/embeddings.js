@@ -1,5 +1,6 @@
 import { fetchJson, MemoryClientError } from "./http.js";
 import { bindConfiguredDestination, canonicalEgressEndpoint } from "../security/egress.js";
+import { types as nodeTypes } from "node:util";
 function isRecord(value) { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function invalidResponse(message) { return new MemoryClientError("invalid-response", message); }
 /** Module-private unexported issuer: real embedding clients are branded at construction. */
@@ -167,6 +168,21 @@ export class BoundEmbeddingDestination {
 }
 Object.freeze(BoundEmbeddingDestination);
 Object.freeze(BoundEmbeddingDestination.prototype);
+function snapshotEmbeddingVector(value) {
+    if (!Array.isArray(value) || nodeTypes.isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length > 0)
+        throw new Error("Embedding vector must be a dense plain array");
+    const names = Object.getOwnPropertyNames(value);
+    if (value.length !== 1024 || names.length !== 1025 || !names.includes("length"))
+        throw new Error("Embedding vector must have 1024 finite components");
+    const snapshot = [];
+    for (let index = 0; index < 1024; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (descriptor === undefined || !("value" in descriptor) || !descriptor.enumerable || typeof descriptor.value !== "number" || !Number.isFinite(descriptor.value))
+            throw new Error("Embedding vector must have 1024 finite components");
+        snapshot.push(descriptor.value);
+    }
+    return Object.freeze(snapshot);
+}
 /** Captures immutable endpoint/client/destination snapshots; a later caller mutation cannot retarget egress. */
 export function createEmbeddingDestinationFactory(input) {
     // Snapshot every untrusted field EXACTLY ONCE into plain frozen objects.
@@ -201,9 +217,7 @@ export function createEmbeddingDestinationFactory(input) {
                     if (model !== "bge-m3" || signal?.aborted)
                         throw new Error(model !== "bge-m3" ? "Only BGE-M3 document embeddings are allowed" : "Embedding aborted");
                     const vector = await embedDocument({ model: "bge-m3", text, ...(signal === undefined ? {} : { signal }) });
-                    if (!Array.isArray(vector) || vector.length !== 1024 || !vector.every((value) => typeof value === "number" && Number.isFinite(value)))
-                        throw new Error("Embedding vector must have 1024 finite components");
-                    return Object.freeze([...vector]);
+                    return snapshotEmbeddingVector(vector);
                 },
             }, BOUND_EMBEDDING_DESTINATION_ISSUER);
         } });

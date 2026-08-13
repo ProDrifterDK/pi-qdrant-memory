@@ -1,4 +1,7 @@
 import type { HostId } from "../types.js";
+/** Shared persisted causal-sequence bound (also enforced by capture selector). */
+export declare const MAX_SESSION_SEQUENCE = 4294967295;
+export declare const SESSION_SEQUENCE_STRIDE = 65536;
 export type TombstoneScope = "occurrence" | "content" | "state";
 export interface StateKeyInput {
     host: HostId;
@@ -15,11 +18,37 @@ export interface StateKeyInput {
 export declare function stateKey(input: StateKeyInput): string;
 /** Reusable value identity under one coordination policy. */
 export declare function contentId(policyHash: string, logicalStateKey: string, canonicalValue: unknown): string;
-export type EffectiveOrder = `session:${number}` | readonly [string, string, string];
-/** Validate the two causal-order encodings permitted by §8.2. */
+export interface SessionEffectiveOrder {
+    readonly kind: "session";
+    /** Durable session identity; sequence is meaningful only within this exact session. */
+    readonly sessionId: string;
+    readonly sequence: number;
+    /** Fallback tuple carried with every session order for cross-session comparison. */
+    readonly eventAt: string;
+    readonly episodeId: string;
+    readonly contentId: string;
+}
+/** Legacy `session:N` values remain parseable for old records but are never treated as cross-session causal evidence. */
+export type EffectiveOrder = SessionEffectiveOrder | `session:${number}` | readonly [string, string, string];
+/** Validate durable session orders plus the legacy/cross-session encodings. */
 export declare function validateEffectiveOrder(value: unknown): asserts value is EffectiveOrder;
 /** Insert-only occurrence identity. effectiveOrder may be a causal tuple. */
 export declare function observationId(policyEpoch: number, logicalContentId: string, primaryEvidenceEpisodeId: string, effectiveOrder: unknown): string;
+/**
+ * Per-policy-epoch mutable current-point identity: one `curated_current`
+ * point per logical state key AND coordination policy epoch. A policy
+ * migration creates a NEW current identity (the old point is never mutated);
+ * active-epoch readers select only the point whose epoch matches the active
+ * control, so the old view is hidden without touching old records.
+ */
+export declare function curatedCurrentId(host: HostId, stateKeyValue: string, coordinationPolicyEpoch: number): string;
+/**
+ * Content-addressed immutable conflict-manifest identity: the manifest id
+ * binds the coordination policy hash, the logical state key and the sorted
+ * conflicting observation members, so concurrent identical conflicts converge
+ * to one manifest and no winner is ever chosen.
+ */
+export declare function conflictManifestId(policyHash: string, stateKeyValue: string, members: readonly string[]): string;
 export declare function evidenceLinkId(observation: string, episode: string, extractorRevision: string | number): string;
 export interface EpisodeIdentityInput {
     host: HostId;

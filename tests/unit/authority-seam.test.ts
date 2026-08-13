@@ -257,9 +257,18 @@ void p1; void p2; void p3; void p4; void p5; void p6; void p7; void proof; void 
     writeFileSync(join(dir, "consumer.ts"), consumer);
     // Copy the built dist next to the consumer so relative d.ts resolution works.
     execFileSync("cp", ["-r", "dist", join(dir, "dist")], { cwd: process.cwd(), stdio: "pipe" });
-    // npx must resolve tsc from the repo's node_modules; the consumer file and
-    // its relative d.ts imports live in the temp dir.
-    execFileSync("npx", ["tsc", "--noEmit", "--strict", "--module", "nodenext", "--moduleResolution", "nodenext", "--target", "es2022", join(dir, "consumer.ts")], { cwd: process.cwd(), stdio: "pipe" });
+    // Isolate this package's declarations from third-party declaration bugs
+    // while still requiring every internal relative type to resolve exactly.
+    const externalTypes = `declare module "@earendil-works/pi-ai" {
+  export type Api = unknown;
+  export interface Model<T = Api> { id: string; provider: string; contextWindow: number; maxTokens: number; }
+  export interface Context { messages?: readonly unknown[]; systemPrompt?: string; tools?: readonly unknown[]; }
+}
+declare module "@earendil-works/pi-coding-agent" { export class SessionManager {} }
+`;
+    const externalTypesPath = join(dir, "external-types.d.ts");
+    writeFileSync(externalTypesPath, externalTypes);
+    execFileSync("npx", ["tsc", "--noEmit", "--strict", "--module", "nodenext", "--moduleResolution", "nodenext", "--target", "es2022", externalTypesPath, join(dir, "consumer.ts")], { cwd: process.cwd(), stdio: "pipe" });
   });
 
   it("GLOBAL RULE: Qdrant options accessors are snapshotted EXACTLY ONCE; late swapped values can never mint or relabel", async () => {

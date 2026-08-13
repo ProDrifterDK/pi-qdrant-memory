@@ -1,5 +1,5 @@
 import { canonicalStringify, sha256Hex } from "./canonical.js";
-import { coverageId, jobId, leasePointId, manifestHash as canonicalManifestHash, proposalContentHash, proposalIdFor, tombstoneId, validateEffectiveOrder } from "./ids.js";
+import { MAX_SESSION_SEQUENCE, conflictManifestId, contentId, coverageId, curatedCurrentId, evidenceLinkId, jobId, leasePointId, manifestHash as canonicalManifestHash, observationId, proposalContentHash, proposalIdFor, tombstoneId, validateEffectiveOrder } from "./ids.js";
 import { processingPolicyHash } from "./policy.js";
 export const RECORD_SCHEMA_REVISION = 1;
 const MAX_TEXT_CHARS = 16_000;
@@ -27,7 +27,7 @@ export function episodeSemanticProjection(episode) {
 const COMMON_KEYS = new Set(["recordType", "id", "ownerHost", "schemaRevision", "createdAt", "privacyEpoch", "processingPolicyId", "expiresAt", "contentHash"]);
 const DERIVED_KEYS = new Set(["coordinationPolicyHash", "coordinationPolicyEpoch"]);
 const RECORD_KEYS = {
-    episode: new Set([...COMMON_KEYS, "sourceEntryId", "host", "projectId", "projectIdentityKind", "sessionId", "turnId", "agentRole", "depth", "eventKind", "eventAt", "modelId", "embeddingDimension", "originProvider", "destinationId", "status", "redactionStatus", "secretScan", "text", "toolName", "toolArgs", "errorFingerprint", "vector", "producerId", "nodeId"]),
+    episode: new Set([...COMMON_KEYS, "sourceEntryId", "host", "projectId", "projectIdentityKind", "sessionId", "turnId", "agentRole", "depth", "eventKind", "eventAt", "modelId", "embeddingDimension", "originProvider", "destinationId", "status", "redactionStatus", "secretScan", "text", "toolName", "toolArgs", "errorFingerprint", "vector", "producerId", "nodeId", "sessionSequence"]),
     curated_memory: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "contentId", "observationId", "eventAt", "effectiveAt", "sourceEpisodeIds", "manifestHash", "primaryEvidenceEpisodeId", "effectiveOrder", "stateKey", "category", "scope", "subject", "predicate", "value", "text", "provenance", "confidence", "vector"]),
     curated_current: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "contentId", "observationId", "version", "stateKey", "resolution", "conflictManifestHash", "effectiveOrder", "sourceEpisodeIds", "text", "vector"]),
     raptor_summary: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "generationId", "clusterId", "membershipHash", "level", "memberIds", "manifestHash", "summary", "vector", "modelId", "embeddingDimension", "promptRevision", "algorithm", "seed", "jobId", "fencingToken", "temporalFrom", "temporalTo", "coveredProjects", "algorithmParameters"]),
@@ -38,6 +38,7 @@ const RECORD_KEYS = {
     proposal: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "jobId", "ownerId", "proposalHash", "manifestHash", "fencingToken", "membership", "content"]),
     coverage: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "episodeId", "extractorRevision"]),
     evidence_link: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "sourceId", "targetId", "jobId", "extractorRevision"]),
+    conflict_manifest: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "stateKey", "members"]),
     tombstone: new Set([...COMMON_KEYS, "scope", "targetId", "provenanceId"]),
 };
 function isRecord(value) { return typeof value === "object" && value !== null && !Array.isArray(value); }
@@ -121,7 +122,7 @@ function validate(value, context) {
         if (!RECORD_KEYS[recordType].has(key))
             fail(`unknown field ${key}`);
     common(value, context);
-    const isDerived = ["curated_memory", "curated_current", "raptor_summary", "job", "lease", "proposal", "coverage", "evidence_link"].includes(recordType);
+    const isDerived = ["curated_memory", "curated_current", "conflict_manifest", "raptor_summary", "job", "lease", "proposal", "coverage", "evidence_link"].includes(recordType);
     if (isDerived)
         derived(value, context);
     switch (recordType) {
@@ -165,12 +166,16 @@ function validate(value, context) {
                 text("producerId", value.producerId);
             if (value.nodeId !== undefined)
                 text("nodeId", value.nodeId);
+            if (value.sessionSequence !== undefined)
+                integer("sessionSequence", value.sessionSequence, 0, MAX_SESSION_SEQUENCE);
             if (value.vector !== undefined)
                 vector(value.vector, context.vectorDimension ?? 1024);
             return value;
         case "curated_memory":
             text("contentId", value.contentId);
             text("observationId", value.observationId);
+            if (value.id !== value.observationId)
+                fail("curated observation id must equal its occurrence id");
             isoDate("eventAt", value.eventAt);
             isoDate("effectiveAt", value.effectiveAt);
             try {
@@ -179,16 +184,20 @@ function validate(value, context) {
             catch {
                 fail("effectiveOrder is invalid");
             }
-            if (value.sourceEpisodeIds !== undefined)
+            if (value.sourceEpisodeIds !== undefined) {
                 ids("sourceEpisodeIds", value.sourceEpisodeIds);
+                strictlySorted("sourceEpisodeIds", value.sourceEpisodeIds);
+            }
             if (value.manifestHash !== undefined)
                 text("manifestHash", value.manifestHash, MAX_ID_CHARS, false);
             if (value.primaryEvidenceEpisodeId !== undefined)
                 text("primaryEvidenceEpisodeId", value.primaryEvidenceEpisodeId);
             if (value.sourceEpisodeIds === undefined && value.manifestHash === undefined && value.primaryEvidenceEpisodeId === undefined)
                 fail("derived source/manifest closure missing");
-            if (value.provenance !== undefined)
+            if (value.provenance !== undefined) {
                 ids("provenance", value.provenance);
+                strictlySorted("provenance", value.provenance);
+            }
             optionalText("stateKey", value.stateKey);
             optionalText("category", value.category, MAX_ID_CHARS, false);
             optionalText("scope", value.scope, MAX_ID_CHARS, false);
@@ -213,6 +222,39 @@ function validate(value, context) {
             }
             if (value.vector !== undefined)
                 vector(value.vector, context.vectorDimension ?? 1024);
+            // Deterministic identity formulas: the content id binds the coordination
+            // policy hash + logical state key + canonical value; the occurrence id
+            // binds the policy epoch + content + primary evidence + causal order.
+            // Task 10 manifest-derived observations (no primary evidence) keep the
+            // bounded-field contract and are NOT forced through the evidence formula.
+            if (value.stateKey !== undefined && (value.value !== undefined || value.text !== undefined) && value.coordinationPolicyHash !== undefined) {
+                const curated = value;
+                // Preserve own-property semantics: `value: null` is a real curated value and must not collapse to the text lane through `??`.
+                const canonicalValue = Object.prototype.hasOwnProperty.call(curated, "value") ? curated.value : curated.text;
+                try {
+                    if (curated.contentId !== contentId(curated.coordinationPolicyHash, curated.stateKey, canonicalValue))
+                        fail("contentId formula mismatch");
+                }
+                catch (error) {
+                    if (error instanceof TypeError && /contentId formula mismatch/u.test(error.message))
+                        throw error;
+                    fail("contentId formula mismatch");
+                }
+            }
+            if (value.primaryEvidenceEpisodeId !== undefined) {
+                const curated = value;
+                try {
+                    if (curated.observationId !== observationId(curated.coordinationPolicyEpoch, curated.contentId, curated.primaryEvidenceEpisodeId, curated.effectiveOrder))
+                        fail("observationId formula mismatch");
+                }
+                catch (error) {
+                    if (error instanceof TypeError && /observationId formula mismatch/u.test(error.message))
+                        throw error;
+                    fail("observationId formula mismatch");
+                }
+            }
+            if (value.vector !== undefined)
+                vector(value.vector, context.vectorDimension ?? 1024);
             return value;
         case "curated_current":
             integer("version", value.version, 1);
@@ -223,21 +265,38 @@ function validate(value, context) {
             catch {
                 fail("effectiveOrder is invalid");
             }
+            const currentOwner = value.ownerHost;
+            host("curated_current.ownerHost", currentOwner);
+            try {
+                const current = value;
+                if (current.id !== curatedCurrentId(currentOwner, current.stateKey, current.coordinationPolicyEpoch))
+                    fail("curated current ID formula mismatch");
+            }
+            catch {
+                fail("curated current ID formula mismatch");
+            }
             if (value.resolution === "resolved") {
                 text("contentId", value.contentId);
                 text("observationId", value.observationId);
                 if (value.conflictManifestHash !== undefined)
                     fail("resolved current cannot carry a conflict manifest");
+                if (typeof value.text !== "string")
+                    fail("resolved current text is required");
+                if (!Array.isArray(value.vector))
+                    fail("resolved current vector is required");
+                vector(value.vector, context.vectorDimension ?? 1024);
             }
             else if (value.resolution === "conflict") {
-                if (Object.prototype.hasOwnProperty.call(value, "contentId") || Object.prototype.hasOwnProperty.call(value, "observationId"))
-                    fail("conflict current cannot select content or observation");
+                if (Object.prototype.hasOwnProperty.call(value, "contentId") || Object.prototype.hasOwnProperty.call(value, "observationId") || Object.prototype.hasOwnProperty.call(value, "text") || Object.prototype.hasOwnProperty.call(value, "vector"))
+                    fail("conflict current cannot select content, observation, text or vector");
                 text("conflictManifestHash", value.conflictManifestHash, MAX_ID_CHARS, false);
             }
             else
                 fail("resolution invalid");
-            if (value.sourceEpisodeIds !== undefined)
+            if (value.sourceEpisodeIds !== undefined) {
                 ids("sourceEpisodeIds", value.sourceEpisodeIds);
+                strictlySorted("sourceEpisodeIds", value.sourceEpisodeIds);
+            }
             if (value.text !== undefined)
                 text("text", value.text, context.maxTextChars ?? MAX_TEXT_CHARS, false);
             if (value.vector !== undefined)
@@ -348,7 +407,7 @@ function validate(value, context) {
             if (value.expiresAt === null)
                 fail("lease requires an expiry");
             isoDate("expiresAt", value.expiresAt);
-            if (value.state !== "leased" && value.state !== "accepted" && value.state !== "released")
+            if (value.state !== "leased" && value.state !== "accepted" && value.state !== "released" && value.state !== "completed")
                 fail("lease state invalid");
             if (value.acceptedProposalId !== null)
                 text("acceptedProposalId", value.acceptedProposalId);
@@ -358,8 +417,8 @@ function validate(value, context) {
                 fail("lease acceptance fields must move together");
             if (value.state === "leased" && value.acceptedProposalId !== null)
                 fail("leased claim cannot carry acceptance");
-            if (value.state === "accepted" && value.acceptedProposalId === null)
-                fail("accepted claim requires proposal and manifest");
+            if ((value.state === "accepted" || value.state === "completed") && value.acceptedProposalId === null)
+                fail("accepted/completed claim requires proposal and manifest");
             try {
                 if (value.id !== leasePointId(value.jobId))
                     fail("lease ID formula mismatch");
@@ -428,7 +487,35 @@ function validate(value, context) {
             text("targetId", value.targetId);
             text("jobId", value.jobId);
             text("extractorRevision", value.extractorRevision, MAX_ID_CHARS, true);
+            try {
+                if (value.id !== evidenceLinkId(value.sourceId, value.targetId, value.extractorRevision))
+                    fail("evidence link ID formula mismatch");
+            }
+            catch {
+                fail("evidence link ID formula mismatch");
+            }
             return value;
+        case "conflict_manifest": {
+            text("stateKey", value.stateKey, MAX_ID_CHARS, false);
+            if (!Array.isArray(value.members) || value.members.length < 2 || value.members.length > MAX_ARRAY)
+                fail(`conflict manifest members must contain 2..${MAX_ARRAY} observations`);
+            value.members.forEach((member, index) => { try {
+                text(`members[${index}]`, member);
+            }
+            catch {
+                fail("conflict manifest members are invalid");
+            } });
+            strictlySorted("conflict manifest members", value.members);
+            try {
+                const manifest = value;
+                if (manifest.id !== conflictManifestId(manifest.coordinationPolicyHash, manifest.stateKey, manifest.members))
+                    fail("conflict manifest ID formula mismatch");
+            }
+            catch {
+                fail("conflict manifest ID formula mismatch");
+            }
+            return value;
+        }
         case "tombstone": {
             if (value.scope !== "occurrence" && value.scope !== "content" && value.scope !== "state")
                 fail("tombstone scope invalid");
@@ -451,8 +538,26 @@ function validate(value, context) {
     }
     return fail("unknown record type");
 }
-export function parseMemoryRecord(value, context = {}) { if (!isRecord(value))
-    fail("record must be an object"); return validate(value, context); }
+function ownedRecordSnapshot(value) {
+    if (!isRecord(value))
+        fail("record must be an object");
+    let serialized;
+    try {
+        serialized = canonicalStringify(value);
+    }
+    catch {
+        fail("record must be canonical JSON");
+    }
+    try {
+        return JSON.parse(serialized);
+    }
+    catch {
+        fail("record must be canonical JSON");
+    }
+}
+export function parseMemoryRecord(value, context = {}) {
+    return validate(ownedRecordSnapshot(value), context);
+}
 export function assertMemoryRecord(value, context = {}) { parseMemoryRecord(value, context); }
 export function isMemoryRecord(value, context = {}) { try {
     parseMemoryRecord(value, context);
@@ -461,8 +566,7 @@ export function isMemoryRecord(value, context = {}) { try {
 catch {
     return false;
 } }
-export function canonicalRecordHash(record) {
-    const validated = parseMemoryRecord(record);
+function canonicalHashFromValidated(validated) {
     const copy = { ...validated };
     delete copy.contentHash;
     delete copy.createdAt;
@@ -472,13 +576,18 @@ export function canonicalRecordHash(record) {
     // a changed/missing vector changes the hash, so a persisted point's hash
     // cryptographically binds the vector readback. Other record types keep the
     // contractual exclusion (vectors are query artifacts, not identity).
-    if (record.recordType !== "episode")
+    if (validated.recordType !== "episode" && validated.recordType !== "curated_memory")
         delete copy.vector;
+    // Evidence-link jobId and createdAt are provenance of the first writer, not
+    // identity: the deterministic (observation, episode, extractor) link must
+    // converge across overlapping accepted jobs without a hash collision.
+    if (validated.recordType === "evidence_link")
+        delete copy.jobId;
     // The processing-policy point identity is content-addressed by the policy
     // itself; the observed envelope privacy epoch is not part of that identity,
     // so reusing an unchanged policy after a privacy-epoch increment converges
     // (insert-only "existing") instead of colliding on a same-ID/different-hash.
-    if (record.recordType === "processing_policy")
+    if (validated.recordType === "processing_policy")
         delete copy.privacyEpoch;
     // Tombstone identity is target/scope-stable under the fixed
     // H(owner,"tombstone",target) formula: the envelope privacy epoch and
@@ -486,17 +595,20 @@ export function canonicalRecordHash(record) {
     // permanent), so repeated same-target forget across privacy AND
     // processing-policy changes converges deterministically even under
     // concurrency instead of content-hash colliding.
-    if (record.recordType === "tombstone") {
+    if (validated.recordType === "tombstone") {
         delete copy.privacyEpoch;
         delete copy.processingPolicyId;
     }
     return sha256Hex(canonicalStringify(copy));
 }
-export function assertCanonicalRecordHash(record) { if (record.contentHash !== canonicalRecordHash(record))
+export function canonicalRecordHash(record) { return canonicalHashFromValidated(parseMemoryRecord(record)); }
+export function assertCanonicalRecordHash(record) { const owned = parseMemoryRecord(record); const expected = owned.contentHash; if (expected !== canonicalHashFromValidated(owned))
     throw new TypeError("Memory record canonical hash mismatch"); }
 export function parsePersistedMemoryRecord(value, context = {}) {
     const record = parseMemoryRecord(value, context);
-    assertCanonicalRecordHash(record);
+    const expected = record.contentHash;
+    if (expected !== canonicalHashFromValidated(record))
+        throw new TypeError("Memory record canonical hash mismatch");
     return record;
 }
 export function isPersistedMemoryRecord(value, context = {}) {

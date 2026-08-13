@@ -15,6 +15,16 @@ export declare function readControl(store: ProductionCoordinationStore): Promise
 export declare function initializeControl(store: ProductionCoordinationStore, initial: ControlRecord): Promise<ControlRecord>;
 /** Read the current control for a CAS cycle; callers reread before and after every transition. */
 export declare function readForUpdate(store: ProductionCoordinationStore): Promise<ControlRecord>;
+/** Bounded frozen control snapshot for curation barriers (exact-once reads, plain frozen locals). */
+export interface ControlSnapshot {
+    readonly state: "active" | "draining" | "retired";
+    readonly privacyEpoch: number;
+    readonly coordinationPolicyEpoch: number;
+    readonly coordinationPolicyHash: string;
+    readonly revokedDestinationIds: readonly string[];
+}
+/** Reread control privacy/coordination epochs + revocations as ONE bounded frozen snapshot. */
+export declare function readControlSnapshot(store: ProductionCoordinationStore): Promise<ControlSnapshot>;
 /** CAS active->draining, clears active generation and derived-current visibility; workers stop claiming/egressing. */
 export declare function beginPolicyDrain(store: ProductionCoordinationStore, input: {
     now: number;

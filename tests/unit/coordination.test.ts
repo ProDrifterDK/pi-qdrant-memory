@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { canonicalStringify, deterministicUuid, sha256Hex } from "../../src/domain/canonical.js";
-import { contentId, coverageId, episodeId, jobId, leasePointId, manifestHash, observationId, proposalContentHash, proposalIdFor, stateKey, tombstoneId } from "../../src/domain/ids.js";
+import { contentId, coverageId, curatedCurrentId, episodeId, jobId, leasePointId, manifestHash, observationId, proposalContentHash, proposalIdFor, stateKey, tombstoneId } from "../../src/domain/ids.js";
 import { canonicalRecordHash, type ControlRecord, type CoverageRecord, type EpisodeRecord, type JobRecord, type LeaseRecord, type ProposalRecord, type TombstoneRecord } from "../../src/domain/records.js";
 import { COLLECTION_CONTROL_ID, bootstrapControlHash, controlPayload } from "../../src/qdrant/schema.js";
 import type { QdrantClientOptions } from "../../src/qdrant/client.js";
@@ -116,6 +116,17 @@ function timedWorker(ms: number, nodeId = "node-a", leaseMs = 30000, skew = 0): 
 function brokenClockWorker(): RootWorkerContext { return mintRootWorker(OWNER, "node-a", () => { throw new Error("clock offline"); }); }
 /** Worker for a nominal node with a FIXED trusted clock (standalone claims). */
 function workerAt(nodeId: string, now: number, leaseMs = 30000, skew = 0): RootWorkerContext { return mintRootWorker(OWNER, nodeId, () => now, leaseMs, skew); }
+async function acceptedCoverageAuthority(store: ProductionCoordinationStore, membershipInput: readonly string[], createdAt = NOW): Promise<LeaseAuthority> {
+  const membership = [...new Set(membershipInput)].sort();
+  void createdAt;
+  const job = await createJob(store, { ownerHost: OWNER, membership, policyHash: POLICY_HASH, policyEpoch: 1, extractorRevision: EXTRACTOR, policyIntersectionId: INTERSECTION_ID, privacyEpoch: 0, createdAt, expiresAt: null });
+  const claimed = await claimLease(store, workerAt(`coverage-${job.id}`, NOW_MS), { jobId: job.id, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0 });
+  if (claimed === null) throw new Error("coverage fixture could not claim its job");
+  const proposal = await writeProposal(store, claimed, { membership, content: { summary: "coverage fixture" }, createdAt });
+  const accepted = await acceptProposal(store, claimed, { proposalId: proposal.id });
+  if (accepted === null) throw new Error("coverage fixture could not accept its proposal");
+  return accepted;
+}
 afterEach(() => { vi.unstubAllGlobals(); });
 function stubGlobalFetch(fetchImpl: typeof fetch): void { vi.stubGlobal("fetch", fetchImpl); }
 /** Real production store over stubbed global fetch (NO raw writer is ever constructed in tests). */
@@ -231,7 +242,7 @@ function casBackend(seed: Array<{ id: string; payload: Record<string, unknown>; 
       });
       if (body?.update_mode === "update_only" && !matches) return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { headers: { "content-type": "application/json" } });
       if (hooks.onUpsert !== undefined) await hooks.onUpsert(body?.points ?? [], String(body?.update_mode));
-      for (const incoming of body?.points ?? []) points.set(incoming.id, { id: incoming.id, payload: incoming.payload, ...(incoming.vector === undefined ? {} : { vector: incoming.vector }) });
+      for (const incoming of body?.points ?? []) { if (body?.update_mode === "insert_only" && points.has(incoming.id)) continue; points.set(incoming.id, { id: incoming.id, payload: incoming.payload, ...(incoming.vector === undefined ? {} : { vector: incoming.vector }) }); }
       return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { headers: { "content-type": "application/json" } });
     }
     return new Response(JSON.stringify({ result: {}, status: "ok" }), { headers: { "content-type": "application/json" } });
@@ -646,7 +657,6 @@ describe("Task 8 coordination protocol", () => {
     const { store } = productionStore(restPoints());
     const storeAny = store as unknown as Record<string, unknown>;
     for (const raw of ["compareAndSwapControl", "casLease", "insertLease", "insertJob", "insertProposal", "insertCoverage", "insertTombstone", "upsertPoints", "client", "writer", "session", "engine", "protocol"]) {
-      if (raw in storeAny) console.log("RAW PRESENT:", raw, typeof storeAny[raw]);
       expect(raw in storeAny).toBe(false);
       expect(typeof storeAny[raw]).toBe("undefined");
     }
@@ -770,7 +780,7 @@ describe("Task 8 coordination protocol", () => {
     await expect(acceptProposal(store, stolen!, { proposalId: oldProposal.id, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, maxClockSkewMs: 0 })).rejects.toThrow(/stale|bound|fencing/i);
     // Acceptance survives steal/release (claim point is the authority) and is readable only through the ACCEPTED authority.
     const active = await readActiveAcceptance(store, accepted!, { policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, maxClockSkewMs: 0 });
-    expect(active).toEqual({ proposalId: newProposal.id, manifestHash: newProposal.manifestHash, claimVersion: claim?.version });
+    expect(active).toMatchObject({ proposalId: newProposal.id, manifestHash: newProposal.manifestHash, claimVersion: claim?.version, job: { id: job.id }, proposal: { id: newProposal.id } });
     // A live accepted claim cannot be stolen before conservative expiry.
     await expect(claimLease(store, workerAt("node-d", NOW_MS + 110000, 30000, 0), { jobId: job.id, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0 })).resolves.toBeNull();
     // An accepted claim can be renewed and released while preserving the acceptance.
@@ -799,7 +809,7 @@ describe("Task 8 coordination protocol", () => {
     // An ACCEPTED-state authority cannot accept (only leased authorities can);
     // a stale/foreign proposal never mints an accepted authority.
     await expect(acceptProposal(store, stolenByC!, { proposalId: oldProposal.id })).resolves.toBeNull();
-    expect(await readActiveAcceptance(store, stolenByC!)).toEqual({ proposalId: newProposal.id, manifestHash: newProposal.manifestHash, claimVersion: afterSteal?.version });
+    expect(await readActiveAcceptance(store, stolenByC!)).toMatchObject({ proposalId: newProposal.id, manifestHash: newProposal.manifestHash, claimVersion: afterSteal?.version, job: { id: job.id }, proposal: { id: newProposal.id } });
   });
 
   it("rejects forged worker capabilities, child evidence, and policy drift before reads or CAS", async () => {
@@ -1137,7 +1147,7 @@ describe("Task 8 coordination protocol", () => {
     expect(claimB).not.toBeNull();
     expect(claimB?.state).toBe("accepted");
     expect(claimB?.fencingToken ?? 0).toBe((claimA?.fencingToken ?? 0) + 1);
-    await expect(readActiveAcceptance(store, claimB!)).resolves.toEqual({ proposalId: proposal.id, manifestHash: proposal.manifestHash, claimVersion: claimB?.version });
+    await expect(readActiveAcceptance(store, claimB!)).resolves.toMatchObject({ proposalId: proposal.id, manifestHash: proposal.manifestHash, claimVersion: claimB?.version, job: { id: job.id }, proposal: { id: proposal.id } });
     holderG.armed = true;
     // Stale A authority after the transfer stays null.
     await expect(readActiveAcceptance(store, accepted!)).resolves.toBeNull();
@@ -1255,6 +1265,10 @@ describe("Task 8 coordination protocol", () => {
     const active = await readActiveAcceptance(store, accepted!);
     expect(active?.proposalId).toBe(proposal.id);
     expect(active?.manifestHash).toBe(proposal.manifestHash);
+    expect(Object.isFrozen(active?.job)).toBe(true);
+    expect(Object.isFrozen(active?.job.membership)).toBe(true);
+    expect(Object.isFrozen(active?.proposal)).toBe(true);
+    expect(Object.isFrozen(active?.proposal.content)).toBe(true);
     // Operations AT the exact expiresAt cannot authorize.
     w.set(NOW_MS + 40000);
     await expect(readActiveAcceptance(store, accepted!)).resolves.toBeNull();
@@ -1349,7 +1363,8 @@ describe("Task 8 coordination protocol", () => {
     const c = episode({ id: idC, sourceEntryId: "entry-c" });
     const d = episode({ id: idD, sourceEntryId: "entry-d" });
     const lateEpisode = episode({ id: late, sourceEntryId: "entry-late" });
-    for (const entry of [b, c, d]) await markCoverage(store, { ownerHost: OWNER, episodeId: entry.id, extractorRevision: EXTRACTOR, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, createdAt: NOW, processingPolicyId: INTERSECTION_ID });
+    const coverageAuthority = await acceptedCoverageAuthority(store, [b.id, c.id, d.id]);
+    for (const entry of [b, c, d]) await markCoverage(store, coverageAuthority, { ownerHost: OWNER, episodeId: entry.id, extractorRevision: EXTRACTOR, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, createdAt: NOW, processingPolicyId: INTERSECTION_ID });
     // First sweep advances PAST the late id (it was offline and not scanned).
     const first = await reconcileCoverage({ store, listEpisodes: async () => ({ episodes: [b, c], nextOffset: idC }), extractorRevision: EXTRACTOR, policyEpoch: 1, policyHash: POLICY_HASH, policyIntersectionId: INTERSECTION_ID, privacyEpoch: 0 });
     expect(first.nextOffset).toBe(idC);
@@ -1373,7 +1388,8 @@ describe("Task 8 coordination protocol", () => {
     const b = episode({ id: idB, sourceEntryId: "entry-b" });
     const c = episode({ id: idC, sourceEntryId: "entry-c" });
     const d = episode({ id: idD, sourceEntryId: "entry-d" });
-    for (const entry of [b, c, d]) await markCoverage(store, { ownerHost: OWNER, episodeId: entry.id, extractorRevision: EXTRACTOR, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, createdAt: NOW, processingPolicyId: INTERSECTION_ID });
+    const coverageAuthority = await acceptedCoverageAuthority(store, [b.id, c.id, d.id]);
+    for (const entry of [b, c, d]) await markCoverage(store, coverageAuthority, { ownerHost: OWNER, episodeId: entry.id, extractorRevision: EXTRACTOR, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, createdAt: NOW, processingPolicyId: INTERSECTION_ID });
     const late = "00000000-0000-5000-8000-000000000099";
     const lateEpisode = episode({ id: late, sourceEntryId: "entry-late" });
     // Cycle 1 pages do NOT contain the late episode (it was inserted after the
@@ -1420,7 +1436,8 @@ describe("Task 8 coordination protocol", () => {
     const a = episode({ id: idA, sourceEntryId: "entry-a" });
     const b = episode({ id: idB, sourceEntryId: "entry-b" });
     const c = episode({ id: idC, sourceEntryId: "entry-c" });
-    await markCoverage(store, { ownerHost: OWNER, episodeId: idB, extractorRevision: EXTRACTOR, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, createdAt: NOW, processingPolicyId: INTERSECTION_ID });
+    const coverageAuthority = await acceptedCoverageAuthority(store, [idB]);
+    await markCoverage(store, coverageAuthority, { ownerHost: OWNER, episodeId: idB, extractorRevision: EXTRACTOR, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, createdAt: NOW, processingPolicyId: INTERSECTION_ID });
     // Same call, two slices: the second page re-serves the first page's last id
     // (overlap); the uncovered a appears in BOTH pages but only once in missing.
     const slices: Array<{ episodes: EpisodeRecord[]; nextOffset?: string }> = [
@@ -1465,7 +1482,10 @@ describe("Task 8 coordination protocol", () => {
     const upserts: string[] = [];
     const store = fakeStoreWithBackend({}, { onUpsert: (_points, mode) => { upserts.push(mode); } }).store;
     // markCoverage: store owner pi vs input owner prime -> rejected before mutation.
-    await expect(markCoverage(store, { ownerHost: "prime", episodeId: "00000000-0000-5000-8000-000000000001", extractorRevision: EXTRACTOR, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, createdAt: NOW, processingPolicyId: INTERSECTION_ID })).rejects.toThrow(/owner/i);
+    const foreignCoverageEpisode = "00000000-0000-5000-8000-000000000001";
+    const coverageAuthority = await acceptedCoverageAuthority(store, [foreignCoverageEpisode]);
+    upserts.length = 0; // Ignore genuine authority setup; the operation under test must not mutate.
+    await expect(markCoverage(store, coverageAuthority, { ownerHost: "prime", episodeId: foreignCoverageEpisode, extractorRevision: EXTRACTOR, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, createdAt: NOW, processingPolicyId: INTERSECTION_ID })).rejects.toThrow(/owner/i);
     expect(upserts).toEqual([]);
     // createJob: store owner pi vs input owner prime -> rejected before mutation.
     await expect(createJob(store, { ownerHost: "prime", membership: ["episode-1"], policyHash: POLICY_HASH, policyEpoch: 1, extractorRevision: EXTRACTOR, policyIntersectionId: INTERSECTION_ID, createdAt: NOW, privacyEpoch: 0 })).rejects.toThrow(/owner/i);
@@ -1505,7 +1525,8 @@ describe("Task 8 coordination protocol", () => {
       const sorted = [...entries].sort((a, b) => (a.id < b.id ? -1 : 1));
       return [{ episodes: sorted, nextOffset: sorted[sorted.length - 1]?.id }];
     };
-    await markCoverage(store, { ownerHost: OWNER, episodeId: coveredEpisode.id, extractorRevision: EXTRACTOR, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, createdAt: NOW, processingPolicyId: INTERSECTION_ID });
+    const coverageAuthority = await acceptedCoverageAuthority(store, [coveredEpisode.id]);
+    await markCoverage(store, coverageAuthority, { ownerHost: OWNER, episodeId: coveredEpisode.id, extractorRevision: EXTRACTOR, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, createdAt: NOW, processingPolicyId: INTERSECTION_ID });
     expect(coverageId({ ownerHost: OWNER, episodeId: coveredEpisode.id, extractorRevision: EXTRACTOR, coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1, policyIntersectionId: INTERSECTION_ID, privacyEpoch: 0 })).toBe(coverageId({ ownerHost: OWNER, episodeId: coveredEpisode.id, extractorRevision: EXTRACTOR, coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1, policyIntersectionId: INTERSECTION_ID, privacyEpoch: 0 }));
     expect(coverageId({ ownerHost: OWNER, episodeId: coveredEpisode.id, extractorRevision: EXTRACTOR, coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 2, policyIntersectionId: INTERSECTION_ID, privacyEpoch: 0 })).not.toBe(coverageId({ ownerHost: OWNER, episodeId: coveredEpisode.id, extractorRevision: EXTRACTOR, coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1, policyIntersectionId: INTERSECTION_ID, privacyEpoch: 0 }));
     const slices: Array<{ episodes: EpisodeRecord[]; nextOffset?: string }> = [
@@ -1557,7 +1578,7 @@ describe("Task 8 coordination protocol", () => {
     expect(store.readEpisode).toBeTypeOf("function");
   });
 
-  it("domain-separates canonical scope targets and preserves the exact tombstone formula", () => {
+  it("domain-separates canonical scope targets and preserves the exact tombstone formula", async () => {
     const stateTarget = stateKey({ host: "pi", scope: "project", projectId: "p", category: "fact", subject: "same", predicate: "same" });
     const contentTarget = contentId("policy", stateTarget, "same");
     const occurrenceTarget = observationId(1, contentTarget, EPISODE_UUID, "session:7");
@@ -1568,7 +1589,7 @@ describe("Task 8 coordination protocol", () => {
     expect(occurrenceTarget).toMatch(/^occurrence:/);
     expect(contentTarget).toMatch(/^content:/);
     expect(stateTarget).toMatch(/^state:/);
-    expect(() => createTombstone(fakeStore(), { ownerHost: "pi", scope: "content", targetId: occurrenceTarget, createdAt: NOW, privacyEpoch: 0, processingPolicyId: "policy-1" })).rejects.toThrow(/scope|target/i);
+    await expect(createTombstone(fakeStore(), { ownerHost: "pi", scope: "content", targetId: occurrenceTarget, createdAt: NOW, privacyEpoch: 0, processingPolicyId: "policy-1" })).rejects.toThrow(/scope|target/i);
   });
 
   it("creates immutable tombstones, verifies episode targets by store lookup, and converges source tombstones", async () => {
@@ -1617,7 +1638,7 @@ describe("Task 8 coordination protocol", () => {
     const sourceEpisode = EPISODE_UUID;
     await createTombstone(store, { ownerHost: OWNER, scope: "state", targetId: stateTarget, provenanceIds: [sourceEpisode], targetKind: "episode", createdAt: NOW, privacyEpoch: 1, processingPolicyId: "policy-1" });
     const tombstones = await readTombstones(store, [stateTarget, sourceEpisode]);
-    const futureStateRecord = { recordType: "curated_memory" as const, ownerHost: OWNER, schemaRevision: 1 as const, createdAt: NOW, privacyEpoch: 4, processingPolicyId: "policy-1", expiresAt: null, contentHash: "pending", id: "curated-1", contentId: contentId("policy", stateTarget, "same"), observationId: observationId(1, contentId("policy", stateTarget, "same"), sourceEpisode, "session:1"), eventAt: NOW, effectiveAt: NOW, effectiveOrder: "session:1", sourceEpisodeIds: [sourceEpisode], stateKey: stateTarget, coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1, text: "safe" };
+    const futureStateRecord = { recordType: "curated_memory" as const, ownerHost: OWNER, schemaRevision: 1 as const, createdAt: NOW, privacyEpoch: 4, processingPolicyId: "policy-1", expiresAt: null, contentHash: "pending", id: observationId(1, contentId(POLICY_HASH, stateTarget, "same"), sourceEpisode, "session:1"), contentId: contentId(POLICY_HASH, stateTarget, "same"), observationId: observationId(1, contentId(POLICY_HASH, stateTarget, "same"), sourceEpisode, "session:1"), eventAt: NOW, effectiveAt: NOW, effectiveOrder: "session:1", sourceEpisodeIds: [sourceEpisode], stateKey: stateTarget, coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1 };
     expect(await isVisibleAfterTombstoneCheck(store, { ...futureStateRecord, contentHash: canonicalRecordHash(futureStateRecord) })).toBe(false);
     const oldEpochEpisode = { ...episode({ privacyEpoch: 0 }), contentHash: "pending" };
     expect(await isVisibleAfterTombstoneCheck(store, { ...oldEpochEpisode, contentHash: canonicalRecordHash(oldEpochEpisode) })).toBe(false);
@@ -1659,7 +1680,7 @@ describe("Task 8 coordination protocol", () => {
     expect(await isVisibleAfterTombstoneCheck(cleanStore, broken)).toBe(false);
     // primaryEvidence alone is not full curated-memory closure: without nonempty
     // verified source episodes (or a resolved manifest) the record is invisible.
-    const primaryOnly = { ownerHost: OWNER, schemaRevision: 1 as const, createdAt: NOW, privacyEpoch: 0, processingPolicyId: "policy-1", expiresAt: null, recordType: "curated_memory" as const, id: "primary-only", contentId: "content-1", observationId: "occurrence-1", eventAt: NOW, effectiveAt: NOW, effectiveOrder: "session:1", primaryEvidenceEpisodeId: EPISODE_UUID, coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1, contentHash: "pending" };
+    const primaryOnly = { ownerHost: OWNER, schemaRevision: 1 as const, createdAt: NOW, privacyEpoch: 0, processingPolicyId: "policy-1", expiresAt: null, recordType: "curated_memory" as const, id: observationId(1, "content-1", EPISODE_UUID, "session:1"), contentId: "content-1", observationId: observationId(1, "content-1", EPISODE_UUID, "session:1"), eventAt: NOW, effectiveAt: NOW, effectiveOrder: "session:1", primaryEvidenceEpisodeId: EPISODE_UUID, coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1, contentHash: "pending" };
     expect(await isVisibleAfterTombstoneCheck(cleanStore, { ...primaryOnly, contentHash: canonicalRecordHash(primaryOnly) })).toBe(false);
 
   });
@@ -1719,7 +1740,7 @@ describe("Task 8 coordination protocol", () => {
     const points = restPoints();
     points.set(ep.id, { id: ep.id, payload: recordPayload(ep), vector: { semantic: [...(ep.vector as number[])] } });
     const store = productionStore(points).store;
-    const curated = { ownerHost: OWNER, schemaRevision: 1 as const, createdAt: NOW, privacyEpoch: 0, processingPolicyId: "policy-1", expiresAt: null, recordType: "curated_memory" as const, id: "curated-vector", contentId: "content:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", observationId: "occurrence:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", eventAt: NOW, effectiveAt: NOW, effectiveOrder: "session:1", sourceEpisodeIds: [ep.id], coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1, contentHash: "pending" };
+    const curated = { ownerHost: OWNER, schemaRevision: 1 as const, createdAt: NOW, privacyEpoch: 0, processingPolicyId: "policy-1", expiresAt: null, recordType: "curated_memory" as const, id: "occurrence:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", contentId: "content:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", observationId: "occurrence:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", eventAt: NOW, effectiveAt: NOW, effectiveOrder: "session:1", sourceEpisodeIds: [ep.id], coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1, contentHash: "pending" };
     expect(await isVisibleAfterTombstoneCheck(store, { ...curated, contentHash: canonicalRecordHash(curated) })).toBe(true);
     // After an occurrence tombstone over the vector-bound episode, invisible.
     await createTombstone(store, { ownerHost: OWNER, scope: "occurrence", targetId: ep.id, targetKind: "episode", createdAt: NOW, privacyEpoch: 0, processingPolicyId: "policy-1" });
@@ -1912,7 +1933,7 @@ describe("Task 8 coordination protocol", () => {
     const job = jobRecord(jobId(OWNER, ["episode-1"], POLICY_HASH, EXTRACTOR, 1, INTERSECTION_ID, 0));
     expect(await isVisibleAfterTombstoneCheck(store, { ...job, contentHash: canonicalRecordHash(job) })).toBe(false);
     // Throwing readers are invisible (memory unavailable), never an exception.
-    const validCurated = { ownerHost: OWNER, schemaRevision: 1 as const, createdAt: NOW, privacyEpoch: 0, processingPolicyId: "policy-1", expiresAt: null, recordType: "curated_memory" as const, id: "curated-ok", contentId: `content:${"b".repeat(64)}`, observationId: `occurrence:${"b".repeat(64)}`, eventAt: NOW, effectiveAt: NOW, effectiveOrder: "session:1", sourceEpisodeIds: [EPISODE_UUID], coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1, contentHash: "pending" };
+    const validCurated = { ownerHost: OWNER, schemaRevision: 1 as const, createdAt: NOW, privacyEpoch: 0, processingPolicyId: "policy-1", expiresAt: null, recordType: "curated_memory" as const, id: `occurrence:${"b".repeat(64)}`, contentId: `content:${"b".repeat(64)}`, observationId: `occurrence:${"b".repeat(64)}`, eventAt: NOW, effectiveAt: NOW, effectiveOrder: "session:1", sourceEpisodeIds: [EPISODE_UUID], coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1, contentHash: "pending" };
     // A STRUCTURAL fake returning same-owner minimal IDs + empty tombstones
     // can never mint visibility (nominal production authority required).
     const structuralFake = { readEpisodes: async () => [episode({ vector })], readTombstones: async () => [] };
@@ -1940,14 +1961,14 @@ describe("Task 8 coordination protocol", () => {
     const ep = episode({ vector: Array.from({ length: 1024 }, (_, index) => (index % 5) / 10) });
     const store = productionVisibilityStore([ep]).store;
     const hex = "a".repeat(64);
-    const base = { ownerHost: OWNER, schemaRevision: 1 as const, createdAt: NOW, privacyEpoch: 0, processingPolicyId: "policy-1", expiresAt: null, recordType: "curated_memory" as const, id: "curated-raw", contentId: "content-raw", observationId: `occurrence:${hex}`, eventAt: NOW, effectiveAt: NOW, effectiveOrder: "session:1", sourceEpisodeIds: [ep.id], coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1, contentHash: "pending" };
+    const base = { ownerHost: OWNER, schemaRevision: 1 as const, createdAt: NOW, privacyEpoch: 0, processingPolicyId: "policy-1", expiresAt: null, recordType: "curated_memory" as const, id: `occurrence:${hex}`, contentId: "content-raw", observationId: `occurrence:${hex}`, eventAt: NOW, effectiveAt: NOW, effectiveOrder: "session:1", sourceEpisodeIds: [ep.id], coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1, contentHash: "pending" };
     // Raw contentId can never be tombstoned -> invisible despite verified sources.
     expect(await isVisibleAfterTombstoneCheck(store, { ...base, contentHash: canonicalRecordHash(base) })).toBe(false);
     // Raw stateKey -> invisible.
     const rawState = { ...base, contentId: `content:${hex}`, stateKey: "raw-state", contentHash: "pending" };
     expect(await isVisibleAfterTombstoneCheck(store, { ...rawState, contentHash: canonicalRecordHash(rawState) })).toBe(false);
     // Invalid raw occurrence selector -> invisible.
-    const rawOccurrence = { ...base, contentId: `content:${hex}`, observationId: "occurrence-raw", contentHash: "pending" };
+    const rawOccurrence = { ...base, id: "occurrence-raw", contentId: `content:${hex}`, observationId: "occurrence-raw", contentHash: "pending" };
     expect(await isVisibleAfterTombstoneCheck(store, { ...rawOccurrence, contentHash: canonicalRecordHash(rawOccurrence) })).toBe(false);
     // Valid domain-separated targets preserve visibility.
     const valid = { ...base, contentId: `content:${hex}`, observationId: `occurrence:${hex}`, stateKey: `state:${hex}`, contentHash: "pending" };
@@ -2007,7 +2028,7 @@ describe("Task 8 coordination protocol", () => {
     const stateTarget = stateKey({ host: "pi", scope: "project", projectId: "p", category: "fact", subject: "s", predicate: "p" });
     const contentTarget = contentId("policy", stateTarget, "value");
     const sourceEpisode = EPISODE_UUID;
-    const current = { recordType: "curated_current" as const, ownerHost: OWNER, schemaRevision: 1 as const, createdAt: NOW, privacyEpoch: 0, processingPolicyId: "policy-1", expiresAt: null, contentHash: "pending", id: "current-1", version: 1, stateKey: stateTarget, resolution: "resolved" as const, contentId: contentTarget, observationId: observationId(1, contentTarget, sourceEpisode, "session:1"), effectiveOrder: "session:1", sourceEpisodeIds: [sourceEpisode], coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1, text: "safe" };
+    const current = { recordType: "curated_current" as const, ownerHost: OWNER, schemaRevision: 1 as const, createdAt: NOW, privacyEpoch: 0, processingPolicyId: "policy-1", expiresAt: null, contentHash: "pending", id: curatedCurrentId(OWNER, stateTarget, 1), version: 1, stateKey: stateTarget, resolution: "resolved" as const, contentId: contentTarget, observationId: observationId(1, contentTarget, sourceEpisode, "session:1"), effectiveOrder: "session:1", sourceEpisodeIds: [sourceEpisode], coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1, text: "safe", vector: Array.from({ length: 1024 }, () => 0.25) };
     const targets = tombstoneTargets({ ...current, contentHash: canonicalRecordHash(current) });
     expect(targets).toEqual(expect.arrayContaining([{ scope: "occurrence", targetId: current.observationId }, { scope: "content", targetId: contentTarget }, { scope: "state", targetId: stateTarget }, { scope: "occurrence", targetId: sourceEpisode }]));
   });

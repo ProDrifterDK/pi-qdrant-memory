@@ -1,5 +1,5 @@
 import { type CoverageRecord, type EpisodeRecord } from "../domain/records.js";
-import { ProductionCoordinationStore } from "../qdrant/write.js";
+import { ProductionCoordinationStore, LeaseAuthority } from "../qdrant/write.js";
 import type { HostId } from "../types.js";
 export interface MarkCoverageInput {
     ownerHost: HostId;
@@ -18,7 +18,7 @@ export interface MarkCoverageInput {
  * intersection + privacy epoch, so pre-forget coverage can never suppress
  * post-forget work.
  */
-export declare function markCoverage(store: ProductionCoordinationStore, input: MarkCoverageInput): Promise<CoverageRecord>;
+export declare function markCoverage(store: ProductionCoordinationStore, authority: LeaseAuthority, input: MarkCoverageInput): Promise<CoverageRecord>;
 export interface EpisodeSlice {
     episodes: readonly EpisodeRecord[];
     nextOffset?: string;

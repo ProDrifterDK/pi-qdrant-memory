@@ -27,6 +27,25 @@ export async function readForUpdate(store: ProductionCoordinationStore): Promise
   return store.readControl();
 }
 
+/** Bounded frozen control snapshot for curation barriers (exact-once reads, plain frozen locals). */
+export interface ControlSnapshot {
+  readonly state: "active" | "draining" | "retired";
+  readonly privacyEpoch: number;
+  readonly coordinationPolicyEpoch: number;
+  readonly coordinationPolicyHash: string;
+  readonly revokedDestinationIds: readonly string[];
+}
+/** Reread control privacy/coordination epochs + revocations as ONE bounded frozen snapshot. */
+export async function readControlSnapshot(store: ProductionCoordinationStore): Promise<ControlSnapshot> {
+  if (!ProductionCoordinationStore.isValid(store)) throw new TypeError("Control snapshot requires a genuine production store");
+  const control = await store.readControl();
+  return Object.freeze({
+    state: control.state, privacyEpoch: control.privacyEpoch,
+    coordinationPolicyEpoch: control.coordinationPolicyEpoch, coordinationPolicyHash: control.coordinationPolicyHash,
+    revokedDestinationIds: Object.freeze([...control.revokedDestinationIds]),
+  });
+}
+
 /** CAS active->draining, clears active generation and derived-current visibility; workers stop claiming/egressing. */
 export async function beginPolicyDrain(store: ProductionCoordinationStore, input: { now: number }): Promise<ControlRecord> {
   if (!ProductionCoordinationStore.isValid(store)) throw new TypeError("Policy drain requires a genuine production store");

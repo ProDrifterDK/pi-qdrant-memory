@@ -18,7 +18,7 @@ export function readPolicy(input) {
     const skew = input.maxClockSkewMs ?? 0;
     if (ownerHost !== "pi" && ownerHost !== "prime")
         throw new TypeError("Read owner is invalid");
-    if (recordTypes.length === 0 || recordTypes.some((type) => !["episode", "curated_memory", "curated_current", "raptor_summary", "collection_control", "processing_policy", "job", "lease", "proposal", "coverage", "evidence_link", "tombstone", "collection_metadata"].includes(type)))
+    if (recordTypes.length === 0 || recordTypes.some((type) => !["episode", "curated_memory", "curated_current", "conflict_manifest", "raptor_summary", "collection_control", "processing_policy", "job", "lease", "proposal", "coverage", "evidence_link", "tombstone", "collection_metadata"].includes(type)))
         throw new TypeError("Read record type policy is invalid");
     if (!Number.isFinite(now) || !Number.isFinite(skew) || skew < 0)
         throw new TypeError("Read expiry policy is invalid");

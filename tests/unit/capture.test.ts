@@ -13,6 +13,7 @@ import {
   resolveCaptureAgentDirectory,
 } from "../../src/capture/episode.js";
 import { selectPersistedEntries } from "../../src/capture/select.js";
+import { MAX_SESSION_SEQUENCE, SESSION_SEQUENCE_STRIDE } from "../../src/domain/ids.js";
 import { parsePersistedMemoryRecord } from "../../src/domain/records.js";
 import { sha256Hex } from "../../src/domain/canonical.js";
 
@@ -91,6 +92,25 @@ describe("Task 4 persisted capture", () => {
     ], { toolArgsChars: 17, toolResultChars: 19 });
     expect(result.find((entry) => entry.sourceEntryId === "call-budget")?.toolArgs?.length).toBeLessThanOrEqual(17);
     expect(result.find((entry) => entry.sourceEntryId === "result-budget")?.text?.length).toBeLessThanOrEqual(19);
+  });
+
+  it("derives deterministic branch/part causal sequences across retries and filtered parts", () => {
+    const entries = [
+      msg("branch-0", "assistant", [{ type: "thinking", thinking: "private" }, { type: "text", text: "visible" }, { type: "text", text: "visible-2" }]),
+      msg("branch-1", "user", "next"),
+    ];
+    const first = selectPersistedEntries(entries, { sequenceOffset: 4 });
+    const retry = selectPersistedEntries(entries, { sequenceOffset: 4 });
+    expect(first.map((entry) => entry.sessionSequence)).toEqual([4 * SESSION_SEQUENCE_STRIDE + 1, 4 * SESSION_SEQUENCE_STRIDE + 2, 5 * SESSION_SEQUENCE_STRIDE]);
+    expect(retry.map((entry) => entry.sessionSequence)).toEqual(first.map((entry) => entry.sessionSequence));
+  });
+
+  it("continues sequence offsets after an activation tail and omits overflow", () => {
+    const tail = Math.floor(MAX_SESSION_SEQUENCE / SESSION_SEQUENCE_STRIDE);
+    const atLimit = selectPersistedEntries([msg("at-limit", "user", "safe")], { sequenceOffset: tail });
+    const overflow = selectPersistedEntries([msg("overflow", "user", "safe")], { sequenceOffset: tail + 1 });
+    expect(atLimit[0]?.sessionSequence).toBe(tail * SESSION_SEQUENCE_STRIDE);
+    expect(overflow[0]?.sessionSequence).toBeUndefined();
   });
 
   it("activates at the getEntries tail, persists restart-safe state, dedupes, and captures only later persisted entries", async () => {
@@ -336,6 +356,15 @@ describe("Task 4 persisted capture", () => {
     // This exact text/toolArgs/toolName order is consumed by Task 7; no later
     // scanner transformation may bless different bytes.
     expect([record?.text, record?.toolArgs, record?.toolName].filter((value): value is string => value !== undefined).join("\n")).toBe(record?.text);
+  });
+
+  it("does not infer redaction provenance from a safe literal marker", async () => {
+    const state = new Map<string, string>(); const entries: Entry[] = [msg("before-literal-marker", "user", "old")];
+    const deps = { sessionId: "literal-marker", host: "pi" as const, getEntries: () => entries.slice(), readActivation: async (key: string) => state.get(key), writeActivation: async (key: string, value: string) => { state.set(key, value); }, now: () => 10 };
+    await activateCapture(deps);
+    entries.push(msg("literal-marker-entry", "user", "password: [password redacted]"));
+    const [record] = await capturePersistedEntries({ ...deps, lifecycle: "agent_end", activationDir: "/unused" });
+    expect(record).toMatchObject({ text: "password: [password redacted]", redactionStatus: "unchanged", secretScan: "passed" });
   });
 
   it("reloads persisted file state, keeps secrets out of returned episodes, and never accepts settled", async () => {

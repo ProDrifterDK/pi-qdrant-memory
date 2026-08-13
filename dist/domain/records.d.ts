@@ -44,6 +44,14 @@ export interface EpisodeRecord extends RecordEnvelope {
     vector?: number[];
     producerId?: string;
     nodeId?: string;
+    /**
+     * Canonical persisted same-session causal sequence derived from the
+     * SessionManager branch order (including part order); survives
+     * activation/compaction/restart. Task 7 records without the field fail over
+     * to the cross-session causal tuple (event_at, episode_id, content_id).
+     * Timestamp causality is never invented from this field.
+     */
+    sessionSequence?: number;
 }
 /**
  * The sole semantic projection that crosses Task 7 document egress.  It is
@@ -87,6 +95,8 @@ export interface CuratedCurrentResolvedRecord extends CuratedCurrentBase {
     resolution: "resolved";
     contentId: string;
     observationId: string;
+    text: string;
+    vector: number[];
     conflictManifestHash?: never;
 }
 export interface CuratedCurrentConflictRecord extends CuratedCurrentBase {
@@ -94,6 +104,8 @@ export interface CuratedCurrentConflictRecord extends CuratedCurrentBase {
     conflictManifestHash: string;
     contentId?: never;
     observationId?: never;
+    text?: never;
+    vector?: never;
 }
 export type CuratedCurrentRecord = CuratedCurrentResolvedRecord | CuratedCurrentConflictRecord;
 export interface RaptorSummaryRecord extends DerivedEnvelope {
@@ -167,7 +179,7 @@ export interface LeaseRecord extends DerivedEnvelope {
     version: number;
     fencingToken: number;
     expiresAt: string;
-    state: "leased" | "accepted" | "released";
+    state: "leased" | "accepted" | "released" | "completed";
     acceptedProposalId: string | null;
     acceptedManifestHash: string | null;
 }
@@ -198,6 +210,20 @@ export interface EvidenceLinkRecord extends DerivedEnvelope {
     jobId: string;
     extractorRevision: string;
 }
+/**
+ * Immutable content-addressed conflict manifest: two or more observations of
+ * one logical state key whose cross-session effective orders fall inside the
+ * clock-skew window with different canonical values. No winner is chosen; the
+ * manifest is created by insert-only CAS (identical concurrent conflicts
+ * converge) and `curated_current` points at it via conflictManifestHash.
+ */
+export interface ConflictManifestRecord extends DerivedEnvelope {
+    recordType: "conflict_manifest";
+    id: string;
+    stateKey: string;
+    /** Strictly sorted conflicting observation ids (2..1024); the worker caps growth and marks coverage at the bound. */
+    members: string[];
+}
 export interface TombstoneRecord extends RecordEnvelope {
     recordType: "tombstone";
     id: string;
@@ -205,7 +231,7 @@ export interface TombstoneRecord extends RecordEnvelope {
     targetId: string;
     provenanceId?: string;
 }
-export type MemoryRecord = EpisodeRecord | CuratedMemoryRecord | CuratedCurrentRecord | RaptorSummaryRecord | ControlRecord | ProcessingPolicyRecord | JobRecord | LeaseRecord | ProposalRecord | CoverageRecord | EvidenceLinkRecord | TombstoneRecord;
+export type MemoryRecord = EpisodeRecord | CuratedMemoryRecord | CuratedCurrentRecord | ConflictManifestRecord | RaptorSummaryRecord | ControlRecord | ProcessingPolicyRecord | JobRecord | LeaseRecord | ProposalRecord | CoverageRecord | EvidenceLinkRecord | TombstoneRecord;
 export interface RecordValidationContext {
     ownerHost?: HostId;
     schemaRevision?: number;

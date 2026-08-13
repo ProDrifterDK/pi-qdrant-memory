@@ -3,7 +3,11 @@ import { initializeDestination } from "../../src/admin/init.js";
 import { memoryStatus } from "../../src/admin/status.js";
 import { defaultCliDependencies } from "../../src/admin/cli.js";
 import { collectionMetadataPayload, COLLECTION_METADATA_ID, COLLECTION_CONTROL_ID, REQUIRED_INDEXES, assertBootstrapControl, bootstrapControlHash, controlPayload, V2_CONTRACT_HASH } from "../../src/qdrant/schema.js";
-import { canonicalRecordHash, type ControlRecord } from "../../src/domain/records.js";
+import { canonicalRecordHash, type ControlRecord, type MemoryRecord } from "../../src/domain/records.js";
+import { conflictManifestId } from "../../src/domain/ids.js";
+import { recordPayload } from "../../src/qdrant/write.js";
+import { readPolicy } from "../../src/qdrant/client.js";
+import { statusRetrieve } from "../../src/admin/transport.js";
 import type { RuntimeConfig } from "../../src/types.js";
 
 function config(): RuntimeConfig {
@@ -229,4 +233,58 @@ describe("Qdrant 1.17 initialization and runtime status probes", () => {
     await expect(initializeDestination(config(), { adminApiKey: "human-admin", fetchImpl: badFetch })).rejects.toThrow(/control|invalid/i);
   });
 
+});
+
+describe("admin wire policy for conflict manifests", () => {
+  const pointId = "0f0f0f0f-0f0f-500f-800f-0f0f0f0f0f0f";
+  const conflictManifestRecord = (): MemoryRecord => {
+    const base = { ownerHost: "pi" as const, schemaRevision: 1 as const, createdAt: "2026-08-10T00:00:00.000Z", privacyEpoch: 2, processingPolicyId: "policy-1", expiresAt: null, contentHash: "hash", coordinationPolicyHash: "coordination-hash", coordinationPolicyEpoch: 3, recordType: "conflict_manifest" as const, id: "pending", stateKey: "state-1", members: ["observation-a", "observation-b"] };
+    return { ...base, id: conflictManifestId(base.coordinationPolicyHash, base.stateKey, base.members) };
+  };
+  const wirePayload = (): Record<string, unknown> => recordPayload(conflictManifestRecord());
+  const adminOptions = { baseUrl: "http://qdrant", collection: "pi_memory", ownerHost: "pi" as const, apiKey: "k", timeoutMs: 1000, maxClockSkewMs: 0 };
+
+  it("admits conflict_manifest only under internal/write-verification wire purposes", () => {
+    expect(() => readPolicy({ ownerHost: "pi", purpose: "write_verification", recordTypes: ["conflict_manifest"] })).not.toThrow();
+    expect(() => readPolicy({ ownerHost: "pi", purpose: "internal", recordTypes: ["conflict_manifest"] })).not.toThrow();
+    expect(() => readPolicy({ ownerHost: "pi", purpose: "memory", recordTypes: ["conflict_manifest"] })).toThrow(/purpose|record/i);
+    expect(() => readPolicy({ ownerHost: "pi", purpose: "query", recordTypes: ["conflict_manifest"] })).toThrow(/purpose|record/i);
+    expect(() => readPolicy({ ownerHost: "pi", purpose: "write_verification", recordTypes: ["not-a-record-type"] })).toThrow(/record/i);
+  });
+
+  it("reads and validates a conflict_manifest point through the admin wire policy", async () => {
+    const calls: Array<{ url: string; body?: Record<string, unknown> }> = [];
+    const fetchImpl: typeof fetch = async (input, init = {}) => {
+      const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as Record<string, unknown>;
+      calls.push({ url, ...(body === undefined ? {} : { body }) });
+      return new Response(JSON.stringify({ result: [{ id: pointId, payload: wirePayload() }], status: "ok" }), { status: 200 });
+    };
+    const policy = readPolicy({ ownerHost: "pi", purpose: "write_verification", recordTypes: ["conflict_manifest"] });
+    const points = await statusRetrieve(adminOptions, fetchImpl, [pointId], policy);
+    expect(points).toHaveLength(1);
+    expect(points[0]!.payload.record_type).toBe("conflict_manifest");
+    expect(points[0]!.payload.members).toEqual(["observation-a", "observation-b"]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.body).toMatchObject({ ids: [pointId], with_payload: true, with_vector: false });
+  });
+
+  it("fails closed when conflict_manifest wire points or policies violate the admin contract", async () => {
+    // A different record type is outside a conflict_manifest-only policy.
+    let calls = 0;
+    const foreignType: typeof fetch = async () => { calls += 1; return new Response(JSON.stringify({ result: [{ id: pointId, payload: { owner_host: "pi", record_type: "episode", status: "active", secret_scan: "passed" } }], status: "ok" }), { status: 200 }); };
+    const policy = readPolicy({ ownerHost: "pi", purpose: "write_verification", recordTypes: ["conflict_manifest"] });
+    await expect(statusRetrieve(adminOptions, foreignType, [pointId], policy)).rejects.toThrow(/record type|policy/i);
+    expect(calls).toBe(1);
+    // A forged memory-purpose policy carrying conflict_manifest is rejected BEFORE any network call.
+    let networkCalls = 0;
+    const forgedFetch: typeof fetch = async () => { networkCalls += 1; throw new Error("fetch must not be called"); };
+    const forged = { ...policy, purpose: "memory" as const };
+    await expect(statusRetrieve(adminOptions, forgedFetch, [pointId], forged)).rejects.toThrow(/purpose/i);
+    expect(networkCalls).toBe(0);
+    // Failed secret scans and expired conflict manifests are rejected on the wire.
+    for (const bad of [{ ...wirePayload(), secret_scan: "failed" }, { ...wirePayload(), expires_at: "2020-01-01T00:00:00.000Z" }]) {
+      const badFetch: typeof fetch = async () => new Response(JSON.stringify({ result: [{ id: pointId, payload: bad }], status: "ok" }), { status: 200 });
+      await expect(statusRetrieve(adminOptions, badFetch, [pointId], policy)).rejects.toThrow(/policy|expired/i);
+    }
+  });
 });

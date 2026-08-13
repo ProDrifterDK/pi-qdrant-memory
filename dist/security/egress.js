@@ -98,6 +98,28 @@ export function assertFinalEgressMaterial(value, options) {
     if (!isCanonicalEgressMaterial(value, options))
         throw new Error("Only final redacted material with a passed secret scan may egress");
 }
+/**
+ * ONE gate for derived curated text before BGE-M3 embedding: the canonical
+ * curated text is structurally redacted AND final-scanned in a single call;
+ * only `secret_scan="passed"` material returns (a scanner reject/error yields
+ * a dropped result that the caller must treat as quarantine with NO text
+ * egress and NO embedding). The returned material is an owned plain object.
+ */
+export function gateCuratedEgressText(text, options = {}) {
+    if (typeof text !== "string" || text.length === 0)
+        throw new TypeError("Curated egress text must be a bounded non-empty string");
+    const maxChars = options.maxChars ?? 4096;
+    const homeDir = options.homeDir ?? "/";
+    if (!Number.isSafeInteger(maxChars) || maxChars < 0 || maxChars > 16_000 || typeof homeDir !== "string" || homeDir.length === 0 || homeDir.length > 4096)
+        throw new TypeError("Curated egress options are invalid");
+    const checked = redactAndScan({ text, maxChars, homeDir, ...(options.scan === undefined ? {} : { scan: options.scan }) });
+    if (checked.dropped || checked.secretScan !== "passed" || checked.text.length === 0)
+        throw new TypeError("Curated egress text failed structural redaction or the final secret scan");
+    if (checked.redactionStatus !== "unchanged" && checked.redactionStatus !== "redacted")
+        throw new TypeError("Curated egress text redaction status is invalid");
+    const material = { text: checked.text, contentHash: checked.contentHash, redactionStatus: checked.redactionStatus, secretScan: checked.secretScan, dropped: false };
+    return Object.freeze(material);
+}
 export function isDestinationAllowed(mode, destination, allowlist, options = {}) {
     if (mode === "local_only") {
         if (!("endpoint" in destination) || !("nodeId" in destination) || !isLoopback(destination.endpoint))

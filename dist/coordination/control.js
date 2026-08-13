@@ -25,6 +25,17 @@ export async function readForUpdate(store) {
         throw new TypeError("Control read requires a genuine production store");
     return store.readControl();
 }
+/** Reread control privacy/coordination epochs + revocations as ONE bounded frozen snapshot. */
+export async function readControlSnapshot(store) {
+    if (!ProductionCoordinationStore.isValid(store))
+        throw new TypeError("Control snapshot requires a genuine production store");
+    const control = await store.readControl();
+    return Object.freeze({
+        state: control.state, privacyEpoch: control.privacyEpoch,
+        coordinationPolicyEpoch: control.coordinationPolicyEpoch, coordinationPolicyHash: control.coordinationPolicyHash,
+        revokedDestinationIds: Object.freeze([...control.revokedDestinationIds]),
+    });
+}
 /** CAS active->draining, clears active generation and derived-current visibility; workers stop claiming/egressing. */
 export async function beginPolicyDrain(store, input) {
     if (!ProductionCoordinationStore.isValid(store))

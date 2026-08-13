@@ -1,6 +1,6 @@
 import type { HostId } from "../types.js";
 import { canonicalStringify, sha256Hex } from "./canonical.js";
-import { coverageId, jobId, leasePointId, manifestHash as canonicalManifestHash, proposalContentHash, proposalIdFor, tombstoneId, validateEffectiveOrder, type EffectiveOrder } from "./ids.js";
+import { MAX_SESSION_SEQUENCE, conflictManifestId, contentId, coverageId, curatedCurrentId, evidenceLinkId, jobId, leasePointId, manifestHash as canonicalManifestHash, observationId, proposalContentHash, proposalIdFor, tombstoneId, validateEffectiveOrder, type EffectiveOrder } from "./ids.js";
 import { processingPolicyHash, type ProcessingPolicy } from "./policy.js";
 
 export const RECORD_SCHEMA_REVISION = 1;
@@ -54,6 +54,14 @@ export interface EpisodeRecord extends RecordEnvelope {
   vector?: number[];
   producerId?: string;
   nodeId?: string;
+  /**
+   * Canonical persisted same-session causal sequence derived from the
+   * SessionManager branch order (including part order); survives
+   * activation/compaction/restart. Task 7 records without the field fail over
+   * to the cross-session causal tuple (event_at, episode_id, content_id).
+   * Timestamp causality is never invented from this field.
+   */
+  sessionSequence?: number;
 }
 /**
  * The sole semantic projection that crosses Task 7 document egress.  It is
@@ -105,6 +113,8 @@ export interface CuratedCurrentResolvedRecord extends CuratedCurrentBase {
   resolution: "resolved";
   contentId: string;
   observationId: string;
+  text: string;
+  vector: number[];
   conflictManifestHash?: never;
 }
 export interface CuratedCurrentConflictRecord extends CuratedCurrentBase {
@@ -112,6 +122,8 @@ export interface CuratedCurrentConflictRecord extends CuratedCurrentBase {
   conflictManifestHash: string;
   contentId?: never;
   observationId?: never;
+  text?: never;
+  vector?: never;
 }
 export type CuratedCurrentRecord = CuratedCurrentResolvedRecord | CuratedCurrentConflictRecord;
 export interface RaptorSummaryRecord extends DerivedEnvelope {
@@ -185,7 +197,7 @@ export interface LeaseRecord extends DerivedEnvelope {
   version: number;
   fencingToken: number;
   expiresAt: string;
-  state: "leased" | "accepted" | "released";
+  state: "leased" | "accepted" | "released" | "completed";
   acceptedProposalId: string | null;
   acceptedManifestHash: string | null;
 }
@@ -216,6 +228,20 @@ export interface EvidenceLinkRecord extends DerivedEnvelope {
   jobId: string;
   extractorRevision: string;
 }
+/**
+ * Immutable content-addressed conflict manifest: two or more observations of
+ * one logical state key whose cross-session effective orders fall inside the
+ * clock-skew window with different canonical values. No winner is chosen; the
+ * manifest is created by insert-only CAS (identical concurrent conflicts
+ * converge) and `curated_current` points at it via conflictManifestHash.
+ */
+export interface ConflictManifestRecord extends DerivedEnvelope {
+  recordType: "conflict_manifest";
+  id: string;
+  stateKey: string;
+  /** Strictly sorted conflicting observation ids (2..1024); the worker caps growth and marks coverage at the bound. */
+  members: string[];
+}
 export interface TombstoneRecord extends RecordEnvelope {
   recordType: "tombstone";
   id: string;
@@ -223,7 +249,7 @@ export interface TombstoneRecord extends RecordEnvelope {
   targetId: string;
   provenanceId?: string;
 }
-export type MemoryRecord = EpisodeRecord | CuratedMemoryRecord | CuratedCurrentRecord | RaptorSummaryRecord | ControlRecord | ProcessingPolicyRecord | JobRecord | LeaseRecord | ProposalRecord | CoverageRecord | EvidenceLinkRecord | TombstoneRecord;
+export type MemoryRecord = EpisodeRecord | CuratedMemoryRecord | CuratedCurrentRecord | ConflictManifestRecord | RaptorSummaryRecord | ControlRecord | ProcessingPolicyRecord | JobRecord | LeaseRecord | ProposalRecord | CoverageRecord | EvidenceLinkRecord | TombstoneRecord;
 
 export interface RecordValidationContext {
   ownerHost?: HostId;
@@ -238,7 +264,7 @@ export interface RecordValidationContext {
 const COMMON_KEYS = new Set(["recordType", "id", "ownerHost", "schemaRevision", "createdAt", "privacyEpoch", "processingPolicyId", "expiresAt", "contentHash"]);
 const DERIVED_KEYS = new Set(["coordinationPolicyHash", "coordinationPolicyEpoch"]);
 const RECORD_KEYS: Record<string, ReadonlySet<string>> = {
-  episode: new Set([...COMMON_KEYS, "sourceEntryId", "host", "projectId", "projectIdentityKind", "sessionId", "turnId", "agentRole", "depth", "eventKind", "eventAt", "modelId", "embeddingDimension", "originProvider", "destinationId", "status", "redactionStatus", "secretScan", "text", "toolName", "toolArgs", "errorFingerprint", "vector", "producerId", "nodeId"]),
+  episode: new Set([...COMMON_KEYS, "sourceEntryId", "host", "projectId", "projectIdentityKind", "sessionId", "turnId", "agentRole", "depth", "eventKind", "eventAt", "modelId", "embeddingDimension", "originProvider", "destinationId", "status", "redactionStatus", "secretScan", "text", "toolName", "toolArgs", "errorFingerprint", "vector", "producerId", "nodeId", "sessionSequence"]),
   curated_memory: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "contentId", "observationId", "eventAt", "effectiveAt", "sourceEpisodeIds", "manifestHash", "primaryEvidenceEpisodeId", "effectiveOrder", "stateKey", "category", "scope", "subject", "predicate", "value", "text", "provenance", "confidence", "vector"]),
   curated_current: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "contentId", "observationId", "version", "stateKey", "resolution", "conflictManifestHash", "effectiveOrder", "sourceEpisodeIds", "text", "vector"]),
   raptor_summary: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "generationId", "clusterId", "membershipHash", "level", "memberIds", "manifestHash", "summary", "vector", "modelId", "embeddingDimension", "promptRevision", "algorithm", "seed", "jobId", "fencingToken", "temporalFrom", "temporalTo", "coveredProjects", "algorithmParameters"]),
@@ -249,6 +275,7 @@ const RECORD_KEYS: Record<string, ReadonlySet<string>> = {
   proposal: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "jobId", "ownerId", "proposalHash", "manifestHash", "fencingToken", "membership", "content"]),
   coverage: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "episodeId", "extractorRevision"]),
   evidence_link: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "sourceId", "targetId", "jobId", "extractorRevision"]),
+  conflict_manifest: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "stateKey", "members"]),
   tombstone: new Set([...COMMON_KEYS, "scope", "targetId", "provenanceId"]),
 };
 function isRecord(value: unknown): value is PlainRecord { return typeof value === "object" && value !== null && !Array.isArray(value); }
@@ -295,16 +322,32 @@ function validate(value: PlainRecord, context: RecordValidationContext): MemoryR
   if (typeof recordType !== "string" || !(recordType in RECORD_KEYS)) fail("unknown record type");
   for (const key of Object.keys(value)) if (!RECORD_KEYS[recordType]!.has(key)) fail(`unknown field ${key}`);
   common(value, context);
-  const isDerived = ["curated_memory", "curated_current", "raptor_summary", "job", "lease", "proposal", "coverage", "evidence_link"].includes(recordType);
+  const isDerived = ["curated_memory", "curated_current", "conflict_manifest", "raptor_summary", "job", "lease", "proposal", "coverage", "evidence_link"].includes(recordType);
   if (isDerived) derived(value, context);
   switch (recordType) {
     case "episode":
       text("sourceEntryId", value.sourceEntryId); host("host", value.host); if (value.host !== value.ownerHost) fail("episode host mismatch"); text("projectId", value.projectId); if (value.projectIdentityKind !== "registered" && value.projectIdentityKind !== "local_only") fail("project identity kind invalid"); text("sessionId", value.sessionId); text("turnId", value.turnId); if (value.agentRole !== "root" && value.agentRole !== "child") fail("agent role invalid"); integer("depth", value.depth); if (!["user", "assistant", "tool_call", "tool_result", "tool_error"].includes(String(value.eventKind))) fail("event kind invalid"); isoDate("eventAt", value.eventAt); text("modelId", value.modelId); integer("embeddingDimension", value.embeddingDimension, 1, 65536); if (value.embeddingDimension !== (context.vectorDimension ?? 1024)) fail("embedding dimension mismatch"); text("originProvider", value.originProvider, MAX_ID_CHARS, false); text("destinationId", value.destinationId); if (value.status !== "active") fail("episode status invalid"); if (value.redactionStatus !== "unchanged" && value.redactionStatus !== "redacted") fail("redaction status invalid"); if (value.secretScan !== "passed") fail("secret scan invalid");
-      if (value.text !== undefined) text("text", value.text, context.maxTextChars ?? MAX_TEXT_CHARS, false); if (value.toolName !== undefined) text("toolName", value.toolName, MAX_ID_CHARS, false); if (value.toolArgs !== undefined) text("toolArgs", value.toolArgs, context.maxTextChars ?? MAX_TEXT_CHARS, false); if (value.errorFingerprint !== undefined) text("errorFingerprint", value.errorFingerprint, MAX_ID_CHARS, false); if (value.producerId !== undefined) text("producerId", value.producerId); if (value.nodeId !== undefined) text("nodeId", value.nodeId); if (value.vector !== undefined) vector(value.vector, context.vectorDimension ?? 1024); return value as unknown as EpisodeRecord;
+      if (value.text !== undefined) text("text", value.text, context.maxTextChars ?? MAX_TEXT_CHARS, false); if (value.toolName !== undefined) text("toolName", value.toolName, MAX_ID_CHARS, false); if (value.toolArgs !== undefined) text("toolArgs", value.toolArgs, context.maxTextChars ?? MAX_TEXT_CHARS, false); if (value.errorFingerprint !== undefined) text("errorFingerprint", value.errorFingerprint, MAX_ID_CHARS, false); if (value.producerId !== undefined) text("producerId", value.producerId); if (value.nodeId !== undefined) text("nodeId", value.nodeId); if (value.sessionSequence !== undefined) integer("sessionSequence", value.sessionSequence, 0, MAX_SESSION_SEQUENCE); if (value.vector !== undefined) vector(value.vector, context.vectorDimension ?? 1024); return value as unknown as EpisodeRecord;
     case "curated_memory":
-      text("contentId", value.contentId); text("observationId", value.observationId); isoDate("eventAt", value.eventAt); isoDate("effectiveAt", value.effectiveAt); try { validateEffectiveOrder(value.effectiveOrder); } catch { fail("effectiveOrder is invalid"); } if (value.sourceEpisodeIds !== undefined) ids("sourceEpisodeIds", value.sourceEpisodeIds); if (value.manifestHash !== undefined) text("manifestHash", value.manifestHash, MAX_ID_CHARS, false); if (value.primaryEvidenceEpisodeId !== undefined) text("primaryEvidenceEpisodeId", value.primaryEvidenceEpisodeId); if (value.sourceEpisodeIds === undefined && value.manifestHash === undefined && value.primaryEvidenceEpisodeId === undefined) fail("derived source/manifest closure missing"); if (value.provenance !== undefined) ids("provenance", value.provenance); optionalText("stateKey", value.stateKey); optionalText("category", value.category, MAX_ID_CHARS, false); optionalText("scope", value.scope, MAX_ID_CHARS, false); optionalText("subject", value.subject, MAX_ID_CHARS, false); optionalText("predicate", value.predicate, MAX_ID_CHARS, false); if (value.value !== undefined) { try { const serialized = canonicalStringify(value.value); if (serialized.length > (context.maxTextChars ?? MAX_TEXT_CHARS)) fail("value is unbounded"); } catch { fail("value is not canonical JSON"); } } if (value.text !== undefined) text("text", value.text, context.maxTextChars ?? MAX_TEXT_CHARS, false); if (value.confidence !== undefined) { finite("confidence", value.confidence); if (value.confidence < 0 || value.confidence > 1) fail("confidence invalid"); } if (value.vector !== undefined) vector(value.vector, context.vectorDimension ?? 1024); return value as unknown as CuratedMemoryRecord;
+      text("contentId", value.contentId); text("observationId", value.observationId); if (value.id !== value.observationId) fail("curated observation id must equal its occurrence id"); isoDate("eventAt", value.eventAt); isoDate("effectiveAt", value.effectiveAt); try { validateEffectiveOrder(value.effectiveOrder); } catch { fail("effectiveOrder is invalid"); } if (value.sourceEpisodeIds !== undefined) { ids("sourceEpisodeIds", value.sourceEpisodeIds); strictlySorted("sourceEpisodeIds", value.sourceEpisodeIds); } if (value.manifestHash !== undefined) text("manifestHash", value.manifestHash, MAX_ID_CHARS, false); if (value.primaryEvidenceEpisodeId !== undefined) text("primaryEvidenceEpisodeId", value.primaryEvidenceEpisodeId); if (value.sourceEpisodeIds === undefined && value.manifestHash === undefined && value.primaryEvidenceEpisodeId === undefined) fail("derived source/manifest closure missing"); if (value.provenance !== undefined) { ids("provenance", value.provenance); strictlySorted("provenance", value.provenance); } optionalText("stateKey", value.stateKey); optionalText("category", value.category, MAX_ID_CHARS, false); optionalText("scope", value.scope, MAX_ID_CHARS, false); optionalText("subject", value.subject, MAX_ID_CHARS, false); optionalText("predicate", value.predicate, MAX_ID_CHARS, false); if (value.value !== undefined) { try { const serialized = canonicalStringify(value.value); if (serialized.length > (context.maxTextChars ?? MAX_TEXT_CHARS)) fail("value is unbounded"); } catch { fail("value is not canonical JSON"); } } if (value.text !== undefined) text("text", value.text, context.maxTextChars ?? MAX_TEXT_CHARS, false); if (value.confidence !== undefined) { finite("confidence", value.confidence); if (value.confidence < 0 || value.confidence > 1) fail("confidence invalid"); } if (value.vector !== undefined) vector(value.vector, context.vectorDimension ?? 1024);
+      // Deterministic identity formulas: the content id binds the coordination
+      // policy hash + logical state key + canonical value; the occurrence id
+      // binds the policy epoch + content + primary evidence + causal order.
+      // Task 10 manifest-derived observations (no primary evidence) keep the
+      // bounded-field contract and are NOT forced through the evidence formula.
+      if (value.stateKey !== undefined && (value.value !== undefined || value.text !== undefined) && value.coordinationPolicyHash !== undefined) {
+        const curated = value as unknown as CuratedMemoryRecord;
+        // Preserve own-property semantics: `value: null` is a real curated value and must not collapse to the text lane through `??`.
+        const canonicalValue = Object.prototype.hasOwnProperty.call(curated, "value") ? curated.value : curated.text;
+        try { if (curated.contentId !== contentId(curated.coordinationPolicyHash!, curated.stateKey!, canonicalValue)) fail("contentId formula mismatch"); } catch (error) { if (error instanceof TypeError && /contentId formula mismatch/u.test(error.message)) throw error; fail("contentId formula mismatch"); }
+      }
+      if (value.primaryEvidenceEpisodeId !== undefined) {
+        const curated = value as unknown as CuratedMemoryRecord;
+        try { if (curated.observationId !== observationId(curated.coordinationPolicyEpoch!, curated.contentId, curated.primaryEvidenceEpisodeId!, curated.effectiveOrder)) fail("observationId formula mismatch"); } catch (error) { if (error instanceof TypeError && /observationId formula mismatch/u.test(error.message)) throw error; fail("observationId formula mismatch"); }
+      }
+      if (value.vector !== undefined) vector(value.vector, context.vectorDimension ?? 1024); return value as unknown as CuratedMemoryRecord;
     case "curated_current":
-      integer("version", value.version, 1); text("stateKey", value.stateKey); try { validateEffectiveOrder(value.effectiveOrder); } catch { fail("effectiveOrder is invalid"); } if (value.resolution === "resolved") { text("contentId", value.contentId); text("observationId", value.observationId); if (value.conflictManifestHash !== undefined) fail("resolved current cannot carry a conflict manifest"); } else if (value.resolution === "conflict") { if (Object.prototype.hasOwnProperty.call(value, "contentId") || Object.prototype.hasOwnProperty.call(value, "observationId")) fail("conflict current cannot select content or observation"); text("conflictManifestHash", value.conflictManifestHash, MAX_ID_CHARS, false); } else fail("resolution invalid"); if (value.sourceEpisodeIds !== undefined) ids("sourceEpisodeIds", value.sourceEpisodeIds); if (value.text !== undefined) text("text", value.text, context.maxTextChars ?? MAX_TEXT_CHARS, false); if (value.vector !== undefined) vector(value.vector, context.vectorDimension ?? 1024); return value as unknown as CuratedCurrentRecord;
+      integer("version", value.version, 1); text("stateKey", value.stateKey); try { validateEffectiveOrder(value.effectiveOrder); } catch { fail("effectiveOrder is invalid"); } const currentOwner = value.ownerHost; host("curated_current.ownerHost", currentOwner); try { const current = value as unknown as CuratedCurrentRecord; if (current.id !== curatedCurrentId(currentOwner, current.stateKey, current.coordinationPolicyEpoch)) fail("curated current ID formula mismatch"); } catch { fail("curated current ID formula mismatch"); } if (value.resolution === "resolved") { text("contentId", value.contentId); text("observationId", value.observationId); if (value.conflictManifestHash !== undefined) fail("resolved current cannot carry a conflict manifest"); if (typeof value.text !== "string") fail("resolved current text is required"); if (!Array.isArray(value.vector)) fail("resolved current vector is required"); vector(value.vector, context.vectorDimension ?? 1024); } else if (value.resolution === "conflict") { if (Object.prototype.hasOwnProperty.call(value, "contentId") || Object.prototype.hasOwnProperty.call(value, "observationId") || Object.prototype.hasOwnProperty.call(value, "text") || Object.prototype.hasOwnProperty.call(value, "vector")) fail("conflict current cannot select content, observation, text or vector"); text("conflictManifestHash", value.conflictManifestHash, MAX_ID_CHARS, false); } else fail("resolution invalid"); if (value.sourceEpisodeIds !== undefined) { ids("sourceEpisodeIds", value.sourceEpisodeIds); strictlySorted("sourceEpisodeIds", value.sourceEpisodeIds); } if (value.text !== undefined) text("text", value.text, context.maxTextChars ?? MAX_TEXT_CHARS, false); if (value.vector !== undefined) vector(value.vector, context.vectorDimension ?? 1024); return value as unknown as CuratedCurrentRecord;
     case "raptor_summary":
       text("generationId", value.generationId); text("clusterId", value.clusterId); text("membershipHash", value.membershipHash, MAX_ID_CHARS, false); integer("level", value.level); if (value.memberIds !== undefined) ids("memberIds", value.memberIds); if (value.manifestHash === undefined && value.memberIds === undefined) fail("summary source/manifest closure missing"); if (value.manifestHash !== undefined) text("manifestHash", value.manifestHash, MAX_ID_CHARS, false); if (value.memberIds !== undefined && value.membershipHash !== canonicalManifestHash(value.memberIds)) fail("summary membership hash mismatch"); text("summary", value.summary, context.maxTextChars ?? MAX_TEXT_CHARS, false); text("modelId", value.modelId); integer("embeddingDimension", value.embeddingDimension, 1, 65536); if (value.embeddingDimension !== (context.vectorDimension ?? 1024)) fail("embedding dimension mismatch"); text("promptRevision", value.promptRevision); text("algorithm", value.algorithm, MAX_ID_CHARS, false); integer("seed", value.seed); text("jobId", value.jobId); integer("fencingToken", value.fencingToken); isoDate("temporalFrom", value.temporalFrom); isoDate("temporalTo", value.temporalTo); if (Date.parse(value.temporalFrom) > Date.parse(value.temporalTo)) fail("summary temporal range is inverted"); ids("coveredProjects", value.coveredProjects); try { const parameters = canonicalStringify(value.algorithmParameters); if (parameters.length > 4096) fail("algorithm parameters are unbounded"); } catch { fail("algorithm parameters are not canonical"); } if (value.vector !== undefined) vector(value.vector, context.vectorDimension ?? 1024); return value as unknown as RaptorSummaryRecord;
     case "collection_control":
@@ -316,50 +359,67 @@ function validate(value: PlainRecord, context: RecordValidationContext): MemoryR
       text("policyId", value.policyId); if (value.policyId !== value.processingPolicyId) fail("job policy ID mismatch"); text("policyHash", value.policyHash, MAX_ID_CHARS, false); if (value.policyHash !== value.coordinationPolicyHash) fail("job policy hash mismatch"); integer("policyEpoch", value.policyEpoch); if (value.policyEpoch !== value.coordinationPolicyEpoch) fail("job policy epoch mismatch"); ids("membership", value.membership); strictlySorted("job membership", value.membership); text("extractorRevision", value.extractorRevision, MAX_ID_CHARS, true); const jobOwner = value.ownerHost; host("job.ownerHost", jobOwner); integer("job.privacyEpoch", value.privacyEpoch); try { if (value.id !== jobId(jobOwner, value.membership, value.policyHash, value.extractorRevision, value.policyEpoch, value.policyId, value.privacyEpoch)) fail("job ID formula mismatch"); } catch { fail("job ID formula mismatch"); } if (context.policyEpoch !== undefined && value.policyEpoch !== context.policyEpoch) fail("policy epoch mismatch"); return value as unknown as JobRecord;
     }
     case "lease":
-      text("jobId", value.jobId); text("ownerId", value.ownerId); integer("version", value.version, 1); integer("fencingToken", value.fencingToken); if (value.expiresAt === null) fail("lease requires an expiry"); isoDate("expiresAt", value.expiresAt); if (value.state !== "leased" && value.state !== "accepted" && value.state !== "released") fail("lease state invalid"); if (value.acceptedProposalId !== null) text("acceptedProposalId", value.acceptedProposalId); if (value.acceptedManifestHash !== null) text("acceptedManifestHash", value.acceptedManifestHash, MAX_ID_CHARS, false); if ((value.acceptedProposalId === null) !== (value.acceptedManifestHash === null)) fail("lease acceptance fields must move together"); if (value.state === "leased" && value.acceptedProposalId !== null) fail("leased claim cannot carry acceptance"); if (value.state === "accepted" && value.acceptedProposalId === null) fail("accepted claim requires proposal and manifest"); try { if (value.id !== leasePointId(value.jobId)) fail("lease ID formula mismatch"); } catch { fail("lease ID formula mismatch"); } return value as unknown as LeaseRecord;
+      text("jobId", value.jobId); text("ownerId", value.ownerId); integer("version", value.version, 1); integer("fencingToken", value.fencingToken); if (value.expiresAt === null) fail("lease requires an expiry"); isoDate("expiresAt", value.expiresAt); if (value.state !== "leased" && value.state !== "accepted" && value.state !== "released" && value.state !== "completed") fail("lease state invalid"); if (value.acceptedProposalId !== null) text("acceptedProposalId", value.acceptedProposalId); if (value.acceptedManifestHash !== null) text("acceptedManifestHash", value.acceptedManifestHash, MAX_ID_CHARS, false); if ((value.acceptedProposalId === null) !== (value.acceptedManifestHash === null)) fail("lease acceptance fields must move together"); if (value.state === "leased" && value.acceptedProposalId !== null) fail("leased claim cannot carry acceptance"); if ((value.state === "accepted" || value.state === "completed") && value.acceptedProposalId === null) fail("accepted/completed claim requires proposal and manifest"); try { if (value.id !== leasePointId(value.jobId)) fail("lease ID formula mismatch"); } catch { fail("lease ID formula mismatch"); } return value as unknown as LeaseRecord;
     case "proposal": {
       text("jobId", value.jobId); text("ownerId", value.ownerId); if (!/^[0-9a-f]{64}$/u.test(String(value.proposalHash))) fail("proposal hash must be a SHA-256 hex digest"); text("manifestHash", value.manifestHash, MAX_ID_CHARS, false); integer("fencingToken", value.fencingToken); ids("membership", value.membership); strictlySorted("proposal membership", value.membership); if (value.manifestHash !== canonicalManifestHash(value.membership)) fail("proposal manifest hash mismatch"); const proposalOwner = value.ownerHost; host("proposal.ownerHost", proposalOwner); text("proposal.coordinationPolicyHash", value.coordinationPolicyHash, MAX_ID_CHARS, false); integer("proposal.coordinationPolicyEpoch", value.coordinationPolicyEpoch); integer("proposal.privacyEpoch", value.privacyEpoch); text("proposal.processingPolicyId", value.processingPolicyId); try { const content = canonicalStringify(value.content); if (content.length > (context.maxTextChars ?? MAX_TEXT_CHARS)) fail("proposal content is unbounded"); const recomputed = proposalContentHash({ ownerHost: proposalOwner, jobId: value.jobId, ownerId: value.ownerId, membership: value.membership, content: value.content, policyHash: value.coordinationPolicyHash, policyEpoch: value.coordinationPolicyEpoch, fencingToken: value.fencingToken, privacyEpoch: value.privacyEpoch, policyIntersectionId: value.processingPolicyId }); if (value.proposalHash !== recomputed) fail("proposal content hash mismatch"); } catch { fail("proposal content is not canonical"); } try { if (value.id !== proposalIdFor(value.jobId, value.proposalHash, value.coordinationPolicyEpoch, value.fencingToken)) fail("proposal ID formula mismatch"); } catch { fail("proposal ID formula mismatch"); } return value as unknown as ProposalRecord;
     }
     case "coverage": {
       text("episodeId", value.episodeId); text("extractorRevision", value.extractorRevision, MAX_ID_CHARS, true); integer("coverage.coordinationPolicyEpoch", value.coordinationPolicyEpoch); text("coverage.coordinationPolicyHash", value.coordinationPolicyHash, MAX_ID_CHARS, false); text("coverage.processingPolicyId", value.processingPolicyId); integer("coverage.privacyEpoch", value.privacyEpoch); const coverageOwner = value.ownerHost; host("coverage.ownerHost", coverageOwner); try { if (value.id !== coverageId({ ownerHost: coverageOwner, episodeId: value.episodeId, extractorRevision: value.extractorRevision, coordinationPolicyHash: value.coordinationPolicyHash, coordinationPolicyEpoch: value.coordinationPolicyEpoch, policyIntersectionId: value.processingPolicyId, privacyEpoch: value.privacyEpoch })) fail("coverage ID formula mismatch"); } catch { fail("coverage ID formula mismatch"); } return value as unknown as CoverageRecord;
     }
-    case "evidence_link": text("sourceId", value.sourceId); text("targetId", value.targetId); text("jobId", value.jobId); text("extractorRevision", value.extractorRevision, MAX_ID_CHARS, true); return value as unknown as EvidenceLinkRecord;
+    case "evidence_link": text("sourceId", value.sourceId); text("targetId", value.targetId); text("jobId", value.jobId); text("extractorRevision", value.extractorRevision, MAX_ID_CHARS, true); try { if (value.id !== evidenceLinkId(value.sourceId, value.targetId, value.extractorRevision)) fail("evidence link ID formula mismatch"); } catch { fail("evidence link ID formula mismatch"); } return value as unknown as EvidenceLinkRecord;
+    case "conflict_manifest": {
+      text("stateKey", value.stateKey, MAX_ID_CHARS, false); if (!Array.isArray(value.members) || value.members.length < 2 || value.members.length > MAX_ARRAY) fail(`conflict manifest members must contain 2..${MAX_ARRAY} observations`); value.members.forEach((member, index) => { try { text(`members[${index}]`, member); } catch { fail("conflict manifest members are invalid"); } }); strictlySorted("conflict manifest members", value.members); try { const manifest = value as unknown as ConflictManifestRecord; if (manifest.id !== conflictManifestId(manifest.coordinationPolicyHash, manifest.stateKey, manifest.members)) fail("conflict manifest ID formula mismatch"); } catch { fail("conflict manifest ID formula mismatch"); } return value as unknown as ConflictManifestRecord;
+    }
     case "tombstone": {
       if (value.scope !== "occurrence" && value.scope !== "content" && value.scope !== "state") fail("tombstone scope invalid"); text("targetId", value.targetId); if (value.provenanceId !== undefined) text("provenanceId", value.provenanceId); const tombOwner = value.ownerHost; host("tombstone.ownerHost", tombOwner); if (!(value.scope === "occurrence" ? /^(?:occurrence:[0-9a-f]{64}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/iu.test(String(value.targetId)) : value.scope === "content" ? /^content:[0-9a-f]{64}$/u.test(String(value.targetId)) : /^state:[0-9a-f]{64}$/u.test(String(value.targetId)))) fail("tombstone target does not match its scope"); try { if (value.id !== tombstoneId(tombOwner, value.targetId)) fail("tombstone ID formula mismatch"); } catch { fail("tombstone ID formula mismatch"); } return value as unknown as TombstoneRecord;
     }
   }
   return fail("unknown record type");
 }
-export function parseMemoryRecord(value: unknown, context: RecordValidationContext = {}): MemoryRecord { if (!isRecord(value)) fail("record must be an object"); return validate(value, context); }
+function ownedRecordSnapshot(value: unknown): PlainRecord {
+  if (!isRecord(value)) fail("record must be an object");
+  let serialized: string;
+  try { serialized = canonicalStringify(value); } catch { fail("record must be canonical JSON"); }
+  try { return JSON.parse(serialized) as PlainRecord; } catch { fail("record must be canonical JSON"); }
+}
+export function parseMemoryRecord(value: unknown, context: RecordValidationContext = {}): MemoryRecord {
+  return validate(ownedRecordSnapshot(value), context);
+}
 export function assertMemoryRecord(value: unknown, context: RecordValidationContext = {}): asserts value is MemoryRecord { parseMemoryRecord(value, context); }
 export function isMemoryRecord(value: unknown, context: RecordValidationContext = {}): value is MemoryRecord { try { parseMemoryRecord(value, context); return true; } catch { return false; } }
-export function canonicalRecordHash(record: MemoryRecord): string {
-  const validated = parseMemoryRecord(record); const copy: PlainRecord = { ...(validated as unknown as PlainRecord) };
+function canonicalHashFromValidated(validated: MemoryRecord): string {
+  const copy: PlainRecord = { ...(validated as unknown as PlainRecord) };
   delete copy.contentHash; delete copy.createdAt; delete copy.producerId; delete copy.nodeId;
   // The episode content hash COMMITS the exact embedded vector (1024 floats):
   // a changed/missing vector changes the hash, so a persisted point's hash
   // cryptographically binds the vector readback. Other record types keep the
   // contractual exclusion (vectors are query artifacts, not identity).
-  if (record.recordType !== "episode") delete copy.vector;
+  if (validated.recordType !== "episode" && validated.recordType !== "curated_memory") delete copy.vector;
+  // Evidence-link jobId and createdAt are provenance of the first writer, not
+  // identity: the deterministic (observation, episode, extractor) link must
+  // converge across overlapping accepted jobs without a hash collision.
+  if (validated.recordType === "evidence_link") delete copy.jobId;
   // The processing-policy point identity is content-addressed by the policy
   // itself; the observed envelope privacy epoch is not part of that identity,
   // so reusing an unchanged policy after a privacy-epoch increment converges
   // (insert-only "existing") instead of colliding on a same-ID/different-hash.
-  if (record.recordType === "processing_policy") delete copy.privacyEpoch;
+  if (validated.recordType === "processing_policy") delete copy.privacyEpoch;
   // Tombstone identity is target/scope-stable under the fixed
   // H(owner,"tombstone",target) formula: the envelope privacy epoch and
   // processing-policy intersection are informational (occurrence visibility is
   // permanent), so repeated same-target forget across privacy AND
   // processing-policy changes converges deterministically even under
   // concurrency instead of content-hash colliding.
-  if (record.recordType === "tombstone") { delete copy.privacyEpoch; delete copy.processingPolicyId; }
+  if (validated.recordType === "tombstone") { delete copy.privacyEpoch; delete copy.processingPolicyId; }
   return sha256Hex(canonicalStringify(copy));
 }
-export function assertCanonicalRecordHash(record: MemoryRecord): void { if (record.contentHash !== canonicalRecordHash(record)) throw new TypeError("Memory record canonical hash mismatch"); }
+export function canonicalRecordHash(record: MemoryRecord): string { return canonicalHashFromValidated(parseMemoryRecord(record)); }
+export function assertCanonicalRecordHash(record: MemoryRecord): void { const owned = parseMemoryRecord(record); const expected = owned.contentHash; if (expected !== canonicalHashFromValidated(owned)) throw new TypeError("Memory record canonical hash mismatch"); }
 
 export function parsePersistedMemoryRecord(value: unknown, context: RecordValidationContext = {}): MemoryRecord {
   const record = parseMemoryRecord(value, context);
-  assertCanonicalRecordHash(record);
+  const expected = record.contentHash;
+  if (expected !== canonicalHashFromValidated(record)) throw new TypeError("Memory record canonical hash mismatch");
   return record;
 }
 

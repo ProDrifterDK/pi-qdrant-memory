@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { redactStructure } from "../security/redaction.js";
+import { MAX_SESSION_SEQUENCE, SESSION_SEQUENCE_STRIDE } from "../domain/ids.js";
 const MAX_TOOL_ARGS = 2_000;
 const MAX_TOOL_RESULT = 4_000;
 const MEMORY_TOOL = /^(?:memory[_-]search|qdrant[_-]memory(?:[_-]search)?)$/iu;
@@ -79,9 +80,15 @@ function errorFingerprint(value) {
     return text === undefined || text.length === 0 ? undefined : createHash("sha256").update(text.normalize("NFC"), "utf8").digest("hex").slice(0, 32);
 }
 function entryPartId(entry, index) { return index === 0 ? 0 : index; }
-function cleanText(value, max, homeDir = "/") { if (value === undefined)
-    return undefined; const text = bounded(value, max); if (text.length === 0)
-    return undefined; const safe = redactStructure({ text, maxChars: max, homeDir }); return safe.text.length === 0 ? undefined : safe.text; }
+function cleanText(value, max, homeDir = "/") {
+    if (value === undefined)
+        return { redactionStatus: "unchanged" };
+    const text = bounded(value, max);
+    if (text.length === 0)
+        return { redactionStatus: "dropped" };
+    const safe = redactStructure({ text, maxChars: max, homeDir });
+    return safe.text.length === 0 ? { redactionStatus: "dropped" } : { text: safe.text, redactionStatus: safe.redactionStatus };
+}
 /** Normalize only final, persisted entries. Event arrays supplied by host callbacks are not accepted here. */
 export function selectPersistedEntries(entries, options = {}) {
     if (!Array.isArray(entries))
@@ -89,8 +96,17 @@ export function selectPersistedEntries(entries, options = {}) {
     const toolArgsChars = Number.isSafeInteger(options.toolArgsChars) && (options.toolArgsChars ?? 0) >= 0 ? Math.min(options.toolArgsChars ?? MAX_TOOL_ARGS, MAX_TOOL_ARGS) : MAX_TOOL_ARGS;
     const toolResultChars = Number.isSafeInteger(options.toolResultChars) && (options.toolResultChars ?? 0) >= 0 ? Math.min(options.toolResultChars ?? MAX_TOOL_RESULT, MAX_TOOL_RESULT) : MAX_TOOL_RESULT;
     const homeDir = options.homeDir ?? "/";
+    const sequenceOffset = options.sequenceOffset === undefined ? 0 : options.sequenceOffset;
+    if (!Number.isSafeInteger(sequenceOffset) || sequenceOffset < 0)
+        return [];
     const selected = [];
-    for (const entry of entries) {
+    for (const [entryIndex, entry] of entries.entries()) {
+        // A sequence is tied to the durable persisted branch position, not to the
+        // callback invocation. The high bits identify the branch entry and the
+        // low bits preserve its part order; capture retries therefore reproduce
+        // the same causal order after compaction/restart.
+        const branchIndex = sequenceOffset + entryIndex;
+        const sequence = branchIndex <= Math.floor(MAX_SESSION_SEQUENCE / SESSION_SEQUENCE_STRIDE) ? branchIndex * SESSION_SEQUENCE_STRIDE : undefined;
         if (typeof entry?.id !== "string" || entry.id.length === 0 || entry.id.length > 512)
             continue;
         const message = messageOf(entry);
@@ -121,10 +137,13 @@ export function selectPersistedEntries(entries, options = {}) {
                 const name = value === undefined ? undefined : toolNameFrom(value);
                 if (name !== undefined && (type === undefined || /tool(?:call|_call)|function/iu.test(type) || value?.arguments !== undefined || value?.input !== undefined)) {
                     if (!ownMemoryTool(name)) {
-                        const call = { sourceEntryId: entry.id, messageId: str(message.id) ?? entry.id, partIdentity: entryPartId(entry, partIndex), eventKind: "tool_call", toolName: bounded(name, 256) };
-                        const args = cleanText(toolArgsFrom(value), toolArgsChars, homeDir);
-                        if (args !== undefined)
-                            call.toolArgs = args;
+                        const call = { sourceEntryId: entry.id, messageId: str(message.id) ?? entry.id, partIdentity: entryPartId(entry, partIndex), eventKind: "tool_call", toolName: bounded(name, 256), ...(sequence === undefined || partIndex >= SESSION_SEQUENCE_STRIDE ? {} : { sessionSequence: sequence + partIndex }) };
+                        const argsSource = toolArgsFrom(value);
+                        const args = cleanText(argsSource, toolArgsChars, homeDir);
+                        if (argsSource !== undefined)
+                            call.toolArgsRedactionStatus = args.redactionStatus;
+                        if (args.text !== undefined)
+                            call.toolArgs = args.text;
                         if (eventAt !== undefined)
                             call.eventAt = eventAt;
                         if (turnId !== undefined)
@@ -134,10 +153,12 @@ export function selectPersistedEntries(entries, options = {}) {
                     partIndex += 1;
                     continue;
                 }
-                const text = cleanText(partText(part), 16_000, homeDir);
+                const textSource = partText(part);
+                const textResult = cleanText(textSource, 16_000, homeDir);
+                const text = textResult.text;
                 const memoryWrapper = text !== undefined && isMemoryContextText(text);
                 if (text !== undefined && !memoryWrapper) {
-                    const item = { sourceEntryId: entry.id, messageId: str(message.id) ?? entry.id, partIdentity: entryPartId(entry, partIndex), eventKind: role, text };
+                    const item = { sourceEntryId: entry.id, messageId: str(message.id) ?? entry.id, partIdentity: entryPartId(entry, partIndex), eventKind: role, text, ...(textSource === undefined ? {} : { textRedactionStatus: textResult.redactionStatus }), ...(sequence === undefined || partIndex >= SESSION_SEQUENCE_STRIDE ? {} : { sessionSequence: sequence + partIndex }) };
                     if (eventAt !== undefined)
                         item.eventAt = eventAt;
                     if (turnId !== undefined)
@@ -177,17 +198,22 @@ export function selectPersistedEntries(entries, options = {}) {
             const body = textOf(content);
             if (explicitFailure && body !== undefined)
                 fields.unshift(body);
-            const text = cleanText(fields.join("\n"), toolResultChars, homeDir);
+            const textSource = fields.join("\n");
+            const textResult = cleanText(textSource, toolResultChars, homeDir);
+            const text = textResult.text;
             if (text === undefined && !explicitFailure)
                 continue;
-            const item = { sourceEntryId: entry.id, messageId: str(message.id) ?? entry.id, partIdentity: 0, eventKind: explicitFailure ? "tool_error" : "tool_result" };
+            const item = { sourceEntryId: entry.id, messageId: str(message.id) ?? entry.id, partIdentity: 0, eventKind: explicitFailure ? "tool_error" : "tool_result", ...(textSource.length === 0 ? {} : { textRedactionStatus: textResult.redactionStatus }), ...(sequence === undefined ? {} : { sessionSequence: sequence }) };
             if (text !== undefined)
                 item.text = text;
             // Failed tool results may carry an independently bounded argument excerpt;
             // it is structurally redacted again by episode materialization.
-            const args = explicitFailure ? cleanText(toolArgsFrom(message), toolArgsChars, homeDir) : undefined;
-            if (args !== undefined)
-                item.toolArgs = args;
+            const argsSource = explicitFailure ? toolArgsFrom(message) : undefined;
+            const args = explicitFailure ? cleanText(argsSource, toolArgsChars, homeDir) : { redactionStatus: "unchanged" };
+            if (argsSource !== undefined)
+                item.toolArgsRedactionStatus = args.redactionStatus;
+            if (args.text !== undefined)
+                item.toolArgs = args.text;
             if (name !== undefined)
                 item.toolName = bounded(name, 256);
             if (status !== undefined)

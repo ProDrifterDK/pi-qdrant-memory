@@ -213,9 +213,10 @@ function redactKnownTokens(value) {
  */
 function structuralRedact(input) {
     let text;
-    // A typed marker is already canonical redaction; retain the redacted status
-    // on repeat passes so the final contract is byte/idempotence stable.
-    let changed = /(?:\[[A-Za-z][A-Za-z0-9_ -]{0,64}\s+redacted\]|<[A-Za-z][A-Za-z0-9_ -]{0,64}\s+redacted>)/u.test(input.text);
+    // Existing typed markers are already canonical and must be idempotent: a
+    // final rescan of an envelope containing persisted `[token redacted]` bytes
+    // must report unchanged when it performs no rewrite.
+    let changed = false;
     const emptyHash = () => createHash("sha256").update("", "utf8").digest("hex");
     try {
         if (typeof input.text !== "string" || !Number.isSafeInteger(input.maxChars) || input.maxChars < 0 || input.maxChars > MAX_HARD_CHARS || typeof input.homeDir !== "string")

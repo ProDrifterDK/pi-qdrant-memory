@@ -4,6 +4,9 @@ import { canonicalStringify, deterministicUuid, sha256Hex } from "./canonical.js
 const SCHEMA_NAMESPACE = "pi-qdrant-memory-v2";
 const MAX_ID_LENGTH = 512;
 const MAX_MEMBERS = 1024;
+/** Shared persisted causal-sequence bound (also enforced by capture selector). */
+export const MAX_SESSION_SEQUENCE = 4_294_967_295;
+export const SESSION_SEQUENCE_STRIDE = 65_536;
 const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 const HEX64 = /^[0-9a-f]{64}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -24,7 +27,7 @@ function hashParts(value: unknown): string {
 }
 
 /** Domain-tagged identity: `tag:hex` keeps occurrence/content/state targets runtime-verifiable. */
-function tagged(domain: "state" | "content" | "occurrence", value: unknown): string {
+function tagged(domain: "state" | "content" | "occurrence" | "current" | "conflict", value: unknown): string {
   return `${domain}:${sha256Hex(canonicalStringify(value))}`;
 }
 
@@ -58,7 +61,8 @@ export function stateKey(input: StateKeyInput): string {
   requireId("stateKey.subject", input.subject);
   requireId("stateKey.predicate", input.predicate);
   if (input.projectId !== undefined && input.projectId !== null) requireId("stateKey.projectId", input.projectId);
-  return tagged("state", { category: input.category, domain: "state", host: input.host, predicate: input.predicate, projectId: input.projectId ?? null, schema: SCHEMA_NAMESPACE, scope: input.scope, subject: input.subject });
+  const identity: Record<string, unknown> = { category: input.category, domain: "state", host: input.host, predicate: input.predicate, projectId: input.projectId ?? null, schema: SCHEMA_NAMESPACE, scope: input.scope, subject: input.subject };
+  return tagged("state", identity);
 }
 
 /** Reusable value identity under one coordination policy. */
@@ -68,20 +72,47 @@ export function contentId(policyHash: string, logicalStateKey: string, canonical
   return tagged("content", { canonicalValue, domain: "content", policyHash, stateKey: logicalStateKey });
 }
 
-export type EffectiveOrder = `session:${number}` | readonly [string, string, string];
+export interface SessionEffectiveOrder {
+  readonly kind: "session";
+  /** Durable session identity; sequence is meaningful only within this exact session. */
+  readonly sessionId: string;
+  readonly sequence: number;
+  /** Fallback tuple carried with every session order for cross-session comparison. */
+  readonly eventAt: string;
+  readonly episodeId: string;
+  readonly contentId: string;
+}
+/** Legacy `session:N` values remain parseable for old records but are never treated as cross-session causal evidence. */
+export type EffectiveOrder = SessionEffectiveOrder | `session:${number}` | readonly [string, string, string];
 
-/** Validate the two causal-order encodings permitted by §8.2. */
+/** Validate durable session orders plus the legacy/cross-session encodings. */
 export function validateEffectiveOrder(value: unknown): asserts value is EffectiveOrder {
   if (typeof value === "string") {
     if (value.length > MAX_ID_LENGTH || !/^session:(?:0|[1-9]\d*)$/u.test(value)) throw new TypeError("effectiveOrder causal sequence is invalid");
+    const legacySequence = Number(value.slice("session:".length));
+    if (!Number.isSafeInteger(legacySequence) || legacySequence > MAX_SESSION_SEQUENCE) throw new TypeError("effectiveOrder causal sequence is invalid");
     return;
   }
-  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length > 0 || Object.getOwnPropertyNames(value).length !== 4 || value.length !== 3 || value.some((item) => typeof item !== "string")) throw new TypeError("effectiveOrder tuple is invalid");
-  const [eventAt, primaryEpisodeId, contentIdValue] = value as [string, string, string];
-  const dateMatch = ISO_DATE.exec(eventAt); const parsed = Date.parse(eventAt);
+  if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length > 0 || Object.getOwnPropertyNames(value).length !== 4 || value.length !== 3 || value.some((item) => typeof item !== "string")) throw new TypeError("effectiveOrder tuple is invalid");
+    const [eventAt, primaryEpisodeId, contentIdValue] = value as [string, string, string];
+    const dateMatch = ISO_DATE.exec(eventAt); const parsed = Date.parse(eventAt);
+    if (dateMatch === null || Number(dateMatch[1]) < 1970 || Number(dateMatch[1]) > 2100 || !Number.isFinite(parsed) || new Date(parsed).toISOString() !== eventAt) throw new TypeError("effectiveOrder event timestamp is invalid");
+    requireId("effectiveOrder.primaryEpisodeId", primaryEpisodeId);
+    requireId("effectiveOrder.contentId", contentIdValue);
+    return;
+  }
+  if (typeof value !== "object" || value === null || Object.getPrototypeOf(value) !== Object.prototype) throw new TypeError("effectiveOrder session object is invalid");
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (JSON.stringify(keys) !== JSON.stringify(["contentId", "episodeId", "eventAt", "kind", "sequence", "sessionId"]) || record.kind !== "session") throw new TypeError("effectiveOrder session object is invalid");
+  requireId("effectiveOrder.sessionId", record.sessionId as string);
+  requireId("effectiveOrder.episodeId", record.episodeId as string);
+  requireId("effectiveOrder.contentId", record.contentId as string);
+  if (!Number.isSafeInteger(record.sequence) || (record.sequence as number) < 0 || (record.sequence as number) > MAX_SESSION_SEQUENCE) throw new TypeError("effectiveOrder sequence is invalid");
+  const eventAt = record.eventAt;
+  const dateMatch = typeof eventAt === "string" ? ISO_DATE.exec(eventAt) : null; const parsed = typeof eventAt === "string" ? Date.parse(eventAt) : Number.NaN;
   if (dateMatch === null || Number(dateMatch[1]) < 1970 || Number(dateMatch[1]) > 2100 || !Number.isFinite(parsed) || new Date(parsed).toISOString() !== eventAt) throw new TypeError("effectiveOrder event timestamp is invalid");
-  requireId("effectiveOrder.primaryEpisodeId", primaryEpisodeId);
-  requireId("effectiveOrder.contentId", contentIdValue);
 }
 
 /** Insert-only occurrence identity. effectiveOrder may be a causal tuple. */
@@ -91,6 +122,41 @@ export function observationId(policyEpoch: number, logicalContentId: string, pri
   requireId("observationId.primaryEvidenceEpisodeId", primaryEvidenceEpisodeId);
   validateEffectiveOrder(effectiveOrder);
   return tagged("occurrence", { contentId: logicalContentId, domain: "occurrence", effectiveOrder, policyEpoch, primaryEvidenceEpisodeId });
+}
+
+/**
+ * Per-policy-epoch mutable current-point identity: one `curated_current`
+ * point per logical state key AND coordination policy epoch. A policy
+ * migration creates a NEW current identity (the old point is never mutated);
+ * active-epoch readers select only the point whose epoch matches the active
+ * control, so the old view is hidden without touching old records.
+ */
+export function curatedCurrentId(host: HostId, stateKeyValue: string, coordinationPolicyEpoch: number): string {
+  if (host !== "pi" && host !== "prime") throw new TypeError("curatedCurrentId.host must be pi or prime");
+  requireId("curatedCurrentId.stateKey", stateKeyValue);
+  requireEpoch("curatedCurrentId.coordinationPolicyEpoch", coordinationPolicyEpoch);
+  return tagged("current", { domain: "current", host, policyEpoch: coordinationPolicyEpoch, stateKey: stateKeyValue });
+}
+
+/**
+ * Content-addressed immutable conflict-manifest identity: the manifest id
+ * binds the coordination policy hash, the logical state key and the sorted
+ * conflicting observation members, so concurrent identical conflicts converge
+ * to one manifest and no winner is ever chosen.
+ */
+export function conflictManifestId(policyHash: string, stateKeyValue: string, members: readonly string[]): string {
+  requireId("conflictManifestId.policyHash", policyHash);
+  requireId("conflictManifestId.stateKey", stateKeyValue);
+  // Bounded conflict manifests use the same 1024-member envelope as other
+  // immutable membership records. The materializer fails closed at the cap;
+  // it never emits partial conflict state or false coverage.
+  if (!Array.isArray(members) || members.length < 2 || members.length > MAX_MEMBERS) throw new TypeError(`conflictManifestId.members must contain 2..${MAX_MEMBERS} observations`);
+  const sorted = [...members];
+  for (let index = 0; index < sorted.length; index += 1) {
+    requireId(`conflictManifestId.members[${index}]`, sorted[index]!);
+    if (index > 0 && sorted[index - 1]! >= sorted[index]!) throw new TypeError("conflictManifestId.members must be strictly sorted and unique");
+  }
+  return tagged("conflict", { domain: "conflict", members: sorted, policyHash, stateKey: stateKeyValue });
 }
 
 export function evidenceLinkId(observation: string, episode: string, extractorRevision: string | number): string {

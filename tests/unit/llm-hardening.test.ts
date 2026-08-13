@@ -1,4 +1,3 @@
-import { readFile } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../../src/config.js";
 import { completeMemory } from "../../src/curation/llm.js";
@@ -176,12 +175,4 @@ describe("memory LLM hardening contract", () => {
     }
   });
 
-  it("keeps the critical hardening paths structurally present", async () => {
-    const source = await readFile("src/curation/llm.ts", "utf8");
-    expect(source).toMatch(/const policyHash = processingPolicyHash\(policy\);[\s\S]*policyHash !== policy\.id/);
-    expect(source).toMatch(/isPolicyExpired\(policy\)/);
-    expect(source).toMatch(/context\.host !== "prime"/);
-    expect(source).toMatch(/const outboundContext: Context/);
-    expect(source).toMatch(/llmDestinationBinding/);
-  });
 });

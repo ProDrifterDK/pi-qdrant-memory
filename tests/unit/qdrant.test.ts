@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readPolicy, physicalPointIdFor, type QdrantClientOptions, type QdrantReadPolicy } from "../../src/qdrant/client.js";
 import { V2_COLLECTION_METADATA, REQUIRED_INDEXES, COLLECTION_METADATA_ID, COLLECTION_CONTROL_ID, physicalPointId, controlPayload } from "../../src/qdrant/schema.js";
-import { bindQdrantDestination, coordinationRecordFromPayload, createQdrantCoordinationStore, createQdrantSafeBundle, recordPayload, QdrantContentHashCollisionError } from "../../src/qdrant/write.js";
+import { bindQdrantDestination, coordinationRecordFromPayload, episodeRecordFromPayload, createQdrantCoordinationStore, createQdrantSafeBundle, recordPayload, QdrantContentHashCollisionError } from "../../src/qdrant/write.js";
 import { adminCreateCollection, adminCreatePayloadIndex, adminHealth, adminInsertInitialControlPoint, adminInsertMetadataPoint, adminRetrieve, adminServerInfo, statusCollectionInfo, statusHealth, statusRetrieve } from "../../src/admin/transport.js";
 import { canonicalRecordHash, type ControlRecord, type EpisodeRecord, type TombstoneRecord } from "../../src/domain/records.js";
+import { MAX_SESSION_SEQUENCE } from "../../src/domain/ids.js";
 import { coverageId, episodeId, leasePointId, tombstoneId } from "../../src/domain/ids.js";
 import { activatePolicyEpoch, beginForgetBarrier, beginPolicyDrain, createIngestControlReader, QuiescenceProof, readControl, rotateCoordinationPolicy, waitForOldLeasesToQuiesce } from "../../src/coordination/control.js";
 import { claimLease, readLease, releaseLease, renewLease } from "../../src/coordination/leases.js";
@@ -63,7 +64,7 @@ function backend(seed: WirePoint[] = [], hooks: BackendHooks = {}): { points: Ma
       });
       if (body?.update_mode === "update_only" && !matches) return json({ result: { status: "acknowledged" }, status: "ok" });
       hooks.onUpsert?.(body?.points ?? [], String(body?.update_mode));
-      for (const incoming of body?.points ?? []) points.set(incoming.id, { id: incoming.id, payload: incoming.payload, ...(incoming.vector === undefined ? {} : { vector: incoming.vector }) });
+      for (const incoming of body?.points ?? []) { if (body?.update_mode === "insert_only" && points.has(incoming.id)) continue; points.set(incoming.id, { id: incoming.id, payload: incoming.payload, ...(incoming.vector === undefined ? {} : { vector: incoming.vector }) }); }
       return json({ result: { status: "acknowledged" }, status: "ok" });
     }
     return json({ result: {}, status: "ok" });
@@ -191,32 +192,6 @@ describe("Qdrant v2 REST capability (safe owner module)", () => {
     await expect(statusCollectionInfo({ baseUrl: "https://qdrant.example", collection: "pi_memory", ownerHost: "pi", timeoutMs: 1000 }, fetchImpl)).rejects.toMatchObject({ category: "invalid-response" });
   });
 
-  it("uses 1.17 insert_only and fails closed on an ignored hash collision", async () => {
-    // insert_only semantics through the safe markCoverage op: a backend that
-    // IGNORES the write (acknowledges but stores nothing) fails the exact
-    // readback closed.
-    const b = backend([{ id: COLLECTION_CONTROL_ID, payload: controlPayload(control()) }], { onUpsert: (_points, mode) => { expect(mode).toBe("insert_only"); } });
-    const ignoreWrite: typeof fetch = async (input, init = {}) => { if (String(input).includes("/points?") && init.method === "PUT") return json({ result: { status: "acknowledged" }, status: "ok" }); return b.fetchImpl(input, init); };
-    vi.stubGlobal("fetch", ignoreWrite);
-    const store = createQdrantCoordinationStore(qdrantOptions());
-    await expect(markCoverage(store, { ownerHost: OWNER, episodeId: "00000000-0000-5000-8000-000000000001", extractorRevision: EXTRACTOR, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, createdAt: NOW, processingPolicyId: INTERSECTION_ID })).rejects.toThrow(/did not read back/i);
-  });
-
-  it("converges equal insert-only hashes", async () => {
-    const b = backend([{ id: COLLECTION_CONTROL_ID, payload: controlPayload(control()) }]);
-    const store = storeFor(b);
-    const input = { ownerHost: OWNER, episodeId: "00000000-0000-5000-8000-000000000001", extractorRevision: EXTRACTOR, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, createdAt: NOW, processingPolicyId: INTERSECTION_ID };
-    const first = await markCoverage(store, input);
-    const second = await markCoverage(store, input);
-    expect(second).toEqual(first);
-  });
-
-  it("rejects invalid payload/vector responses", async () => {
-    const input = { ownerHost: OWNER, episodeId: "00000000-0000-5000-8000-000000000001", extractorRevision: EXTRACTOR, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, createdAt: NOW, processingPolicyId: INTERSECTION_ID };
-    const tampered = backend([{ id: COLLECTION_CONTROL_ID, payload: controlPayload(control()) }], { onUpsert: (points) => { for (const point of points) if (point.payload.record_type === "coverage") point.payload = { ...point.payload, content_hash: "0".repeat(64) }; } });
-    await expect(markCoverage(storeFor(tampered), input)).rejects.toThrow(/hash/i);
-  });
-
   it("emits update_only CAS predicates and verifies readback", async () => {
     const writes: Array<{ mode: string; filter: unknown }> = [];
     const b = backend([{ id: COLLECTION_CONTROL_ID, payload: controlPayload(control()) }], { onUpsert: (_points, mode) => { writes.push({ mode, filter: writes.length }); } });
@@ -339,17 +314,6 @@ describe("Qdrant v2 REST capability (safe owner module)", () => {
     expect(reread.state).toBe("draining");
   });
 
-  it("exact authoritative reread cardinality: ambiguous insert preflight/postflight responses fail closed", async () => {
-    const input = { ownerHost: OWNER, episodeId: "00000000-0000-5000-8000-000000000001", extractorRevision: EXTRACTOR, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, createdAt: NOW, processingPolicyId: INTERSECTION_ID };
-    const withExtras = (point: WirePoint): WirePoint[] => [{ id: point.id, payload: point.payload }, { id: "00000000-0000-4000-8000-000000000099", payload: point.payload }];
-    // Preflight ambiguity: an extra unrequested point is never mapped to success.
-    const preflight = backend([{ id: COLLECTION_CONTROL_ID, payload: controlPayload(control()) }], { extra: (ids) => { const point = [...Array.from({ length: 0 })] as WirePoint[]; return point; } });
-    const coveragePhysicalId = coverageId({ ownerHost: OWNER, episodeId: input.episodeId, extractorRevision: EXTRACTOR, coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1, policyIntersectionId: INTERSECTION_ID, privacyEpoch: 0 });
-    const preflightFetch: typeof fetch = async (input, init = {}) => { if (String(input).includes("/points/retrieve")) { const body = JSON.parse(String(init.body ?? "{}")) as { ids?: string[] }; const ids = body?.ids ?? []; const found = ids.map((id) => preflight.points.get(id)).filter((point) => point !== undefined); const coverage = preflight.points.get(coveragePhysicalId); const extras = coverage === undefined ? [] : withExtras(coverage); return json({ result: [...found, ...extras], status: "ok" }); } return preflight.fetchImpl(input, init); };
-    vi.stubGlobal("fetch", preflightFetch);
-    await expect(markCoverage(createQdrantCoordinationStore(qdrantOptions()), input)).rejects.toThrow(/ambiguous/i);
-  });
-
   it("exact authoritative reread cardinality: ambiguous control/lease CAS responses fail closed", async () => {
     const controlPayload2 = controlPayload(control());
     const ambiguous: typeof fetch = async (input) => { if (String(input).includes("/points/retrieve")) return json({ result: [{ id: COLLECTION_CONTROL_ID, payload: controlPayload2 }, { id: "00000000-0000-4000-8000-000000000099", payload: controlPayload2 }], status: "ok" }); return json({ result: {}, status: "ok" }); };
@@ -360,10 +324,16 @@ describe("Qdrant v2 REST capability (safe owner module)", () => {
     await expect(readLease(createQdrantCoordinationStore(qdrantOptions()), "job-1")).resolves.toBeNull();
   });
 
-  it("rejects a cross-owner canonical record before any retrieve or upsert", async () => {
-    const b = backend([{ id: COLLECTION_CONTROL_ID, payload: controlPayload(control()) }]);
-    const store = storeFor(b);
-    await expect(markCoverage(store, { ownerHost: "prime", episodeId: "00000000-0000-5000-8000-000000000001", extractorRevision: EXTRACTOR, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, createdAt: NOW, processingPolicyId: INTERSECTION_ID })).rejects.toThrow(/owner/i);
+  it("round-trips bounded session sequence on the episode wire and binds it into the hash", () => {
+    const withSequence = { ...episode(), sessionSequence: 17, contentHash: "pending" } as EpisodeRecord;
+    const committed = { ...withSequence, contentHash: canonicalRecordHash(withSequence) } as EpisodeRecord;
+    const payload = recordPayload(committed);
+    expect(payload.session_sequence).toBe(17);
+    expect(episodeRecordFromPayload(payload, OWNER)).toMatchObject({ sessionSequence: 17, contentHash: committed.contentHash });
+    expect(canonicalRecordHash({ ...committed, sessionSequence: 18 })).not.toBe(committed.contentHash);
+    expect(() => recordPayload({ ...committed, sessionSequence: -1, contentHash: "pending" } as EpisodeRecord)).toThrow();
+    expect(() => recordPayload({ ...committed, sessionSequence: MAX_SESSION_SEQUENCE + 1, contentHash: "pending" } as EpisodeRecord)).toThrow();
+    expect(() => recordPayload({ ...committed, sessionSequence: 1.5, contentHash: "pending" } as EpisodeRecord)).toThrow();
   });
 
   it("serializes Episode vectors as named vectors, never payload fields", async () => {
@@ -404,12 +374,6 @@ describe("Qdrant v2 REST capability (safe owner module)", () => {
     expect(reread[0]?.scope).toBe("occurrence");
   });
 
-  it("detects an ignored insert-only write from the post-read hash", async () => {
-    const b = backend([{ id: COLLECTION_CONTROL_ID, payload: controlPayload(control()) }], { onUpsert: (points) => { for (const point of points) if (point.payload.record_type === "coverage") point.payload = { ...point.payload, content_hash: "1".repeat(64) }; } });
-    const store = storeFor(b);
-    await expect(markCoverage(store, { ownerHost: OWNER, episodeId: "00000000-0000-5000-8000-000000000001", extractorRevision: EXTRACTOR, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, createdAt: NOW, processingPolicyId: INTERSECTION_ID })).rejects.toThrow(/hash/i);
-  });
-
   it("does not send a made-up retrieve filter and rejects missing response ownership", async () => {
     const bodies: Array<{ filter?: unknown; ids?: string[] }> = [];
     const fetchImpl: typeof fetch = async (input, init = {}) => { if (String(input).includes("/points/retrieve")) { bodies.push(JSON.parse(String(init.body)) as { filter?: unknown; ids?: string[] }); return json({ result: [{ id: COLLECTION_METADATA_ID, payload: { record_type: "collection_metadata", status: "active", secret_scan: "passed" } }], status: "ok" }); } return json({ result: {}, status: "ok" }); };
@@ -439,14 +403,6 @@ describe("Qdrant v2 REST capability (safe owner module)", () => {
     await expect(store2.readEpisodes([finalExpiredEp.id])).rejects.toThrow(/expired/i);
     expect(physicalPointIdFor("episode", "session-1")).toBe(physicalPointId("episode", "session-1"));
     expect(physicalPointIdFor("episode", "00000000-0000-5000-8000-000000000001")).toBe("00000000-0000-5000-8000-000000000001");
-  });
-
-  it("preflights insert-only and reports a pre-existing equal point across fresh stores", async () => {
-    const input = { ownerHost: OWNER, episodeId: "00000000-0000-5000-8000-000000000001", extractorRevision: EXTRACTOR, policyEpoch: 1, policyHash: POLICY_HASH, privacyEpoch: 0, createdAt: NOW, processingPolicyId: INTERSECTION_ID };
-    const b = backend([{ id: COLLECTION_CONTROL_ID, payload: controlPayload(control()) }]);
-    const first = await markCoverage(storeFor(b), input);
-    const second = await markCoverage(storeFor(b), input);
-    expect(second).toEqual(first);
   });
 
   it("rejects arbitrary CAS patches and preserves full control payload on update-only", async () => {

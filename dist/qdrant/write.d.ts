@@ -1,4 +1,4 @@
-import { type ControlRecord, type CoverageRecord, type EpisodeRecord, type JobRecord, type LeaseRecord, type MemoryRecord, type ProcessingPolicyRecord, type ProposalRecord, type TombstoneRecord } from "../domain/records.js";
+import { type ConflictManifestRecord, type ControlRecord, type CoverageRecord, type CuratedCurrentRecord, type CuratedMemoryRecord, type EpisodeRecord, type EvidenceLinkRecord, type JobRecord, type LeaseRecord, type MemoryRecord, type ProcessingPolicyRecord, type ProposalRecord, type TombstoneRecord } from "../domain/records.js";
 import type { AuthorizedDestination, HostId, RuntimeConfig } from "../types.js";
 import { type QdrantClientOptions, type QdrantPoint } from "./client.js";
 import { RootWorkerContext } from "../coordination/root.js";
@@ -10,7 +10,7 @@ import type { MarkCoverageInput } from "../coordination/reconcile.js";
 type Payload = Record<string, unknown>;
 export declare function recordPayload(record: MemoryRecord): Payload;
 /** Strict inverse of recordPayload; status/secret_scan are wire-only defaults except for episode. */
-export declare function recordFromPayload(value: unknown, ownerHost: "pi" | "prime"): MemoryRecord;
+export declare function recordFromPayload(value: unknown, ownerHost: "pi" | "prime", semanticVector?: readonly number[]): MemoryRecord;
 /** Strict inverse of recordPayload for coordination points; status/secret_scan are wire-only defaults. */
 export declare function coordinationRecordFromPayload(value: unknown, ownerHost: "pi" | "prime"): JobRecord | LeaseRecord | ProposalRecord | CoverageRecord | TombstoneRecord;
 /** Strict episode readback parser for internal coordination reads (tombstone target verification). */
@@ -120,8 +120,15 @@ export declare class ProductionCoordinationStore {
         leases: LeaseRecord[];
         nextOffset?: string;
     }>;
+    /** Bounded authoritative job discovery for crash-resume selection. */
+    scrollJobs(offset?: string, limit?: number): Promise<{
+        jobs: JobRecord[];
+        nextOffset?: string;
+    }>;
     readEpisode(episodeIdValue: string): Promise<EpisodeRecord | null>;
     readEpisodes(episodeIds: readonly string[]): Promise<EpisodeRecord[]>;
+    private assertAcceptedAuthorityBase;
+    private assertCuratedRecordAgainstJob;
     claimLease(worker: RootWorkerContext, input: ClaimLeaseInput): Promise<LeaseAuthority | null>;
     renewLease(authority: LeaseAuthority): Promise<LeaseAuthority | null>;
     releaseLease(authority: LeaseAuthority): Promise<boolean>;
@@ -130,8 +137,25 @@ export declare class ProductionCoordinationStore {
         proposalId: string;
     }): Promise<LeaseAuthority | null>;
     createJob(input: CreateJobInput): Promise<JobRecord>;
+    completeJob(authority: LeaseAuthority): Promise<boolean>;
     writeProposal(authority: LeaseAuthority, input: WriteProposalInput): Promise<ProposalRecord>;
-    markCoverage(input: MarkCoverageInput): Promise<CoverageRecord>;
+    markCoverage(authority: LeaseAuthority, input: MarkCoverageInput): Promise<CoverageRecord>;
+    readObservation(authority: LeaseAuthority, id: string): Promise<CuratedMemoryRecord | null>;
+    readCurrent(authority: LeaseAuthority, id: string): Promise<CuratedCurrentRecord | null>;
+    readConflictManifest(authority: LeaseAuthority, id: string): Promise<ConflictManifestRecord | null>;
+    insertObservation(authority: LeaseAuthority, input: {
+        record: CuratedMemoryRecord;
+    }): Promise<CuratedMemoryRecord>;
+    insertEvidenceLink(authority: LeaseAuthority, input: {
+        record: EvidenceLinkRecord;
+    }): Promise<EvidenceLinkRecord>;
+    insertConflictManifest(authority: LeaseAuthority, input: {
+        record: ConflictManifestRecord;
+    }): Promise<ConflictManifestRecord>;
+    upsertCuratedCurrent(authority: LeaseAuthority, input: {
+        record: CuratedCurrentRecord;
+        expectedVersion: number | null;
+    }): Promise<CuratedCurrentRecord | null>;
     createTombstone(input: CreateTombstoneInput): Promise<TombstoneRecord[]>;
     initializeControl(initial: ControlRecord): Promise<ControlRecord>;
     beginPolicyDrain(input: {

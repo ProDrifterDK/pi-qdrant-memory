@@ -1,14 +1,23 @@
+import { types as nodeTypes } from "node:util";
 import { canonicalRecordHash, parseMemoryRecord } from "../domain/records.js";
 import { canonicalStringify } from "../domain/canonical.js";
-import { bindConfiguredDestination, canonicalEgressEndpoint } from "../security/egress.js";
+import { bindConfiguredDestination, canonicalEgressEndpoint, gateCuratedEgressText } from "../security/egress.js";
 import { physicalPointId, COLLECTION_CONTROL_ID, assertBootstrapControl, controlPayload, controlRecordFromPayload, isPhysicalPointId } from "./schema.js";
 import { expectedQdrantCollection, readPolicy, validatePurpose } from "./client.js";
 import { fetchJson, fetchOk, MemoryClientError } from "../clients/http.js";
-import { jobId, leasePointId, manifestHash, proposalContentHash, proposalIdFor, tombstoneId, coverageId, isContentTarget, isOccurrenceTarget, isStateTarget, isTombstoneTarget } from "../domain/ids.js";
+import { contentId, curatedCurrentId, evidenceLinkId, jobId, leasePointId, manifestHash, observationId, proposalContentHash, proposalIdFor, stateKey, tombstoneId, coverageId, isContentTarget, isOccurrenceTarget, isStateTarget, isTombstoneTarget, conflictManifestId } from "../domain/ids.js";
+import { assertPersistableCurationResult, validateCurationResult } from "../curation/validate.js";
 import { jobExpired } from "../coordination/deadline.js";
 import { RootWorkerContext } from "../coordination/root.js";
 import { QdrantContentHashCollisionError, QdrantLegacyEpisodeHashError } from "../domain/qdrant-errors.js";
 export { QdrantContentHashCollisionError, QdrantLegacyEpisodeHashError, QDRANT_CONTENT_HASH_COLLISION, QDRANT_LEGACY_EPISODE_HASH } from "../domain/qdrant-errors.js";
+import { parseCurationProposalEnvelope, provenanceMatches } from "../curation/provenance.js";
+import { CURATION_PROMPT_REVISION } from "../curation/prompt.js";
+import { projectCurationItem as sharedProjectCurationItem, projectConflictAggregate, compareProjectionOrders } from "../curation/projection.js";
+// Strict curation bounds permit 32 items, 1,024 conflict members per item,
+// and 16 source episodes per member. Keep every legitimate tombstone closure
+// completable while retaining a finite fail-closed ceiling.
+const MAX_COMPLETION_DERIVED_TARGETS = 600_000;
 /**
  * Package-internal safe-owner module.
  * THE single safe owner module for Qdrant write + Task 8 coordination
@@ -36,7 +45,83 @@ export { QdrantContentHashCollisionError, QdrantLegacyEpisodeHashError, QDRANT_C
  * objects (ProductionCoordinationStore, BoundQdrantDestination, the safe
  * bundle); they never accept or return a raw session/writer.
  */
-function isRecord(value) { return typeof value === "object" && value !== null && !Array.isArray(value); }
+function isRecord(value) { return typeof value === "object" && value !== null && !Array.isArray(value) && !nodeTypes.isProxy(value); }
+/** Clone canonical JSON exclusively from own data descriptors. The caller graph
+ * is inspected exactly once: proxies, accessors, symbols, sparse/extra array
+ * keys, cycles and non-JSON values fail before any discriminator is read. */
+function ownedCanonicalJsonSnapshot(value, label) {
+    const active = new Set();
+    const clone = (candidate) => {
+        if (candidate === null || typeof candidate === "string" || typeof candidate === "boolean")
+            return candidate;
+        if (typeof candidate === "number") {
+            if (!Number.isFinite(candidate))
+                throw new TypeError(`${label} contains a non-finite number`);
+            return candidate;
+        }
+        if (typeof candidate !== "object" || nodeTypes.isProxy(candidate))
+            throw new TypeError(`${label} contains a non-JSON value`);
+        if (active.has(candidate))
+            throw new TypeError(`${label} is cyclic`);
+        active.add(candidate);
+        try {
+            if (Object.getOwnPropertySymbols(candidate).length > 0)
+                throw new TypeError(`${label} contains symbol keys`);
+            const prototype = Object.getPrototypeOf(candidate);
+            if (Array.isArray(candidate)) {
+                if (prototype !== Array.prototype)
+                    throw new TypeError(`${label} array is invalid`);
+                const lengthDescriptor = Object.getOwnPropertyDescriptor(candidate, "length");
+                if (lengthDescriptor === undefined || !("value" in lengthDescriptor) || !Number.isSafeInteger(lengthDescriptor.value) || lengthDescriptor.value < 0 || lengthDescriptor.value > 16_384)
+                    throw new TypeError(`${label} array length is invalid`);
+                const length = lengthDescriptor.value;
+                const names = Object.getOwnPropertyNames(candidate);
+                if (names.length !== length + 1 || !names.includes("length"))
+                    throw new TypeError(`${label} array is sparse or has extra keys`);
+                const result = [];
+                for (let index = 0; index < length; index += 1) {
+                    const descriptor = Object.getOwnPropertyDescriptor(candidate, String(index));
+                    if (descriptor === undefined || !("value" in descriptor) || descriptor.enumerable !== true)
+                        throw new TypeError(`${label} array contains an accessor or hole`);
+                    result.push(clone(descriptor.value));
+                }
+                return result;
+            }
+            if (prototype !== Object.prototype && prototype !== null)
+                throw new TypeError(`${label} object is invalid`);
+            const result = {};
+            for (const name of Object.getOwnPropertyNames(candidate)) {
+                const descriptor = Object.getOwnPropertyDescriptor(candidate, name);
+                if (descriptor === undefined || !("value" in descriptor) || descriptor.enumerable !== true)
+                    throw new TypeError(`${label} contains an accessor or hidden field`);
+                Object.defineProperty(result, name, { value: clone(descriptor.value), enumerable: true, writable: true, configurable: true });
+            }
+            return result;
+        }
+        finally {
+            active.delete(candidate);
+        }
+    };
+    const owned = clone(value);
+    try {
+        return JSON.parse(canonicalStringify(owned));
+    }
+    catch {
+        throw new TypeError(`${label} is not canonical JSON`);
+    }
+}
+/** Own a backend point before inspecting discriminators. */
+function ownedPointSnapshot(value) {
+    const clone = ownedCanonicalJsonSnapshot(value, "Qdrant point");
+    if (!isRecord(clone))
+        throw new TypeError("Qdrant point is invalid");
+    return clone;
+}
+function ownedPointsSnapshot(values) {
+    if (!Array.isArray(values))
+        throw new TypeError("Qdrant point list is invalid");
+    return values.map((value) => ownedPointSnapshot(value));
+}
 function failInput(message) { throw new MemoryClientError("configuration", message); }
 function failResponse(message) { throw new MemoryClientError("invalid-response", message); }
 function validId(value) { return isPhysicalPointId(value); }
@@ -92,7 +177,7 @@ function updateEnvelope(value) { const result = envelope(value); if (result === 
     return; if (!isRecord(result) || !["acknowledged", "completed", "ok"].includes(String(result.status)))
     failResponse("Qdrant update did not complete"); if (result.operation_id !== undefined && result.operation_id !== null && (!Number.isSafeInteger(result.operation_id) || Number(result.operation_id) < 0))
     failResponse("Qdrant operation ID is invalid"); }
-function validatePolicy(policy, configuredOwner) { if (!isRecord(policy) || policy.ownerHost !== configuredOwner || (policy.ownerHost !== "pi" && policy.ownerHost !== "prime") || policy.requireStatus !== "active" || policy.requireSecretScan !== "passed" || !Number.isFinite(policy.now) || !Number.isFinite(policy.maxClockSkewMs) || policy.maxClockSkewMs < 0 || !Array.isArray(policy.recordTypes) || policy.recordTypes.length === 0 || policy.recordTypes.some((type) => !["episode", "curated_memory", "curated_current", "raptor_summary", "collection_control", "processing_policy", "job", "lease", "proposal", "coverage", "evidence_link", "tombstone", "collection_metadata"].includes(type)))
+function validatePolicy(policy, configuredOwner) { if (!isRecord(policy) || policy.ownerHost !== configuredOwner || (policy.ownerHost !== "pi" && policy.ownerHost !== "prime") || policy.requireStatus !== "active" || policy.requireSecretScan !== "passed" || !Number.isFinite(policy.now) || !Number.isFinite(policy.maxClockSkewMs) || policy.maxClockSkewMs < 0 || !Array.isArray(policy.recordTypes) || policy.recordTypes.length === 0 || policy.recordTypes.some((type) => !["episode", "curated_memory", "curated_current", "conflict_manifest", "raptor_summary", "collection_control", "processing_policy", "job", "lease", "proposal", "coverage", "evidence_link", "tombstone", "collection_metadata"].includes(type)))
     failInput("Read policy is invalid"); try {
     validatePurpose(policy.purpose, policy.recordTypes);
 }
@@ -289,14 +374,27 @@ function validatePrecondition(value, owner) {
             failInput("Closed control precondition is invalid");
         return;
     }
+    if (value.kind === "current-cas") {
+        if (value.recordType !== "curated_current" || !validBoundedText(value.id) || !Number.isSafeInteger(value.expectedVersion) || value.expectedVersion < 0 || !Number.isSafeInteger(value.expectedEpoch) || value.expectedEpoch < 0 || !validBoundedText(value.expectedPolicyHash) || !validBoundedText(value.expectedProcessingPolicyId) || (value.expectedExpiresAt !== null && !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value.expectedExpiresAt)) || !Number.isSafeInteger(value.expectedPrivacyEpoch) || value.expectedPrivacyEpoch < 0 || (value.expectedResolution !== "resolved" && value.expectedResolution !== "conflict") || (value.expectedContentId !== null && !validBoundedText(value.expectedContentId)) || (value.expectedConflictManifestHash !== null && !validBoundedText(value.expectedConflictManifestHash)) || (value.expectedResolution === "resolved") === (value.expectedContentId === null) || (value.expectedResolution === "conflict") !== (value.expectedConflictManifestHash !== null) || !/^[0-9a-f]{64}$/u.test(value.expectedContentHash))
+            failInput("Closed curated-current precondition is invalid");
+        return;
+    }
     if (value.kind === "lease-cas") {
-        if (value.recordType !== "lease" || !validBoundedText(value.jobId) || !Number.isSafeInteger(value.expectedVersion) || value.expectedVersion < 0 || !Number.isSafeInteger(value.expectedFencingToken) || value.expectedFencingToken < 0 || !Number.isSafeInteger(value.expectedPolicyEpoch) || value.expectedPolicyEpoch < 0 || !validBoundedText(value.expectedPolicyHash) || !Number.isSafeInteger(value.expectedPrivacyEpoch) || value.expectedPrivacyEpoch < 0 || (value.expectedState !== "leased" && value.expectedState !== "accepted" && value.expectedState !== "released") || !validBoundedText(value.expectedOwner) || (value.expectedAcceptedProposalId !== null && !validBoundedText(value.expectedAcceptedProposalId)) || (value.expectedAcceptedManifestHash !== null && !validBoundedText(value.expectedAcceptedManifestHash)) || (value.expectedAcceptedProposalId === null) !== (value.expectedAcceptedManifestHash === null) || !validBoundedText(value.expectedProcessingPolicyId) || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value.expectedCreatedAt) || !/^[0-9a-f]{64}$/u.test(value.expectedContentHash) || (value.expiresBefore !== undefined && (!Number.isSafeInteger(value.expiresBefore) || value.expiresBefore < 0)) || (value.expiresAfter !== undefined && (!Number.isSafeInteger(value.expiresAfter) || value.expiresAfter < 0)))
+        if (value.recordType !== "lease" || !validBoundedText(value.jobId) || !Number.isSafeInteger(value.expectedVersion) || value.expectedVersion < 0 || !Number.isSafeInteger(value.expectedFencingToken) || value.expectedFencingToken < 0 || !Number.isSafeInteger(value.expectedPolicyEpoch) || value.expectedPolicyEpoch < 0 || !validBoundedText(value.expectedPolicyHash) || !Number.isSafeInteger(value.expectedPrivacyEpoch) || value.expectedPrivacyEpoch < 0 || (value.expectedState !== "leased" && value.expectedState !== "accepted" && value.expectedState !== "released" && value.expectedState !== "completed") || !validBoundedText(value.expectedOwner) || (value.expectedAcceptedProposalId !== null && !validBoundedText(value.expectedAcceptedProposalId)) || (value.expectedAcceptedManifestHash !== null && !validBoundedText(value.expectedAcceptedManifestHash)) || (value.expectedAcceptedProposalId === null) !== (value.expectedAcceptedManifestHash === null) || !validBoundedText(value.expectedProcessingPolicyId) || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value.expectedCreatedAt) || !/^[0-9a-f]{64}$/u.test(value.expectedContentHash) || (value.expiresBefore !== undefined && (!Number.isSafeInteger(value.expiresBefore) || value.expiresBefore < 0)) || (value.expiresAfter !== undefined && (!Number.isSafeInteger(value.expiresAfter) || value.expiresAfter < 0)))
             failInput("Closed lease precondition is invalid");
         return;
     }
     failInput("Closed update precondition is invalid");
 }
 function wirePrecondition(value) {
+    if (value.kind === "current-cas") {
+        const must = [{ key: "owner_host", match: { value: value.ownerHost } }, { key: "record_type", match: { value: "curated_current" } }, { key: "version", match: { value: value.expectedVersion } }, { key: "coordination_policy_epoch", match: { value: value.expectedEpoch } }, { key: "coordination_policy_hash", match: { value: value.expectedPolicyHash } }, { key: "processing_policy_id", match: { value: value.expectedProcessingPolicyId } }, ...(value.expectedExpiresAt === null ? [{ is_null: { key: "expires_at" } }] : [{ key: "expires_at", match: { value: value.expectedExpiresAt } }]), { key: "privacy_epoch", match: { value: value.expectedPrivacyEpoch } }, { key: "resolution", match: { value: value.expectedResolution } }, { key: "content_hash", match: { value: value.expectedContentHash } }];
+        if (value.expectedResolution === "resolved")
+            must.push({ key: "content_id", match: { value: value.expectedContentId } });
+        else
+            must.push({ key: "conflict_manifest_hash", match: { value: value.expectedConflictManifestHash } });
+        return { must, must_not: [], should: [] };
+    }
     if (value.kind === "collection-control-cas") {
         const must = [{ key: "owner_host", match: { value: value.ownerHost } }, { key: "record_type", match: { value: "collection_control" } }, { key: "version", match: { value: value.expectedVersion } }, { key: "privacy_epoch", match: { value: value.expectedPrivacyEpoch } }, { key: "coordination_policy_epoch", match: { value: value.expectedEpoch } }, { key: "state", match: { value: value.expectedState } }];
         if (value.expectedBaseGeneration === null)
@@ -344,18 +442,39 @@ function isProductionRestQdrantSessionWriter(value) {
 /** Truthful minimum capability required by insert/readback verification (lexical). */
 const CONTROL_PATCH_KEYS = new Set(["version", "processingPolicyId", "activeGeneration", "activeBaseGeneration", "privacyEpoch", "coordinationPolicyEpoch", "coordinationPolicyHash", "state", "scanCursor", "lastForgetBarrier", "revokedDestinationIds", "contentHash"]);
 function fail(message) { throw new TypeError(message); }
-const FIELD_NAMES = { recordType: "record_type", ownerHost: "owner_host", schemaRevision: "schema_revision", createdAt: "created_at", privacyEpoch: "privacy_epoch", processingPolicyId: "processing_policy_id", expiresAt: "expires_at", contentHash: "content_hash", sourceEntryId: "source_entry_id", projectId: "project_id", projectIdentityKind: "project_identity_kind", sessionId: "session_id", turnId: "turn_id", agentRole: "agent_role", eventKind: "event_kind", eventAt: "event_at", modelId: "model_id", embeddingDimension: "embedding_dimension", originProvider: "origin_provider", destinationId: "destination_id", redactionStatus: "redaction_status", secretScan: "secret_scan", toolName: "tool_name", toolArgs: "tool_args", errorFingerprint: "error_fingerprint", producerId: "producer_id", nodeId: "node_id", coordinationPolicyHash: "coordination_policy_hash", coordinationPolicyEpoch: "coordination_policy_epoch", contentId: "content_id", observationId: "observation_id", effectiveAt: "effective_at", sourceEpisodeIds: "source_episode_ids", manifestHash: "manifest_hash", primaryEvidenceEpisodeId: "primary_evidence_episode_id", effectiveOrder: "effective_order", stateKey: "state_key", category: "category", scope: "scope", subject: "subject", predicate: "predicate", confidence: "confidence", generationId: "generation_id", clusterId: "cluster_id", membershipHash: "membership_hash", level: "level", memberIds: "member_ids", summary: "summary", promptRevision: "prompt_revision", algorithm: "algorithm", seed: "seed", jobId: "job_id", fencingToken: "fencing_token", temporalFrom: "temporal_from", temporalTo: "temporal_to", coveredProjects: "covered_projects", algorithmParameters: "algorithm_parameters", activeGeneration: "active_generation", activeBaseGeneration: "active_base_generation", state: "state", scanCursor: "scan_cursor", lastForgetBarrier: "last_forget_barrier", policy: "policy", canonicalHash: "canonical_hash", policyId: "policy_id", policyHash: "policy_hash", policyEpoch: "policy_epoch", membership: "membership", leaseExpiresAt: "lease_expires_at", leaseOwner: "lease_owner", acceptedProposalId: "accepted_proposal_id", acceptedManifestHash: "accepted_manifest_hash", episodeId: "episode_id", extractorRevision: "extractor_revision", sourceId: "source_id", targetId: "target_id", provenanceId: "provenance_id", resolution: "resolution", conflictManifestHash: "conflict_manifest_hash", value: "value", revokedDestinationIds: "revoked_destination_ids", ownerId: "owner_id", proposalHash: "proposal_hash", content: "content" };
+const FIELD_NAMES = { recordType: "record_type", ownerHost: "owner_host", schemaRevision: "schema_revision", createdAt: "created_at", privacyEpoch: "privacy_epoch", processingPolicyId: "processing_policy_id", expiresAt: "expires_at", contentHash: "content_hash", sourceEntryId: "source_entry_id", projectId: "project_id", projectIdentityKind: "project_identity_kind", sessionId: "session_id", turnId: "turn_id", agentRole: "agent_role", eventKind: "event_kind", eventAt: "event_at", modelId: "model_id", embeddingDimension: "embedding_dimension", originProvider: "origin_provider", destinationId: "destination_id", redactionStatus: "redaction_status", secretScan: "secret_scan", toolName: "tool_name", toolArgs: "tool_args", errorFingerprint: "error_fingerprint", producerId: "producer_id", nodeId: "node_id", sessionSequence: "session_sequence", coordinationPolicyHash: "coordination_policy_hash", coordinationPolicyEpoch: "coordination_policy_epoch", contentId: "content_id", observationId: "observation_id", effectiveAt: "effective_at", sourceEpisodeIds: "source_episode_ids", manifestHash: "manifest_hash", primaryEvidenceEpisodeId: "primary_evidence_episode_id", effectiveOrder: "effective_order", stateKey: "state_key", category: "category", scope: "scope", subject: "subject", predicate: "predicate", confidence: "confidence", generationId: "generation_id", clusterId: "cluster_id", membershipHash: "membership_hash", level: "level", memberIds: "member_ids", summary: "summary", promptRevision: "prompt_revision", algorithm: "algorithm", seed: "seed", jobId: "job_id", fencingToken: "fencing_token", temporalFrom: "temporal_from", temporalTo: "temporal_to", coveredProjects: "covered_projects", algorithmParameters: "algorithm_parameters", activeGeneration: "active_generation", activeBaseGeneration: "active_base_generation", state: "state", scanCursor: "scan_cursor", lastForgetBarrier: "last_forget_barrier", policy: "policy", canonicalHash: "canonical_hash", policyId: "policy_id", policyHash: "policy_hash", policyEpoch: "policy_epoch", membership: "membership", leaseExpiresAt: "lease_expires_at", leaseOwner: "lease_owner", acceptedProposalId: "accepted_proposal_id", acceptedManifestHash: "accepted_manifest_hash", episodeId: "episode_id", extractorRevision: "extractor_revision", sourceId: "source_id", targetId: "target_id", provenanceId: "provenance_id", resolution: "resolution", conflictManifestHash: "conflict_manifest_hash", value: "value", revokedDestinationIds: "revoked_destination_ids", ownerId: "owner_id", proposalHash: "proposal_hash", content: "content" };
 function mapKey(key) { return FIELD_NAMES[key] ?? key; }
-export function recordPayload(record) { const parsed = parseMemoryRecord(record); const payload = {}; for (const [key, value] of Object.entries(parsed)) {
-    if (key === "vector")
-        continue;
-    const mapped = mapKey(key);
-    if (mapped === key && /[A-Z]/u.test(key))
-        fail(`Unmapped record field: ${key}`);
-    payload[mapped] = value;
-} payload.status = payload.status ?? "active"; payload.secret_scan = payload.secret_scan ?? "passed"; return payload; }
-function recordPoint(record) { const payload = record.recordType === "collection_control" ? controlPayload(record) : recordPayload(record); const point = { id: physicalPointId(record.recordType, record.id), payload }; if ("vector" in record && record.vector !== undefined)
-    point.vector = { semantic: record.vector }; return point; }
+/** Serialize an already-owned parsed record. Never call parseMemoryRecord here:
+ * callers that snapshot a getter-bearing record must not re-read it. */
+function payloadFromParsed(parsed) {
+    const payload = {};
+    for (const [key, value] of Object.entries(parsed)) {
+        if (key === "vector")
+            continue;
+        const mapped = mapKey(key);
+        if (mapped === key && /[A-Z]/u.test(key))
+            fail(`Unmapped record field: ${key}`);
+        payload[mapped] = value;
+    }
+    payload.status = payload.status ?? "active";
+    payload.secret_scan = payload.secret_scan ?? "passed";
+    return payload;
+}
+export function recordPayload(record) {
+    // parseMemoryRecord owns/canonicalizes the input exactly once. The returned
+    // plain snapshot, not the caller object, is the only value serialized.
+    return payloadFromParsed(parseMemoryRecord(record));
+}
+function recordPointFromParsed(parsed) {
+    const payload = parsed.recordType === "collection_control" ? controlPayload(parsed) : payloadFromParsed(parsed);
+    const point = { id: physicalPointId(parsed.recordType, parsed.id), payload };
+    if ("vector" in parsed && parsed.vector !== undefined)
+        point.vector = { semantic: [...parsed.vector] };
+    return point;
+}
+function recordPoint(record) {
+    return recordPointFromParsed(parseMemoryRecord(record));
+}
 function policyFor(client, recordType, purpose = "write_verification") { return readPolicy({ ownerHost: client.ownerHost, purpose, recordTypes: [recordType], maxClockSkewMs: client.maxClockSkewMs }); }
 function contentHash(payload) { return payload.content_hash; }
 function collision(expected, actual) { throw new Error(`content hash collision for ${expected}: ${String(actual)}`); }
@@ -384,36 +503,64 @@ function privateWriteEngine(client) {
         updateOnlyCas: (input) => updateOnlyCas(client, input),
         publishControlCas: (input) => publishControlCas(client, input),
         casPoint: (input) => casPoint(client, input),
+        casCuratedCurrent: (input) => casCuratedCurrent(client, input),
     });
 }
 /** @internal */
 /** Insert-only is at-least-once: preflight and postflight reads classify observed state; a concurrent race is inherently ambiguous. */
 async function insertOnly(client, record) {
+    // Own/parse ONCE before touching any record getter or network. Every later
+    // decision (owner/type/version/hash/point/policy) uses this immutable dense
+    // snapshot, so getter swaps cannot split validation from persistence.
+    const parsed = parseMemoryRecord(record);
     // Owner-domain write safety BEFORE any retrieve/upsert: a writer can never
     // physically insert a canonical record owned by a different host (a pi
     // writer cannot pollute the collection with a prime job/coverage/proposal/
     // tombstone that only its pi-filtered reread would reject).
-    if (record.ownerHost !== client.ownerHost)
+    if (parsed.ownerHost !== client.ownerHost)
         fail("Memory record owner does not match the client owner");
-    if (!(record.recordType === "collection_control" && record.version === 0))
-        parseMemoryRecord(record);
-    if (record.recordType === "collection_control" && record.version === 0)
-        assertBootstrapControl(record, client.ownerHost);
-    else if (record.contentHash !== canonicalRecordHash(record))
+    if (parsed.recordType === "collection_control" && parsed.version === 0)
+        assertBootstrapControl(parsed, client.ownerHost);
+    else if (parsed.contentHash !== canonicalRecordHash(parsed))
         fail("Memory record canonical hash mismatch");
-    const point = recordPoint(record);
-    const policy = policyFor(client, record.recordType === "collection_control" ? "collection_control" : record.recordType, record.recordType === "collection_control" ? "control" : "write_verification");
-    const before = await retrieveOne(client, point.id, policy);
+    const point = recordPointFromParsed(parsed);
+    const policy = policyFor(client, parsed.recordType === "collection_control" ? "collection_control" : parsed.recordType, parsed.recordType === "collection_control" ? "control" : "write_verification");
+    const includeVector = point.vector !== undefined;
+    const exactPoint = (candidate) => {
+        try {
+            let payloadMatches = canonicalStringify(candidate.payload) === canonicalStringify(point.payload);
+            // Evidence-link identity intentionally excludes jobId so overlapping
+            // accepted jobs converge on the first immutable link. The higher-level
+            // curated kernel validates the preserved job against its exact job.
+            if (!payloadMatches && parsed.recordType === "evidence_link") {
+                const normalized = { ...candidate.payload, job_id: point.payload.job_id };
+                payloadMatches = canonicalStringify(normalized) === canonicalStringify(point.payload);
+            }
+            if (!payloadMatches)
+                return false;
+            if (point.vector === undefined)
+                return candidate.vector === undefined;
+            return candidate.vector !== undefined && canonicalStringify(candidate.vector.semantic) === canonicalStringify(point.vector.semantic);
+        }
+        catch {
+            return false;
+        }
+    };
+    const before = await retrieveOne(client, point.id, policy, includeVector);
     let existing = false;
     if (before !== undefined) {
-        checkHash(before.payload, record.contentHash);
+        checkHash(before.payload, parsed.contentHash);
+        if (!exactPoint(before))
+            throw new Error(`insert-only existing point did not match exactly ${point.id}`);
         existing = true;
     }
     await client.upsertPoints([point], "insert_only");
-    const after = await retrieveOne(client, point.id, policy);
+    const after = await retrieveOne(client, point.id, policy, includeVector);
     if (after === undefined)
         throw new Error(`insert-only write did not read back point ${point.id}`);
-    checkHash(after.payload, record.contentHash);
+    checkHash(after.payload, parsed.contentHash);
+    if (!exactPoint(after))
+        throw new Error(`insert-only write did not read back exactly ${point.id}`);
     return existing ? "existing" : "inserted";
 }
 function patchPayload(patch) { const result = {}; for (const key of Object.keys(patch)) {
@@ -534,18 +681,47 @@ async function publishControlCas(client, input) {
 const COORDINATION_RECORD_TYPES = new Set(["lease", "job", "proposal", "coverage", "tombstone"]);
 const SNAKE_TO_CAMEL = new Map(Object.entries(FIELD_NAMES).map(([camel, snake]) => [snake, camel]));
 /** Strict inverse of recordPayload; status/secret_scan are wire-only defaults except for episode. */
-export function recordFromPayload(value, ownerHost) {
-    if (!isRecord(value) || typeof value.record_type !== "string")
+export function recordFromPayload(value, ownerHost, semanticVector) {
+    let snapshot;
+    try {
+        snapshot = ownedCanonicalJsonSnapshot(value, "Coordination point payload");
+    }
+    catch {
         throw new TypeError("Coordination point payload is invalid");
+    }
+    if (!isRecord(snapshot) || typeof snapshot.record_type !== "string")
+        throw new TypeError("Coordination point payload is invalid");
+    const owned = snapshot;
+    // Named vectors are the only legal vector transport. Snapshot the semantic
+    // vector once; payload-level vectors and unsupported record pairings fail.
+    if (Object.prototype.hasOwnProperty.call(owned, "vector"))
+        throw new TypeError("Coordination point vector must be a named vector");
     const record = {};
-    for (const [wire, raw] of Object.entries(value)) {
-        if ((wire === "status" || wire === "secret_scan") && value.record_type !== "episode")
+    const recordType = owned.record_type;
+    for (const [wire, raw] of Object.entries(owned)) {
+        if ((wire === "status" || wire === "secret_scan") && recordType !== "episode")
             continue;
         record[SNAKE_TO_CAMEL.get(wire) ?? wire] = raw;
     }
+    const supportsNamedVector = recordType === "episode" || recordType === "curated_memory" || recordType === "curated_current" && owned.resolution === "resolved";
+    let vectorSnapshot;
+    if (semanticVector !== undefined) {
+        let ownedVector;
+        try {
+            ownedVector = ownedCanonicalJsonSnapshot(semanticVector, "Coordination semantic vector");
+        }
+        catch {
+            throw new TypeError("Coordination semantic vector is invalid");
+        }
+        if (!Array.isArray(ownedVector) || ownedVector.length !== 1024 || !ownedVector.every((component) => typeof component === "number" && Number.isFinite(component)))
+            throw new TypeError("Coordination semantic vector is invalid");
+        vectorSnapshot = ownedVector;
+        if (!supportsNamedVector)
+            throw new TypeError("Record type does not permit a named semantic vector");
+    }
     let parsed;
     try {
-        parsed = parseMemoryRecord(record, { ownerHost });
+        parsed = vectorSnapshot === undefined ? parseMemoryRecord(record, { ownerHost }) : parseMemoryRecord({ ...record, vector: vectorSnapshot }, { ownerHost });
     }
     catch {
         throw new TypeError("Coordination point record is invalid");
@@ -553,7 +729,7 @@ export function recordFromPayload(value, ownerHost) {
     if (parsed.contentHash !== canonicalRecordHash(parsed))
         throw new TypeError("Coordination point canonical hash mismatch");
     try {
-        if (canonicalStringify(value) !== canonicalStringify(recordPayload(parsed)))
+        if (canonicalStringify(owned) !== canonicalStringify(payloadFromParsed(parsed)))
             throw new TypeError("Coordination point payload mismatch");
     }
     catch {
@@ -563,15 +739,19 @@ export function recordFromPayload(value, ownerHost) {
 }
 /** Strict inverse of recordPayload for coordination points; status/secret_scan are wire-only defaults. */
 export function coordinationRecordFromPayload(value, ownerHost) {
-    if (!isRecord(value) || typeof value.record_type !== "string" || !COORDINATION_RECORD_TYPES.has(value.record_type))
+    // recordFromPayload owns the raw wire object exactly once. Do not pre-read
+    // record_type from a caller accessor before that canonical snapshot.
+    const parsed = recordFromPayload(value, ownerHost);
+    if (!COORDINATION_RECORD_TYPES.has(parsed.recordType))
         throw new TypeError("Coordination point payload is invalid");
-    return recordFromPayload(value, ownerHost);
+    return parsed;
 }
 /** Strict episode readback parser for internal coordination reads (tombstone target verification). */
 export function episodeRecordFromPayload(value, ownerHost) {
-    if (!isRecord(value) || value.record_type !== "episode")
+    const parsed = recordFromPayload(value, ownerHost);
+    if (parsed.recordType !== "episode")
         throw new TypeError("Episode payload is invalid");
-    return recordFromPayload(value, ownerHost);
+    return parsed;
 }
 /**
  * Typed single-point CAS for lease/job points: update_only + typed
@@ -619,7 +799,13 @@ async function casPoint(client, input) {
         if (next.acceptedProposalId !== p.expectedAcceptedProposalId || next.acceptedManifestHash !== p.expectedAcceptedManifestHash)
             fail("Typed CAS cannot alter an existing acceptance");
     }
-    // State/owner/fence transitions:
+    // State/owner/fence transitions. Terminal completion is a single explicit
+    // accepted->completed transition and cannot be reached from leased,
+    // released, or an already-completed claim.
+    if (next.state === "completed" && (p.expectedState !== "accepted" || p.expectedAcceptedProposalId === null || p.expectedAcceptedManifestHash === null || next.ownerId !== p.expectedOwner || next.fencingToken !== p.expectedFencingToken || next.acceptedProposalId !== p.expectedAcceptedProposalId || next.acceptedManifestHash !== p.expectedAcceptedManifestHash))
+        fail("Typed CAS completion transition is invalid");
+    if (p.expectedState === "completed")
+        fail("Typed CAS cannot transition a completed lease");
     const ownerChanged = next.ownerId !== p.expectedOwner;
     const fenceChanged = next.fencingToken !== p.expectedFencingToken;
     if (next.state === "released") {
@@ -667,7 +853,7 @@ async function casPoint(client, input) {
     if (reread === undefined)
         return false;
     // Exact wire equality to the intended next payload; never compare to itself.
-    return canonicalStringify(reread.payload) === canonicalStringify(recordPayload(next));
+    return canonicalStringify(reread.payload) === canonicalStringify(payloadFromParsed(next));
 }
 function validCoordinationBinding(hash, epoch) {
     if (typeof hash !== "string" || hash.length === 0 || hash.length > 512 || !/^[A-Za-z0-9._:-]+$/u.test(hash) || !Number.isSafeInteger(epoch) || epoch < 0)
@@ -677,7 +863,7 @@ function payloadValue(payload, camel, snake) { return Object.prototype.hasOwnPro
 function optionalPayload(payload, camel, snake) { return Object.prototype.hasOwnProperty.call(payload, snake) ? payload[snake] : payload[camel]; }
 function sameCanonicalWirePayload(point, parsed) {
     try {
-        return canonicalStringify(point.payload) === canonicalStringify(recordPayload(parsed));
+        return canonicalStringify(point.payload) === canonicalStringify(payloadFromParsed(parsed));
     }
     catch {
         return false;
@@ -714,26 +900,29 @@ function sameEpisodeRecordExact(readback, record) {
  * by the narrow legacy-hash classifier below.
  */
 function reconstructEpisodePoint(point) {
-    const id = String(point.payload.id ?? "");
+    // `point` is already an owned plain snapshot when this helper is called.
+    const payload = point.payload;
+    const id = typeof payload.id === "string" ? payload.id : "";
     const common = {
-        recordType: "episode", id, ownerHost: payloadValue(point.payload, "ownerHost", "owner_host"), schemaRevision: payloadValue(point.payload, "schemaRevision", "schema_revision"),
-        createdAt: payloadValue(point.payload, "createdAt", "created_at"), privacyEpoch: payloadValue(point.payload, "privacyEpoch", "privacy_epoch"),
-        processingPolicyId: payloadValue(point.payload, "processingPolicyId", "processing_policy_id"), expiresAt: payloadValue(point.payload, "expiresAt", "expires_at"), contentHash: payloadValue(point.payload, "contentHash", "content_hash"),
+        recordType: "episode", id, ownerHost: payloadValue(payload, "ownerHost", "owner_host"), schemaRevision: payloadValue(payload, "schemaRevision", "schema_revision"),
+        createdAt: payloadValue(payload, "createdAt", "created_at"), privacyEpoch: payloadValue(payload, "privacyEpoch", "privacy_epoch"),
+        processingPolicyId: payloadValue(payload, "processingPolicyId", "processing_policy_id"), expiresAt: payloadValue(payload, "expiresAt", "expires_at"), contentHash: payloadValue(payload, "contentHash", "content_hash"),
     };
     return {
-        ...common, sourceEntryId: payloadValue(point.payload, "sourceEntryId", "source_entry_id"), host: point.payload.host,
-        projectId: payloadValue(point.payload, "projectId", "project_id"), projectIdentityKind: payloadValue(point.payload, "projectIdentityKind", "project_identity_kind"),
-        sessionId: payloadValue(point.payload, "sessionId", "session_id"), turnId: payloadValue(point.payload, "turnId", "turn_id"), agentRole: payloadValue(point.payload, "agentRole", "agent_role"),
-        depth: point.payload.depth, eventKind: payloadValue(point.payload, "eventKind", "event_kind"), eventAt: payloadValue(point.payload, "eventAt", "event_at"),
-        modelId: payloadValue(point.payload, "modelId", "model_id"), embeddingDimension: payloadValue(point.payload, "embeddingDimension", "embedding_dimension"),
-        originProvider: payloadValue(point.payload, "originProvider", "origin_provider"), destinationId: payloadValue(point.payload, "destinationId", "destination_id"),
-        status: point.payload.status, redactionStatus: payloadValue(point.payload, "redactionStatus", "redaction_status"), secretScan: payloadValue(point.payload, "secretScan", "secret_scan"),
-        ...(optionalPayload(point.payload, "text", "text") === undefined ? {} : { text: optionalPayload(point.payload, "text", "text") }),
-        ...(optionalPayload(point.payload, "toolName", "tool_name") === undefined ? {} : { toolName: optionalPayload(point.payload, "toolName", "tool_name") }),
-        ...(optionalPayload(point.payload, "toolArgs", "tool_args") === undefined ? {} : { toolArgs: optionalPayload(point.payload, "toolArgs", "tool_args") }),
-        ...(optionalPayload(point.payload, "errorFingerprint", "error_fingerprint") === undefined ? {} : { errorFingerprint: optionalPayload(point.payload, "errorFingerprint", "error_fingerprint") }),
-        ...(optionalPayload(point.payload, "producerId", "producer_id") === undefined ? {} : { producerId: optionalPayload(point.payload, "producerId", "producer_id") }),
-        ...(optionalPayload(point.payload, "nodeId", "node_id") === undefined ? {} : { nodeId: optionalPayload(point.payload, "nodeId", "node_id") }),
+        ...common, sourceEntryId: payloadValue(payload, "sourceEntryId", "source_entry_id"), host: payload.host,
+        projectId: payloadValue(payload, "projectId", "project_id"), projectIdentityKind: payloadValue(payload, "projectIdentityKind", "project_identity_kind"),
+        sessionId: payloadValue(payload, "sessionId", "session_id"), turnId: payloadValue(payload, "turnId", "turn_id"), agentRole: payloadValue(payload, "agentRole", "agent_role"),
+        depth: payload.depth, eventKind: payloadValue(payload, "eventKind", "event_kind"), eventAt: payloadValue(payload, "eventAt", "event_at"),
+        modelId: payloadValue(payload, "modelId", "model_id"), embeddingDimension: payloadValue(payload, "embeddingDimension", "embedding_dimension"),
+        originProvider: payloadValue(payload, "originProvider", "origin_provider"), destinationId: payloadValue(payload, "destinationId", "destination_id"),
+        status: payload.status, redactionStatus: payloadValue(payload, "redactionStatus", "redaction_status"), secretScan: payloadValue(payload, "secretScan", "secret_scan"),
+        ...(optionalPayload(payload, "text", "text") === undefined ? {} : { text: optionalPayload(payload, "text", "text") }),
+        ...(optionalPayload(payload, "toolName", "tool_name") === undefined ? {} : { toolName: optionalPayload(payload, "toolName", "tool_name") }),
+        ...(optionalPayload(payload, "toolArgs", "tool_args") === undefined ? {} : { toolArgs: optionalPayload(payload, "toolArgs", "tool_args") }),
+        ...(optionalPayload(payload, "errorFingerprint", "error_fingerprint") === undefined ? {} : { errorFingerprint: optionalPayload(payload, "errorFingerprint", "error_fingerprint") }),
+        ...(optionalPayload(payload, "producerId", "producer_id") === undefined ? {} : { producerId: optionalPayload(payload, "producerId", "producer_id") }),
+        ...(optionalPayload(payload, "nodeId", "node_id") === undefined ? {} : { nodeId: optionalPayload(payload, "nodeId", "node_id") }),
+        ...(optionalPayload(payload, "sessionSequence", "session_sequence") === undefined ? {} : { sessionSequence: optionalPayload(payload, "sessionSequence", "session_sequence") }),
         ...(point.vector?.semantic === undefined ? {} : { vector: point.vector.semantic }),
     };
 }
@@ -746,17 +935,25 @@ function reconstructEpisodePoint(point) {
  * by ProductionCoordinationStore so episode reads never diverge.
  */
 export function parseBoundEpisodePoint(point, ownerHost) {
-    if (!isRecord(point) || !isRecord(point.payload) || point.payload.record_type !== "episode")
+    let owned;
+    try {
+        owned = ownedPointSnapshot(point);
+    }
+    catch {
         return null;
-    const id = String(point.payload.id ?? "");
-    if (id.length === 0 || physicalPointId("episode", id) !== point.id)
+    }
+    const payload = owned.payload;
+    if (payload.record_type !== "episode")
+        return null;
+    const id = payload.id;
+    if (typeof id !== "string" || id.length === 0 || physicalPointId("episode", id) !== owned.id)
         return null;
     try {
-        const value = reconstructEpisodePoint(point);
-        const parsed = parseMemoryRecord(value);
+        const semantic = owned.vector?.semantic;
+        const parsed = recordFromPayload(payload, ownerHost, semantic);
         if (parsed.recordType !== "episode" || parsed.id !== id || parsed.ownerHost !== ownerHost || parsed.vector === undefined)
             return null;
-        if (parsed.contentHash !== canonicalRecordHash(parsed) || !sameCanonicalWirePayload(point, parsed) || !sameCanonicalWireVector(point, parsed))
+        if (parsed.contentHash !== canonicalRecordHash(parsed) || !sameCanonicalWirePayload(owned, parsed) || !sameCanonicalWireVector(owned, parsed))
             return null;
         return parsed;
     }
@@ -771,26 +968,28 @@ export function parseBoundEpisodePoint(point, ownerHost) {
  * verified current point and an arbitrary malformed hash.
  */
 export function isLegacyEpisodePoint(point, ownerHost) {
-    if (!isRecord(point) || !isRecord(point.payload) || point.payload.record_type !== "episode" || point.vector?.semantic === undefined || typeof point.payload.content_hash !== "string")
+    let owned;
+    try {
+        owned = ownedPointSnapshot(point);
+    }
+    catch {
         return false;
-    const id = String(point.payload.id ?? "");
-    if (id.length === 0 || physicalPointId("episode", id) !== point.id)
+    }
+    const payload = owned.payload;
+    if (payload.record_type !== "episode" || owned.vector?.semantic === undefined || typeof payload.content_hash !== "string")
+        return false;
+    const id = payload.id;
+    if (typeof id !== "string" || id.length === 0 || physicalPointId("episode", id) !== owned.id)
         return false;
     try {
-        const value = reconstructEpisodePoint(point);
+        const value = reconstructEpisodePoint(owned);
         const parsed = parseMemoryRecord(value);
-        // Explicit identity: the parsed logical id must equal the payload id (in
-        // addition to the exact wire checks below).
         if (parsed.recordType !== "episode" || parsed.id !== id || parsed.ownerHost !== ownerHost || parsed.vector === undefined)
             return false;
-        const stored = point.payload.content_hash;
+        const stored = payload.content_hash;
         if (canonicalRecordHash(parsed) === stored)
-            return false; // already verified current
-        // EXACT legacy wire equality before terminal classification: the canonical
-        // wire payload (no extra/camel/alias keys) and the exact named semantic
-        // vector must both hold; ONLY the old vector-excluding hash may differ.
-        // Any extra/malformed/ambiguous point stays null/pending, never terminal.
-        if (!sameCanonicalWirePayload(point, parsed) || !sameCanonicalWireVector(point, parsed))
+            return false;
+        if (!sameCanonicalWirePayload(owned, parsed) || !sameCanonicalWireVector(owned, parsed))
             return false;
         const { vector: _vector, ...noVector } = parsed;
         return canonicalRecordHash(noVector) === stored;
@@ -810,28 +1009,38 @@ async function boundRetrieve(client, recordType, id) {
     if (points.length !== matches.length || matches.length > 1)
         return null;
     const point = matches[0];
-    if (point === undefined || point.payload.record_type !== recordType || point.payload.content_hash === undefined)
+    if (point === undefined)
+        return null;
+    let owned;
+    try {
+        owned = ownedPointSnapshot(point);
+    }
+    catch {
+        return null;
+    }
+    const payload = owned.payload;
+    if (payload.record_type !== recordType || payload.content_hash === undefined)
         return null;
     if (recordType === "episode") {
-        const parsed = parseBoundEpisodePoint(point, client.ownerHost);
+        const parsed = parseBoundEpisodePoint(owned, client.ownerHost);
         if (parsed !== null)
             return parsed;
         // A present same-ID episode whose hash verifies ONLY under the legacy
         // vector-excluding formula is a verified terminal collision, never an
         // ambiguous null that would loop pending forever.
-        if (isLegacyEpisodePoint(point, client.ownerHost))
+        if (isLegacyEpisodePoint(owned, client.ownerHost))
             throw new QdrantLegacyEpisodeHashError();
         return null;
     }
     const value = {
-        recordType, id, ownerHost: payloadValue(point.payload, "ownerHost", "owner_host"), schemaRevision: payloadValue(point.payload, "schemaRevision", "schema_revision"),
-        createdAt: payloadValue(point.payload, "createdAt", "created_at"), privacyEpoch: payloadValue(point.payload, "privacyEpoch", "privacy_epoch"),
-        processingPolicyId: payloadValue(point.payload, "processingPolicyId", "processing_policy_id"), expiresAt: payloadValue(point.payload, "expiresAt", "expires_at"), contentHash: payloadValue(point.payload, "contentHash", "content_hash"),
-        policy: point.payload.policy, canonicalHash: payloadValue(point.payload, "canonicalHash", "canonical_hash"),
+        recordType, id, ownerHost: payloadValue(payload, "ownerHost", "owner_host"), schemaRevision: payloadValue(payload, "schemaRevision", "schema_revision"),
+        createdAt: payloadValue(payload, "createdAt", "created_at"), privacyEpoch: payloadValue(payload, "privacyEpoch", "privacy_epoch"),
+        processingPolicyId: payloadValue(payload, "processingPolicyId", "processing_policy_id"), expiresAt: payloadValue(payload, "expiresAt", "expires_at"), contentHash: payloadValue(payload, "contentHash", "content_hash"),
+        policy: payload.policy, canonicalHash: payloadValue(payload, "canonicalHash", "canonical_hash"),
     };
     try {
         const parsed = parseMemoryRecord(value);
-        if (parsed.contentHash !== canonicalRecordHash(parsed) || !sameCanonicalWirePayload(point, parsed) || !sameCanonicalWireVector(point, parsed))
+        if (parsed.contentHash !== canonicalRecordHash(parsed) || !sameCanonicalWirePayload(owned, parsed) || !sameCanonicalWireVector(owned, parsed))
             return null;
         return parsed;
     }
@@ -999,6 +1208,61 @@ export function bindQdrantDestination(factory, destination) {
     const dest = snapshotAuthorizedDestination(destination);
     return bindFn(dest);
 }
+/** @internal */
+/**
+ * OCC single-point CAS for the mutable curated-current point: update_only +
+ * typed update_filter pins owner/record/version/epoch/hash/privacy/resolution
+ * and the exact resolved content or conflict manifest; strong ordering/wait,
+ * then reread and exact payload compare. A Qdrant-acknowledged zero-match or
+ * delayed concurrent write returns false; callers return only the exact reread.
+ */
+async function casCuratedCurrent(client, input) {
+    if (input.precondition.kind !== "current-cas" || input.precondition.recordType !== "curated_current" || input.precondition.id !== input.next.id || input.id !== physicalPointId("curated_current", input.next.id))
+        fail("Curated-current CAS precondition does not match the point");
+    const next = input.next;
+    if (next.recordType !== "curated_current" || next.ownerHost !== client.ownerHost || next.contentHash !== canonicalRecordHash(next))
+        fail("Curated-current CAS record is invalid");
+    const p = input.precondition;
+    if (next.version !== p.expectedVersion + 1)
+        fail("Curated-current CAS must advance version exactly once");
+    if (next.coordinationPolicyEpoch !== p.expectedEpoch || next.coordinationPolicyHash !== p.expectedPolicyHash || next.privacyEpoch !== p.expectedPrivacyEpoch)
+        fail("Curated-current CAS must preserve the pinned coordination/privacy identity");
+    // The old processing-policy intersection and expiry are pinned by the
+    // update filter. A causally later accepted job may intentionally publish its
+    // own intersection envelope; the materializer has already bound `next` to
+    // that accepted job before reaching this OCC seam.
+    if (next.resolution === "resolved") {
+        // A resolved transition is allowed from resolved (a later effective value)
+        // or from conflict (a later-dated observation resolves the conflicted view).
+        if (p.expectedResolution !== "resolved" && p.expectedResolution !== "conflict")
+            fail("Curated-current CAS resolution transition is invalid");
+    }
+    else {
+        // A conflict transition is allowed from a resolved current (a within-skew
+        // different value) or from another conflict; conflict->conflict may only
+        // GROW the immutable manifest member set (the same manifest would mean
+        // nothing changed and must not re-CAS).
+        if (next.conflictManifestHash === undefined)
+            fail("Curated-current CAS conflict transition is invalid");
+        if (p.expectedResolution === "conflict" && (p.expectedConflictManifestHash === null || next.conflictManifestHash === p.expectedConflictManifestHash))
+            fail("Curated-current CAS conflict transition is invalid");
+    }
+    const point = recordPoint(next);
+    await client.upsertPoints([point], "update_only", p);
+    const policy = policyFor(client, "curated_current", "internal");
+    const reread = await retrieveOne(client, point.id, policy, true);
+    if (reread === undefined)
+        return false;
+    if (next.resolution === "resolved") {
+        const intended = next.vector;
+        const actual = reread.vector?.semantic;
+        if (!Array.isArray(intended) || intended.length !== 1024 || !Array.isArray(actual) || actual.length !== 1024 || intended.some((value, index) => actual[index] !== value))
+            return false;
+    }
+    else if (reread.vector !== undefined)
+        return false;
+    return canonicalStringify(reread.payload) === canonicalStringify(payloadFromParsed(next));
+}
 /**
  * The PRODUCTION coordination store exposes NO raw mutators (no control
  * compare-and-swap, lease/job/proposal/coverage/tombstone inserts, generic
@@ -1084,8 +1348,12 @@ export class ProductionCoordinationStore {
                 return engine.updateOnlyCas({ id: COLLECTION_CONTROL_ID, expectedVersion, expectedEpoch: current.coordinationPolicyEpoch, patch });
             },
             scrollLeases: async (offset, limit = 256) => this.scrollLeases(offset, limit),
+            scrollJobs: async (offset, limit = 256) => this.scrollJobs(offset, limit),
             readEpisode: async (episodeIdValue) => this.readEpisode(episodeIdValue),
             readEpisodes: async (episodeIds) => this.readEpisodes(episodeIds),
+            readCurated: async (recordType, id) => this.#readCurated(recordType, id),
+            insertCurated: async (record) => engine.insertOnly(record),
+            casCuratedCurrent: async (input) => engine.casCuratedCurrent(input),
         };
         this.#protocol = Object.freeze(facade);
         Object.freeze(this);
@@ -1103,7 +1371,7 @@ export class ProductionCoordinationStore {
     }
     async readOne(recordType, id) {
         try {
-            const points = await this.#bound.retrieve([id], this.internalPolicy(recordType));
+            const points = ownedPointsSnapshot(await this.#bound.retrieve([id], this.internalPolicy(recordType)));
             // Exact physical response cardinality: zero or exactly one requested
             // point; extras, duplicates or unrequested aliases fail closed.
             const matches = points.filter((candidate) => candidate.id === id);
@@ -1123,7 +1391,7 @@ export class ProductionCoordinationStore {
         }
     }
     async readControl() {
-        const points = await this.#bound.retrieve([COLLECTION_CONTROL_ID], readPolicy({ ownerHost: this.ownerHost, purpose: "control", recordTypes: ["collection_control"], maxClockSkewMs: this.maxClockSkewMs }));
+        const points = ownedPointsSnapshot(await this.#bound.retrieve([COLLECTION_CONTROL_ID], readPolicy({ ownerHost: this.ownerHost, purpose: "control", recordTypes: ["collection_control"], maxClockSkewMs: this.maxClockSkewMs })));
         // Exact cardinality: extras/duplicates/aliases are ambiguous and fail closed.
         const matches = points.filter((candidate) => candidate.id === COLLECTION_CONTROL_ID);
         if (points.length !== matches.length || matches.length > 1)
@@ -1144,7 +1412,7 @@ export class ProductionCoordinationStore {
         if (!Array.isArray(targetIds) || targetIds.length === 0 || targetIds.length > 1024 || targetIds.some((id) => typeof id !== "string" || id.length === 0 || id.length > 512) || new Set(targetIds).size !== targetIds.length)
             throw new TypeError("Tombstone target IDs are invalid");
         const ids = targetIds.map((id) => tombstoneId(this.ownerHost, id));
-        const points = await this.#bound.retrieve(ids, this.internalPolicy("tombstone"));
+        const points = ownedPointsSnapshot(await this.#bound.retrieve(ids, this.internalPolicy("tombstone")));
         // Batch cardinality: every returned point must be a requested physical ID
         // exactly once; extras, duplicates or aliases fail closed (missing
         // requested IDs remain meaningful).
@@ -1165,7 +1433,7 @@ export class ProductionCoordinationStore {
     async readCoverage(coverageIds) {
         if (!Array.isArray(coverageIds) || coverageIds.length === 0 || coverageIds.length > 1024 || coverageIds.some((id) => typeof id !== "string" || id.length === 0 || id.length > 512) || new Set(coverageIds).size !== coverageIds.length)
             throw new TypeError("Coverage IDs are invalid");
-        const points = await this.#bound.retrieve([...coverageIds], this.internalPolicy("coverage"));
+        const points = ownedPointsSnapshot(await this.#bound.retrieve([...coverageIds], this.internalPolicy("coverage")));
         // Batch cardinality: every returned point must be a requested ID exactly
         // once; extras, duplicates or aliases fail closed.
         const requested = new Set(coverageIds);
@@ -1181,11 +1449,12 @@ export class ProductionCoordinationStore {
     }
     async scrollLeases(offset, limit = 256) {
         const result = await this.#bound.scroll({ policy: this.internalPolicy("lease"), ...(offset === undefined ? {} : { offset }), limit });
+        const ownedPoints = ownedPointsSnapshot(result.points);
         // NEVER ignore malformed/foreign/alias points in the lease scroll: an
         // unparseable or cross-id point could falsely prove quiescence, so every
         // returned point must parse as a lease with parsed.id === point.id.
         const leases = [];
-        for (const point of result.points) {
+        for (const point of ownedPoints) {
             const parsed = coordinationRecordFromPayload(point.payload, this.ownerHost);
             if (parsed.recordType !== "lease" || parsed.id !== point.id)
                 throw new TypeError("Lease scroll readback is malformed or foreign");
@@ -1193,17 +1462,30 @@ export class ProductionCoordinationStore {
         }
         return { leases, ...(result.nextOffset === undefined ? {} : { nextOffset: result.nextOffset }) };
     }
+    /** Bounded authoritative job discovery for crash-resume selection. */
+    async scrollJobs(offset, limit = 256) {
+        const result = await this.#bound.scroll({ policy: this.internalPolicy("job"), ...(offset === undefined ? {} : { offset }), limit });
+        const ownedPoints = ownedPointsSnapshot(result.points);
+        const jobs = [];
+        for (const point of ownedPoints) {
+            const parsed = coordinationRecordFromPayload(point.payload, this.ownerHost);
+            if (parsed.recordType !== "job" || parsed.id !== point.id)
+                throw new TypeError("Job scroll readback is malformed or foreign");
+            jobs.push(parsed);
+        }
+        return { jobs, ...(result.nextOffset === undefined ? {} : { nextOffset: result.nextOffset }) };
+    }
     async readEpisode(episodeIdValue) {
         try {
             // Vector-aware reads: the shared exact parser requires the named semantic
             // vector, exact wire payload and vector-bound contentHash.
-            const points = await this.#bound.retrieve([episodeIdValue], this.internalPolicy("episode"), { includeVector: true });
+            const points = ownedPointsSnapshot(await this.#bound.retrieve([episodeIdValue], this.internalPolicy("episode"), { includeVector: true }));
             // Exact cardinality: extras/duplicates/aliases fail closed.
             const matches = points.filter((candidate) => candidate.id === episodeIdValue);
             if (points.length !== matches.length || matches.length > 1)
                 return null;
             const point = matches[0];
-            if (point === undefined || point.payload.record_type !== "episode")
+            if (point === undefined)
                 return null;
             const parsed = parseBoundEpisodePoint(point, this.ownerHost);
             return parsed !== null && parsed.ownerHost === this.ownerHost ? parsed : null;
@@ -1212,10 +1494,51 @@ export class ProductionCoordinationStore {
             return null;
         }
     }
+    async #readCurated(recordType, id) {
+        // The curated logical ids are tagged strings (occurrence:/current:/
+        // conflict:), so the exact physical point id is the deterministic UUID
+        // derived from (recordType, logical id).
+        const physicalId = physicalPointId(recordType, id);
+        // Vector-aware reads: curated observations/currents carry the derived
+        // BGE-M3 vector on their points (payload-only reads would lose it).
+        const points = ownedPointsSnapshot(await this.#bound.retrieve([physicalId], this.internalPolicy(recordType), { includeVector: true }));
+        // Exact cardinality: extras/duplicates/aliases fail closed.
+        const matches = points.filter((candidate) => candidate.id === physicalId);
+        if (points.length !== matches.length || matches.length > 1)
+            return null;
+        const point = matches[0];
+        if (point === undefined || point.payload.record_type !== recordType)
+            return null;
+        // Bind the parsed identity to the outer point identity and the requested
+        // logical id: a canonical payload for a DIFFERENT logical id is a
+        // cross-id alias.
+        const semantic = point.vector?.semantic;
+        const parsed = recordFromPayload(point.payload, this.ownerHost, semantic);
+        if (parsed.recordType !== recordType || parsed.id !== id || physicalPointId(recordType, parsed.id) !== point.id)
+            return null;
+        // Bind the point's named semantic vector (curated records carry the
+        // derived BGE-M3 vector as a query artifact; exactly 1024 finite values).
+        if (recordType === "curated_memory") {
+            if (!Array.isArray(semantic) || semantic.length !== 1024 || !semantic.every((value) => typeof value === "number" && Number.isFinite(value)))
+                return null;
+        }
+        else if (recordType === "curated_current") {
+            const typed = parsed;
+            if (typed.resolution === "resolved") {
+                if (!Array.isArray(semantic) || semantic.length !== 1024 || !semantic.every((value) => typeof value === "number" && Number.isFinite(value)))
+                    return null;
+            }
+            else if (point.vector !== undefined)
+                return null;
+        }
+        else if (point.vector !== undefined)
+            return null;
+        return parsed;
+    }
     async readEpisodes(episodeIds) {
         if (!Array.isArray(episodeIds) || episodeIds.length === 0 || episodeIds.length > 1024 || episodeIds.some((id) => typeof id !== "string" || id.length === 0 || id.length > 512) || new Set(episodeIds).size !== episodeIds.length)
             throw new TypeError("Episode IDs are invalid");
-        const points = await this.#bound.retrieve([...episodeIds], this.internalPolicy("episode"), { includeVector: true });
+        const points = ownedPointsSnapshot(await this.#bound.retrieve([...episodeIds], this.internalPolicy("episode"), { includeVector: true }));
         // Exact mapping: every returned episode must be one of the requested point
         // IDs; extras, duplicates, missing vectors, malformed payloads or hash
         // mismatches fail closed through the shared vector-aware parser.
@@ -1225,8 +1548,6 @@ export class ProductionCoordinationStore {
         for (const point of points) {
             if (!requested.has(point.id) || seen.has(point.id))
                 throw new TypeError("Episode readback contains extras or duplicates");
-            if (point.payload.record_type !== "episode")
-                throw new TypeError("Episode readback point is malformed");
             const parsed = parseBoundEpisodePoint(point, this.ownerHost);
             if (parsed === null || parsed.ownerHost !== this.ownerHost || parsed.id !== point.id)
                 throw new TypeError("Episode readback point is malformed or identity mismatched");
@@ -1234,6 +1555,116 @@ export class ProductionCoordinationStore {
             episodes.push(parsed);
         }
         return episodes;
+    }
+    async assertAcceptedAuthorityBase(authority) {
+        if (!LeaseAuthority.isValid(authority) || !authority.matchesStore(this) || !authority.matchesScope(this.#authorityScope) || authority.state !== "accepted")
+            throw new TypeError("Curated write requires a genuine accepted lease authority");
+        const job = await this.readJob(authority.jobId);
+        const claim = await this.readLease(authority.jobId);
+        if (job === null || claim === null || !authority.matchesClaim(claim) || claim.state !== "accepted")
+            throw new TypeError("Curated write authority claim is stale");
+        const now = authority.now();
+        if (jobExpired(job, now, authority.maxClockSkewMs) || Date.parse(claim.expiresAt) <= now)
+            throw new TypeError("Curated write authority is expired");
+        return job;
+    }
+    async assertCuratedRecordAgainstJob(record, job) {
+        if (record.ownerHost !== this.ownerHost || record.processingPolicyId !== job.policyId || record.coordinationPolicyEpoch !== job.coordinationPolicyEpoch || record.coordinationPolicyHash !== job.coordinationPolicyHash || record.privacyEpoch !== job.privacyEpoch || record.expiresAt !== job.expiresAt)
+            throw new TypeError("Curated write record policy/owner binding is invalid");
+        const members = new Set(job.membership);
+        const priorJobMatches = (prior, episodeId) => prior !== null && prior.ownerHost === this.ownerHost && prior.policyId === job.policyId && prior.policyHash === job.policyHash && prior.policyEpoch === job.policyEpoch && prior.privacyEpoch === job.privacyEpoch && prior.extractorRevision === job.extractorRevision && prior.expiresAt === job.expiresAt && prior.membership.includes(episodeId);
+        const acceptedLeaseMatches = (prior, lease) => lease !== null && (lease.state === "accepted" || lease.state === "released" || lease.state === "completed") && lease.acceptedProposalId !== null && lease.acceptedManifestHash !== null && claimIdentityMatchesJob(lease, prior);
+        const assertObservationEvidenceClosure = async (observation) => {
+            const sourceIds = observation.sourceEpisodeIds ?? [];
+            if (sourceIds.length === 0 || observation.provenance === undefined || canonicalStringify(sourceIds) !== canonicalStringify(observation.provenance))
+                throw new TypeError("Conflict member evidence closure is invalid");
+            let currentJobEvidence = false;
+            for (const episodeId of sourceIds) {
+                const linkId = evidenceLinkId(observation.id, episodeId, job.extractorRevision);
+                const linkValue = await this.#readCurated("evidence_link", linkId);
+                if (linkValue === null || linkValue.recordType !== "evidence_link")
+                    throw new TypeError("Conflict member evidence link is missing");
+                const link = linkValue;
+                if (link.id !== linkId || link.ownerHost !== this.ownerHost || link.processingPolicyId !== job.policyId || link.coordinationPolicyEpoch !== job.coordinationPolicyEpoch || link.coordinationPolicyHash !== job.coordinationPolicyHash || link.privacyEpoch !== job.privacyEpoch || link.expiresAt !== job.expiresAt || link.createdAt !== observation.createdAt || link.sourceId !== observation.id || link.targetId !== episodeId || link.extractorRevision !== job.extractorRevision || link.contentHash !== canonicalRecordHash(link))
+                    throw new TypeError("Conflict member evidence link is invalid");
+                const linkJob = link.jobId === job.id ? job : await this.readJob(link.jobId);
+                if (!priorJobMatches(linkJob, episodeId))
+                    throw new TypeError("Conflict member prior job is not bound to the accepted policy");
+                const linkLease = await this.readLease(link.jobId);
+                if (!acceptedLeaseMatches(linkJob, linkLease))
+                    throw new TypeError("Conflict member prior job has no durable acceptance");
+                if (members.has(episodeId))
+                    currentJobEvidence = true;
+            }
+            return currentJobEvidence;
+        };
+        const validateManifest = async (manifest) => {
+            if (manifest.ownerHost !== this.ownerHost || manifest.processingPolicyId !== job.policyId || manifest.coordinationPolicyEpoch !== job.coordinationPolicyEpoch || manifest.coordinationPolicyHash !== job.coordinationPolicyHash || manifest.privacyEpoch !== job.privacyEpoch || manifest.expiresAt !== job.expiresAt || manifest.members.length < 2 || new Set(manifest.members).size !== manifest.members.length || manifest.id !== conflictManifestId(manifest.coordinationPolicyHash, manifest.stateKey, manifest.members) || manifest.contentHash !== canonicalRecordHash(manifest))
+                throw new TypeError("Conflict manifest members are invalid");
+            const observations = [];
+            let boundMember = false;
+            for (const memberId of manifest.members) {
+                const value = await this.#readCurated("curated_memory", memberId);
+                if (value === null || value.recordType !== "curated_memory")
+                    throw new TypeError("Conflict member is missing");
+                const member = value;
+                if (member.id !== memberId || member.id !== member.observationId || member.ownerHost !== this.ownerHost || member.processingPolicyId !== job.policyId || member.coordinationPolicyEpoch !== job.coordinationPolicyEpoch || member.coordinationPolicyHash !== job.coordinationPolicyHash || member.privacyEpoch !== job.privacyEpoch || member.expiresAt !== job.expiresAt || member.stateKey !== manifest.stateKey || member.createdAt !== member.eventAt || member.effectiveAt !== member.eventAt || member.contentHash !== canonicalRecordHash(member))
+                    throw new TypeError("Conflict member is not bound to the accepted policy");
+                if (await assertObservationEvidenceClosure(member))
+                    boundMember = true;
+                observations.push(member);
+            }
+            const aggregate = projectConflictAggregate(observations);
+            if (canonicalStringify(manifest.members) !== canonicalStringify(aggregate.members) || manifest.createdAt !== aggregate.createdAt)
+                throw new TypeError("Conflict manifest aggregate is invalid");
+            return { aggregate, boundMember };
+        };
+        if (record.recordType === "evidence_link") {
+            if (!members.has(record.targetId))
+                throw new TypeError("Evidence link is not bound to the accepted job membership");
+            const source = await this.#readCurated("curated_memory", record.sourceId);
+            if (source === null || source.ownerHost !== this.ownerHost || source.processingPolicyId !== job.policyId || source.coordinationPolicyEpoch !== job.coordinationPolicyEpoch || source.coordinationPolicyHash !== job.coordinationPolicyHash || source.privacyEpoch !== job.privacyEpoch)
+                throw new TypeError("Evidence link source is not bound to the accepted job");
+            if (record.jobId !== job.id) {
+                const priorJob = await this.readJob(record.jobId);
+                if (!priorJobMatches(priorJob, record.targetId))
+                    throw new TypeError("Evidence link prior job is not bound to the accepted policy");
+                const priorLease = await this.readLease(record.jobId);
+                if (!acceptedLeaseMatches(priorJob, priorLease))
+                    throw new TypeError("Evidence link prior job has no durable acceptance");
+            }
+        }
+        else if (record.recordType === "curated_memory") {
+            const sourceIds = record.sourceEpisodeIds ?? [];
+            if (sourceIds.length === 0 || sourceIds.some((id) => !members.has(id)))
+                throw new TypeError("Curated record source evidence is not bound to the accepted job membership");
+        }
+        else if (record.recordType === "curated_current") {
+            const sourceIds = record.sourceEpisodeIds ?? [];
+            if (sourceIds.length === 0)
+                throw new TypeError("Curated current source evidence is empty");
+            if (record.resolution === "resolved") {
+                if (sourceIds.some((id) => !members.has(id)))
+                    throw new TypeError("Resolved current source evidence is not bound to the accepted job membership");
+            }
+            else {
+                const manifestValue = await this.#readCurated("conflict_manifest", record.conflictManifestHash);
+                if (manifestValue === null || manifestValue.recordType !== "conflict_manifest")
+                    throw new TypeError("Conflict current manifest is missing");
+                const { aggregate, boundMember } = await validateManifest(manifestValue);
+                if (!boundMember || record.createdAt !== aggregate.createdAt || canonicalStringify(record.sourceEpisodeIds) !== canonicalStringify(aggregate.sourceEpisodeIds) || canonicalStringify(record.effectiveOrder) !== canonicalStringify(aggregate.effectiveOrder))
+                    throw new TypeError("Conflict current aggregate is not bound to the accepted job");
+            }
+        }
+        else if (record.recordType === "coverage") {
+            if (!members.has(record.episodeId) || record.id !== coverageId({ ownerHost: this.ownerHost, episodeId: record.episodeId, extractorRevision: record.extractorRevision, coordinationPolicyHash: record.coordinationPolicyHash, coordinationPolicyEpoch: record.coordinationPolicyEpoch, policyIntersectionId: job.policyId, privacyEpoch: record.privacyEpoch }))
+                throw new TypeError("Coverage is not bound to the accepted job membership");
+        }
+        else {
+            const { boundMember } = await validateManifest(record);
+            if (!boundMember)
+                throw new TypeError("Conflict manifest has no evidence from the accepted job");
+        }
     }
     // ---------------------------------------------------------------------------
     // Named SAFE high-level methods. The production class accepts ONLY the same
@@ -1262,11 +1693,58 @@ export class ProductionCoordinationStore {
     async createJob(input) {
         return createJobOnProtocol(this.#protocol, input);
     }
+    async completeJob(authority) {
+        return completeJobOnProtocol(this.#protocol, this, this.#authorityScope, authority);
+    }
     async writeProposal(authority, input) {
         return writeProposalOnProtocol(this.#protocol, this, this.#authorityScope, authority, input);
     }
-    async markCoverage(input) {
-        return markCoverageOnProtocol(this.#protocol, this, this.#authorityScope, input);
+    async markCoverage(authority, input) {
+        const job = await this.assertAcceptedAuthorityBase(authority);
+        const normalized = snapshotMarkCoverageInput(input);
+        const candidate = coverageRecordForInput(this, normalized);
+        await assertCoverageRecordBoundToJob(candidate, job, this.ownerHost);
+        return markCoverageOnProtocol(this.#protocol, this, this.#authorityScope, authority, normalized);
+    }
+    async readObservation(authority, id) {
+        const job = await this.assertAcceptedAuthorityBase(authority);
+        const record = await this.#readCurated("curated_memory", id);
+        return record !== null && record.recordType === "curated_memory" && record.ownerHost === this.ownerHost && record.coordinationPolicyEpoch === job.coordinationPolicyEpoch && record.coordinationPolicyHash === job.coordinationPolicyHash && record.privacyEpoch === job.privacyEpoch ? record : null;
+    }
+    async readCurrent(authority, id) {
+        const job = await this.assertAcceptedAuthorityBase(authority);
+        const record = await this.#readCurated("curated_current", id);
+        return record !== null && record.recordType === "curated_current" && record.ownerHost === this.ownerHost && record.coordinationPolicyEpoch === job.coordinationPolicyEpoch && record.coordinationPolicyHash === job.coordinationPolicyHash && record.privacyEpoch === job.privacyEpoch ? record : null;
+    }
+    async readConflictManifest(authority, id) {
+        const job = await this.assertAcceptedAuthorityBase(authority);
+        const record = await this.#readCurated("conflict_manifest", id);
+        return record !== null && record.recordType === "conflict_manifest" && record.ownerHost === this.ownerHost && record.coordinationPolicyEpoch === job.coordinationPolicyEpoch && record.coordinationPolicyHash === job.coordinationPolicyHash && record.privacyEpoch === job.privacyEpoch ? record : null;
+    }
+    async insertObservation(authority, input) {
+        const job = await this.assertAcceptedAuthorityBase(authority);
+        const record = ownedCuratedRecordSnapshot(input.record);
+        await this.assertCuratedRecordAgainstJob(record, job);
+        return insertCuratedOnProtocol(this.#protocol, this, this.#authorityScope, authority, { record });
+    }
+    async insertEvidenceLink(authority, input) {
+        const job = await this.assertAcceptedAuthorityBase(authority);
+        const record = ownedCuratedRecordSnapshot(input.record);
+        await this.assertCuratedRecordAgainstJob(record, job);
+        return insertCuratedOnProtocol(this.#protocol, this, this.#authorityScope, authority, { record });
+    }
+    async insertConflictManifest(authority, input) {
+        const job = await this.assertAcceptedAuthorityBase(authority);
+        const record = ownedCuratedRecordSnapshot(input.record);
+        await this.assertCuratedRecordAgainstJob(record, job);
+        return insertCuratedOnProtocol(this.#protocol, this, this.#authorityScope, authority, { record });
+    }
+    async upsertCuratedCurrent(authority, input) {
+        const job = await this.assertAcceptedAuthorityBase(authority);
+        const expectedVersion = input.expectedVersion;
+        const record = ownedCuratedRecordSnapshot(input.record);
+        await this.assertCuratedRecordAgainstJob(record, job);
+        return upsertCuratedCurrentOnProtocol(this.#protocol, this, this.#authorityScope, authority, { record, expectedVersion });
     }
     async createTombstone(input) {
         return createTombstoneOnProtocol(this.#protocol, this, this.#authorityScope, input);
@@ -1445,6 +1923,8 @@ function freshLease(store, input, control, jobPolicyId, jobDeadline) {
     return hashed(record);
 }
 function mintLeaseAuthority(target, scope, worker, claim, leaseMs, jobDeadline, maxClockSkewMs) {
+    if (claim.state === "completed")
+        throw new TypeError("Completed jobs cannot mint lease authority");
     const authority = new LeaseAuthority({ store: target, scope, worker, ownerHost: worker.host, nodeId: worker.nodeId, jobId: claim.jobId, leasePointIdValue: claim.id, ownerId: claim.ownerId, version: claim.version, fencingToken: claim.fencingToken, state: claim.state, acceptedProposalId: claim.acceptedProposalId, acceptedManifestHash: claim.acceptedManifestHash, contentHash: claim.contentHash, processingPolicyId: claim.processingPolicyId, coordinationPolicyHash: claim.coordinationPolicyHash, coordinationPolicyEpoch: claim.coordinationPolicyEpoch, privacyEpoch: claim.privacyEpoch, expiresAt: claim.expiresAt, leaseMs, jobDeadline, maxClockSkewMs }, LEASE_AUTHORITY_ISSUER);
     AUTHORITY_WORKERS.set(authority, worker);
     return authority;
@@ -1563,7 +2043,7 @@ async function claimLeaseOnProtocol(protocol, target, scope, worker, input) {
     return mintLeaseAuthority(target, scope, worker, finalClaim, worker.leaseMs, job.expiresAt, worker.maxClockSkewMs);
 }
 async function claimOrSteal(store, worker, input, job, current) {
-    if (current === null)
+    if (current === null || current.state === "completed")
         return null;
     if (current.ownerHost !== input.ownerHost || current.processingPolicyId !== job.policyId || current.coordinationPolicyEpoch !== input.policyEpoch || current.coordinationPolicyHash !== input.policyHash || current.privacyEpoch !== input.privacyEpoch)
         return null;
@@ -1811,6 +2291,11 @@ async function acceptLeaseAuthorityOnProtocol(protocol, target, scope, authority
     const tombstonesAfter = await protocol.readTombstones(job.membership);
     if (tombstonesAfter.length > 0)
         return null;
+    const finalJob = await protocol.readJob(input.jobId);
+    const finalProposal = await protocol.readProposal(proposal.id);
+    const finalTombstones = await protocol.readTombstones(job.membership);
+    if (finalJob === null || finalJob.contentHash !== job.contentHash || finalProposal === null || finalProposal.contentHash !== proposal.contentHash || finalTombstones.length > 0)
+        return null;
     const after = await protocol.readControl();
     if (after.state !== "active" || after.coordinationPolicyEpoch !== input.policyEpoch || after.coordinationPolicyHash !== input.policyHash || after.privacyEpoch !== input.privacyEpoch)
         return null;
@@ -1826,7 +2311,7 @@ async function acceptLeaseAuthorityOnProtocol(protocol, target, scope, authority
     }
     if (Date.parse(acceptedClaim.expiresAt) <= finalNow)
         return null;
-    if (jobExpired(job, finalNow, input.maxClockSkewMs))
+    if (jobExpired(finalJob, finalNow, input.maxClockSkewMs))
         return null;
     return accepted;
 }
@@ -1879,9 +2364,7 @@ async function createJobOnProtocol(protocol, input) {
     if (protocol.ownerHost !== ownerHost)
         throw new TypeError("Job store owner does not match the job owner");
     validateSortedMembership(membership);
-    const normalizedInput = { ownerHost, membership, policyIntersectionId, policyHash, policyEpoch, extractorRevision, privacyEpoch, createdAt };
-    if (expiresAt !== undefined)
-        normalizedInput.expiresAt = expiresAt;
+    const normalizedInput = { ownerHost, membership, policyIntersectionId, policyHash, policyEpoch, extractorRevision, privacyEpoch, createdAt, expiresAt };
     const id = jobIdFor(normalizedInput);
     const record = {
         ownerHost, schemaRevision: 1, createdAt, privacyEpoch,
@@ -1913,7 +2396,209 @@ export function proposalHashFor(input) {
     const policyIntersectionId = input.policyIntersectionId;
     return proposalContentHash({ ownerHost, jobId: jobIdValue, ownerId, membership, content, policyHash, policyEpoch, fencingToken, privacyEpoch, policyIntersectionId });
 }
-/** Immutable proposal output: bounded canonical membership + validated content; recomputed on readback. */
+/** @internal Raw-protocol terminal job completion; all derived effects are
+ * authoritatively derived from the accepted proposal and job membership. */
+async function completeJobOnProtocol(protocol, target, scope, authority) {
+    const no = (_reason) => false;
+    if (!LeaseAuthority.isValid(authority) || !authority.matchesStore(target) || !authority.matchesScope(scope) || authority.state !== "accepted")
+        throw new TypeError("Job completion requires a genuine accepted lease authority");
+    const job = await protocol.readJob(authority.jobId);
+    const initialClaim = await protocol.readLease(authority.jobId);
+    if (job === null || initialClaim === null || !authority.matchesClaim(initialClaim) || initialClaim.state !== "accepted" || initialClaim.acceptedProposalId === null || initialClaim.acceptedManifestHash === null)
+        return no("check-2");
+    const now = authority.now();
+    if (jobExpired(job, now, authority.maxClockSkewMs) || Date.parse(initialClaim.expiresAt) <= now || job.id !== authority.jobId || job.policyId !== authority.processingPolicyId || job.expiresAt !== null && Date.parse(initialClaim.expiresAt) > Date.parse(job.expiresAt))
+        return no("check-3");
+    const proposal = await protocol.readProposal(initialClaim.acceptedProposalId);
+    if (proposal === null || proposal.id !== initialClaim.acceptedProposalId || proposal.jobId !== job.id || proposal.ownerHost !== job.ownerHost || proposal.processingPolicyId !== job.policyId || proposal.coordinationPolicyEpoch !== job.coordinationPolicyEpoch || proposal.coordinationPolicyHash !== job.coordinationPolicyHash || proposal.privacyEpoch !== job.privacyEpoch || proposal.manifestHash !== initialClaim.acceptedManifestHash || proposal.expiresAt !== job.expiresAt || proposal.membership.length !== job.membership.length || proposal.membership.some((id, index) => id !== job.membership[index]))
+        return no("check-4");
+    const initialControl = await protocol.readControl();
+    const initialTombstones = await protocol.readTombstones(job.membership);
+    if (initialControl.ownerHost !== target.ownerHost || initialControl.state !== "active" || initialControl.coordinationPolicyEpoch !== authority.coordinationPolicyEpoch || initialControl.coordinationPolicyHash !== authority.coordinationPolicyHash || initialControl.privacyEpoch !== authority.privacyEpoch || initialTombstones.length > 0)
+        return no("check-4-barrier");
+    const episodes = await protocol.readEpisodes(job.membership);
+    if (episodes.length !== job.membership.length)
+        return no("check-5");
+    const episodeMap = new Map(episodes.map((episode) => [episode.id, episode]));
+    if (job.membership.length === 0 || episodeMap.get(job.membership[0])?.createdAt !== job.createdAt)
+        return no("check-5-created-at");
+    let result;
+    try {
+        const proposalEnvelope = parseCurationProposalEnvelope(proposal.content);
+        if (proposalEnvelope === null || !provenanceMatches(proposalEnvelope.provenance, { host: target.ownerHost, policyId: job.policyId, policyHash: job.policyId, policyEpoch: job.coordinationPolicyEpoch, promptRevision: CURATION_PROMPT_REVISION }) || proposal.createdAt !== proposalEnvelope.provenance.invokedAt)
+            return no("check-6");
+        result = assertPersistableCurationResult(validateCurationResult({ items: proposalEnvelope.items }, { directUserEpisodeIds: new Set(episodes.filter((episode) => episode.eventKind === "user").map((episode) => episode.id)), knownEpisodeIds: new Set(episodes.map((episode) => episode.id)) }));
+    }
+    catch {
+        return no("check-6");
+    }
+    const projections = result.items.map((item) => sharedProjectCurationItem(target.ownerHost, job.coordinationPolicyHash, job.coordinationPolicyEpoch, item, episodeMap));
+    if (new Set(projections.map((projection) => projection.observationId)).size !== projections.length)
+        return no("check-7");
+    const sameEnvelope = (record) => record.ownerHost === target.ownerHost && record.processingPolicyId === job.policyId && record.coordinationPolicyEpoch === job.coordinationPolicyEpoch && record.coordinationPolicyHash === job.coordinationPolicyHash && record.privacyEpoch === job.privacyEpoch && record.expiresAt === job.expiresAt && record.contentHash === canonicalRecordHash(record);
+    const memberSet = new Set(job.membership);
+    const observations = new Map();
+    const links = new Map();
+    const currents = new Map();
+    const conflicts = new Map();
+    const derivedTargets = [];
+    for (let projectionIndex = 0; projectionIndex < projections.length; projectionIndex += 1) {
+        const projection = projections[projectionIndex];
+        const item = result.items[projectionIndex];
+        const record = await protocol.readCurated("curated_memory", projection.observationId);
+        if (record === null || record.recordType !== "curated_memory" || record.id !== projection.observationId || !sameEnvelope(record) || record.createdAt !== projection.primary.eventAt || record.contentId !== projection.contentId || record.observationId !== projection.observationId || record.stateKey !== projection.stateKey || record.eventAt !== projection.primary.eventAt || record.effectiveAt !== projection.primary.eventAt || record.primaryEvidenceEpisodeId !== projection.primary.id || canonicalStringify(record.effectiveOrder) !== canonicalStringify(projection.effectiveOrder) || record.category !== item.category || record.scope !== item.scope || record.subject !== item.subject || record.predicate !== item.predicate || record.text !== projection.text || canonicalStringify(record.sourceEpisodeIds ?? []) !== canonicalStringify(projection.evidence.map((episode) => episode.id).sort()) || canonicalStringify(record.provenance ?? []) !== canonicalStringify(projection.evidence.map((episode) => episode.id).sort()) || !Array.isArray(record.vector) || record.vector.length !== 1024 || !record.vector.every((value) => typeof value === "number" && Number.isFinite(value)))
+            return no("observation");
+        if (Object.prototype.hasOwnProperty.call(record, "value") !== (item.value !== undefined) || item.value !== undefined && canonicalStringify(record.value) !== canonicalStringify(item.value) || record.confidence !== item.confidence)
+            return no("observation-fields");
+        observations.set(record.id, record);
+        derivedTargets.push(record.id, record.contentId, projection.stateKey);
+        for (const episode of projection.evidence) {
+            const linkId = evidenceLinkId(record.id, episode.id, job.extractorRevision);
+            const link = await protocol.readCurated("evidence_link", linkId);
+            if (link === null || link.recordType !== "evidence_link" || link.id !== linkId || !sameEnvelope(link) || link.createdAt !== record.createdAt || link.sourceId !== record.id || link.targetId !== episode.id || link.extractorRevision !== job.extractorRevision)
+                return no("evidence-link");
+            if (link.jobId !== job.id) {
+                const prior = await protocol.readJob(link.jobId);
+                const priorLease = prior === null ? null : await protocol.readLease(prior.id);
+                if (prior === null || priorLease === null || (priorLease.state !== "accepted" && priorLease.state !== "released" && priorLease.state !== "completed") || priorLease.acceptedProposalId === null || priorLease.acceptedManifestHash === null || !claimIdentityMatchesJob(priorLease, prior) || prior.ownerHost !== target.ownerHost || prior.policyId !== job.policyId || prior.policyHash !== job.policyHash || prior.policyEpoch !== job.policyEpoch || prior.privacyEpoch !== job.privacyEpoch || prior.extractorRevision !== job.extractorRevision || prior.expiresAt !== job.expiresAt || !prior.membership.includes(link.targetId))
+                    return no("evidence-prior");
+            }
+            links.set(link.id, link);
+            derivedTargets.push(link.sourceId, link.targetId);
+        }
+        const current = await protocol.readCurated("curated_current", projection.currentId);
+        if (current === null || current.recordType !== "curated_current" || current.id !== projection.currentId || current.ownerHost !== target.ownerHost || current.coordinationPolicyEpoch !== job.coordinationPolicyEpoch || current.coordinationPolicyHash !== job.coordinationPolicyHash || current.privacyEpoch !== job.privacyEpoch || current.stateKey !== projection.stateKey || (current.sourceEpisodeIds ?? []).length === 0 || current.contentHash !== canonicalRecordHash(current))
+            return no("current-envelope");
+        derivedTargets.push(current.stateKey);
+        if (current.resolution === "resolved") {
+            derivedTargets.push(current.contentId, current.observationId);
+            if (!current.contentId || !current.observationId || !Array.isArray(current.vector) || current.vector.length !== 1024 || !current.vector.every((value) => typeof value === "number" && Number.isFinite(value)))
+                return no("current-vector");
+            const pointedValue = await protocol.readCurated("curated_memory", current.observationId);
+            if (pointedValue === null || pointedValue.recordType !== "curated_memory")
+                return no("current-observation");
+            const pointed = pointedValue;
+            if (pointed.ownerHost !== target.ownerHost || pointed.processingPolicyId !== current.processingPolicyId || pointed.expiresAt !== current.expiresAt || current.createdAt !== pointed.eventAt || pointed.contentHash !== canonicalRecordHash(pointed) || pointed.coordinationPolicyEpoch !== job.coordinationPolicyEpoch || pointed.coordinationPolicyHash !== job.coordinationPolicyHash || pointed.privacyEpoch !== job.privacyEpoch || pointed.stateKey !== projection.stateKey || pointed.contentId !== current.contentId || current.effectiveOrder === undefined || canonicalStringify(current.effectiveOrder) !== canonicalStringify(pointed.effectiveOrder) || current.text !== pointed.text || canonicalStringify(current.sourceEpisodeIds ?? []) !== canonicalStringify(pointed.sourceEpisodeIds ?? []) || pointed.provenance === undefined || canonicalStringify(pointed.provenance) !== canonicalStringify(pointed.sourceEpisodeIds ?? []) || current.createdAt !== pointed.eventAt || !Array.isArray(pointed.vector) || pointed.vector.length !== 1024 || pointed.vector.some((value, index) => current.vector[index] !== value))
+                return no("current-pointed");
+            for (const episodeId of pointed.sourceEpisodeIds ?? []) {
+                const linkId = evidenceLinkId(pointed.id, episodeId, job.extractorRevision);
+                const linkValue = await protocol.readCurated("evidence_link", linkId);
+                if (linkValue === null || linkValue.recordType !== "evidence_link")
+                    return no("current-pointed-link");
+                const link = linkValue;
+                if (link.id !== linkId || link.ownerHost !== target.ownerHost || link.processingPolicyId !== pointed.processingPolicyId || link.expiresAt !== pointed.expiresAt || link.coordinationPolicyEpoch !== job.coordinationPolicyEpoch || link.coordinationPolicyHash !== job.coordinationPolicyHash || link.privacyEpoch !== job.privacyEpoch || link.createdAt !== pointed.createdAt || link.sourceId !== pointed.id || link.targetId !== episodeId || link.extractorRevision !== job.extractorRevision || link.contentHash !== canonicalRecordHash(link))
+                    return no("current-pointed-link-envelope");
+                const linkJob = link.jobId === job.id ? job : await protocol.readJob(link.jobId);
+                const linkLease = linkJob === null ? null : link.jobId === job.id ? initialClaim : await protocol.readLease(linkJob.id);
+                if (linkJob === null || linkLease === null || (linkLease.state !== "accepted" && linkLease.state !== "released" && linkLease.state !== "completed") || linkLease.acceptedProposalId === null || linkLease.acceptedManifestHash === null || !claimIdentityMatchesJob(linkLease, linkJob) || linkJob.ownerHost !== target.ownerHost || linkJob.policyId !== pointed.processingPolicyId || linkJob.policyHash !== job.policyHash || linkJob.policyEpoch !== job.policyEpoch || linkJob.privacyEpoch !== job.privacyEpoch || linkJob.extractorRevision !== job.extractorRevision || linkJob.expiresAt !== pointed.expiresAt || !linkJob.membership.includes(episodeId))
+                    return no("current-pointed-link-job");
+                derivedTargets.push(link.sourceId, link.targetId);
+            }
+            // A cross-processing-policy current is admissible only when it proves a
+            // strictly later canonical observation. Equal/within-skew cannot silently
+            // migrate the envelope, and an older job can never rewind the winner.
+            const orderComparison = compareProjectionOrders(pointed.effectiveOrder, projection.effectiveOrder, authority.maxClockSkewMs);
+            const crossPolicyCurrent = current.processingPolicyId !== job.policyId || current.expiresAt !== job.expiresAt;
+            if (crossPolicyCurrent) {
+                if (orderComparison !== "after")
+                    return no("current-cross-policy");
+            }
+            else if (current.observationId !== projection.observationId) {
+                if (pointed.contentId === projection.contentId) {
+                    if (orderComparison === "before")
+                        return no("current-rewind");
+                }
+                else if (orderComparison !== "after")
+                    return no("current-rewind");
+            }
+        }
+        else {
+            if (current.processingPolicyId !== job.policyId || current.expiresAt !== job.expiresAt || current.conflictManifestHash === undefined || current.vector !== undefined)
+                return no("conflict-current");
+            const manifestValue = await protocol.readCurated("conflict_manifest", current.conflictManifestHash);
+            if (manifestValue === null || manifestValue.recordType !== "conflict_manifest")
+                return no("conflict-manifest");
+            const manifest = manifestValue;
+            if (manifest.ownerHost !== target.ownerHost || manifest.contentHash !== canonicalRecordHash(manifest) || manifest.processingPolicyId !== job.policyId || manifest.expiresAt !== job.expiresAt || manifest.coordinationPolicyEpoch !== current.coordinationPolicyEpoch || manifest.coordinationPolicyHash !== current.coordinationPolicyHash || manifest.privacyEpoch !== current.privacyEpoch || manifest.stateKey !== projection.stateKey || manifest.members.length < 2 || current.conflictManifestHash !== manifest.id)
+                return no("conflict-membership");
+            const conflictMembers = [];
+            derivedTargets.push(manifest.stateKey, ...manifest.members);
+            for (const memberId of manifest.members) {
+                const memberValue = await protocol.readCurated("curated_memory", memberId);
+                if (memberValue === null || memberValue.recordType !== "curated_memory")
+                    return no("conflict-member");
+                const member = memberValue;
+                if (member.id !== member.observationId || member.createdAt !== member.eventAt || member.effectiveAt !== member.eventAt || member.contentHash !== canonicalRecordHash(member) || member.sourceEpisodeIds === undefined || member.provenance === undefined || canonicalStringify(member.sourceEpisodeIds) !== canonicalStringify([...member.sourceEpisodeIds].sort()) || canonicalStringify(member.provenance) !== canonicalStringify(member.sourceEpisodeIds) || member.ownerHost !== target.ownerHost || member.processingPolicyId !== job.policyId || member.expiresAt !== job.expiresAt || member.coordinationPolicyEpoch !== job.coordinationPolicyEpoch || member.coordinationPolicyHash !== job.coordinationPolicyHash || member.privacyEpoch !== job.privacyEpoch || member.stateKey !== projection.stateKey || member.sourceEpisodeIds.length === 0 || !Array.isArray(member.vector) || member.vector.length !== 1024 || !member.vector.every((value) => typeof value === "number" && Number.isFinite(value)))
+                    return no("conflict-member-envelope");
+                for (const episodeId of member.sourceEpisodeIds) {
+                    const linkId = evidenceLinkId(member.id, episodeId, job.extractorRevision);
+                    const linkValue = await protocol.readCurated("evidence_link", linkId);
+                    if (linkValue === null || linkValue.recordType !== "evidence_link")
+                        return no("conflict-member-link");
+                    const link = linkValue;
+                    if (link.id !== linkId || link.ownerHost !== target.ownerHost || link.processingPolicyId !== job.policyId || link.expiresAt !== job.expiresAt || link.coordinationPolicyEpoch !== job.coordinationPolicyEpoch || link.coordinationPolicyHash !== job.coordinationPolicyHash || link.privacyEpoch !== job.privacyEpoch || link.createdAt !== member.createdAt || link.sourceId !== member.id || link.targetId !== episodeId || link.extractorRevision !== job.extractorRevision || link.contentHash !== canonicalRecordHash(link))
+                        return no("conflict-member-link-envelope");
+                    const linkJob = link.jobId === job.id ? job : await protocol.readJob(link.jobId);
+                    const linkLease = linkJob === null ? null : link.jobId === job.id ? initialClaim : await protocol.readLease(linkJob.id);
+                    if (linkJob === null || linkLease === null || (linkLease.state !== "accepted" && linkLease.state !== "released" && linkLease.state !== "completed") || linkLease.acceptedProposalId === null || linkLease.acceptedManifestHash === null || !claimIdentityMatchesJob(linkLease, linkJob) || linkJob.ownerHost !== target.ownerHost || linkJob.policyId !== job.policyId || linkJob.policyHash !== job.policyHash || linkJob.policyEpoch !== job.policyEpoch || linkJob.privacyEpoch !== job.privacyEpoch || linkJob.extractorRevision !== job.extractorRevision || linkJob.expiresAt !== job.expiresAt || !linkJob.membership.includes(episodeId))
+                        return no("conflict-member-link-job");
+                    derivedTargets.push(link.sourceId, link.targetId);
+                }
+                conflictMembers.push(member);
+            }
+            let aggregate;
+            try {
+                aggregate = projectConflictAggregate(conflictMembers);
+            }
+            catch {
+                return no("conflict-aggregate");
+            }
+            if (canonicalStringify(manifest.members) !== canonicalStringify(aggregate.members) || manifest.id !== conflictManifestId(manifest.coordinationPolicyHash, manifest.stateKey, aggregate.members) || manifest.createdAt !== aggregate.createdAt || canonicalStringify(current.sourceEpisodeIds ?? []) !== canonicalStringify(aggregate.sourceEpisodeIds) || canonicalStringify(current.effectiveOrder) !== canonicalStringify(aggregate.effectiveOrder) || current.createdAt !== aggregate.createdAt || !aggregate.representatives.some((member) => member.contentId === projection.contentId))
+                return no("conflict-projection");
+            conflicts.set(manifest.id, manifest);
+        }
+        currents.set(current.id, current);
+    }
+    const expectedCoverage = job.membership.map((episodeId) => coverageId({ ownerHost: target.ownerHost, episodeId, extractorRevision: job.extractorRevision, coordinationPolicyHash: job.coordinationPolicyHash, coordinationPolicyEpoch: job.coordinationPolicyEpoch, policyIntersectionId: job.policyId, privacyEpoch: job.privacyEpoch }));
+    const coverage = await protocol.readCoverage(expectedCoverage);
+    if (coverage.length !== expectedCoverage.length || new Set(coverage.map((record) => record.id)).size !== coverage.length || coverage.some((record) => record.ownerHost !== target.ownerHost || !expectedCoverage.includes(record.id) || !memberSet.has(record.episodeId) || record.processingPolicyId !== job.policyId || record.coordinationPolicyEpoch !== job.coordinationPolicyEpoch || record.coordinationPolicyHash !== job.coordinationPolicyHash || record.privacyEpoch !== job.privacyEpoch || record.expiresAt !== null || record.extractorRevision !== job.extractorRevision || record.contentHash !== canonicalRecordHash(record)))
+        return no("check-19");
+    const coverageEpisodeMap = new Map(episodes.map((episode) => [episode.id, episode]));
+    if (coverage.some((record) => {
+        const episode = coverageEpisodeMap.get(record.episodeId);
+        return episode === undefined || episode.createdAt !== record.createdAt;
+    }))
+        return no("check-19-created-at");
+    const membershipSet = new Set(job.membership);
+    const mutationTargets = [...new Set(derivedTargets)].filter((target) => !membershipSet.has(target)).sort();
+    if (mutationTargets.length > MAX_COMPLETION_DERIVED_TARGETS)
+        return no("check-19-derived-target-cap");
+    const finalJob = await protocol.readJob(job.id);
+    const finalProposal = await protocol.readProposal(proposal.id);
+    const finalTombstones = await protocol.readTombstones(job.membership);
+    const finalDerivedTombstones = mutationTargets.length === 0 ? [] : await readTombstoneChunks(protocol, mutationTargets);
+    const finalControl = await protocol.readControl();
+    const finalClaim = await protocol.readLease(job.id);
+    const finalNow = authority.now();
+    if (finalJob === null || finalProposal === null || canonicalStringify(finalJob) !== canonicalStringify(job) || canonicalStringify(finalProposal) !== canonicalStringify(proposal) || canonicalStringify(finalControl) !== canonicalStringify(initialControl) || canonicalStringify(finalTombstones) !== canonicalStringify(initialTombstones) || finalTombstones.length > 0 || finalDerivedTombstones.length > 0 || finalControl.state !== "active" || finalControl.coordinationPolicyEpoch !== authority.coordinationPolicyEpoch || finalControl.coordinationPolicyHash !== authority.coordinationPolicyHash || finalControl.privacyEpoch !== authority.privacyEpoch || finalClaim === null || !authority.matchesClaim(finalClaim) || canonicalStringify(finalClaim) !== canonicalStringify(initialClaim) || finalClaim.state !== "accepted" || Date.parse(finalClaim.expiresAt) <= finalNow || jobExpired(finalJob, finalNow, authority.maxClockSkewMs))
+        return no("check-20");
+    const next = hashed({ ...finalClaim, version: finalClaim.version + 1, state: "completed" });
+    const won = await protocol.casLease({ jobId: job.id, expectedVersion: finalClaim.version, expectedFencingToken: finalClaim.fencingToken, expectedPolicyEpoch: finalClaim.coordinationPolicyEpoch, expectedPolicyHash: finalClaim.coordinationPolicyHash, expectedPrivacyEpoch: finalClaim.privacyEpoch, expectedState: "accepted", expectedOwner: finalClaim.ownerId, expectedAcceptedProposalId: finalClaim.acceptedProposalId, expectedAcceptedManifestHash: finalClaim.acceptedManifestHash, expectedProcessingPolicyId: finalClaim.processingPolicyId, expectedCreatedAt: finalClaim.createdAt, expectedContentHash: finalClaim.contentHash, expiresAfter: finalNow, next });
+    if (!won)
+        return no("check-21");
+    const reread = await protocol.readLease(job.id);
+    if (reread === null || canonicalStringify(reread) !== canonicalStringify(next))
+        return no("check-22");
+    const afterJob = await protocol.readJob(job.id);
+    const afterProposal = await protocol.readProposal(proposal.id);
+    const afterCoverage = await protocol.readCoverage(expectedCoverage);
+    const afterControl = await protocol.readControl();
+    const afterTombstones = await protocol.readTombstones(job.membership);
+    const afterDerivedTombstones = mutationTargets.length === 0 ? [] : await readTombstoneChunks(protocol, mutationTargets);
+    const afterClaim = await protocol.readLease(job.id);
+    const afterNow = authority.now();
+    return afterJob !== null && canonicalStringify(afterJob) === canonicalStringify(finalJob) && afterProposal !== null && canonicalStringify(afterProposal) === canonicalStringify(finalProposal) && canonicalStringify(afterCoverage) === canonicalStringify(coverage) && afterClaim !== null && canonicalStringify(afterClaim) === canonicalStringify(next) && canonicalStringify(afterControl) === canonicalStringify(finalControl) && afterControl.state === "active" && afterTombstones.length === 0 && afterDerivedTombstones.length === 0 && Date.parse(afterClaim.expiresAt) > afterNow && !jobExpired(afterJob, afterNow, authority.maxClockSkewMs);
+}
 /** @internal Raw-protocol proposal write; the production class routes through its named safe method. */
 /** @internal */
 async function writeProposalOnProtocol(protocol, target, scope, authority, input) {
@@ -2041,6 +2726,209 @@ async function writeProposalOnProtocol(protocol, target, scope, authority, input
         throw new TypeError("Proposal job is expired after insert");
     return reread;
 }
+/** Owned canonical clone of a caller-supplied curated record: canonicalStringify
+ * rejects accessors/sparse arrays/symbols/non-plain/non-finite values; the
+ * JSON.parse clone is the ONLY object validated and persisted (a malicious
+ * accessor can never swap validated and persisted values). */
+function ownedCuratedRecordSnapshot(value) {
+    let serialized;
+    try {
+        serialized = canonicalStringify(value);
+    }
+    catch {
+        throw new TypeError("Curated record is not canonical JSON");
+    }
+    let clone;
+    try {
+        clone = JSON.parse(serialized);
+    }
+    catch {
+        throw new TypeError("Curated record is invalid");
+    }
+    const record = parseMemoryRecord(clone);
+    if (record.contentHash !== canonicalRecordHash(record))
+        throw new TypeError("Curated record canonical hash mismatch");
+    return record;
+}
+/** Evidence links are immutable by deterministic (observation, episode,
+ * extractor) identity. An overlapping accepted job may observe an existing
+ * valid link whose provenance jobId differs; all other fields must remain
+ * byte-identical, and the prior job must be independently validated. */
+function equivalentEvidenceLinkExceptJob(left, right) {
+    if (left.recordType !== "evidence_link" || right.recordType !== "evidence_link")
+        return false;
+    const normalizedLeft = { ...left, jobId: right.jobId };
+    return deepEqual(normalizedLeft, right);
+}
+/** Derived tombstone targets that can invalidate a curated mutation without
+ * tombstoning one of the source episodes. This is computed only from an owned,
+ * validated record snapshot; callers cannot swap a target between validation
+ * and the barrier read. */
+function curatedMutationTombstoneTargets(record) {
+    const targets = [];
+    switch (record.recordType) {
+        case "curated_memory":
+            targets.push(record.id, record.contentId);
+            if (record.stateKey !== undefined)
+                targets.push(record.stateKey);
+            break;
+        case "evidence_link":
+            // targetId is normally a source episode in the accepted membership; the
+            // source observation is the additional derived target that can be
+            // forgotten independently of episode membership.
+            targets.push(record.sourceId, record.targetId);
+            break;
+        case "conflict_manifest":
+            targets.push(record.stateKey, ...record.members);
+            break;
+        case "curated_current":
+            targets.push(record.stateKey);
+            if (record.resolution === "resolved")
+                targets.push(record.contentId, record.observationId);
+            else
+                targets.push(record.conflictManifestHash);
+            break;
+    }
+    const unique = [...new Set(targets)].sort();
+    if (unique.length > 4096 || unique.some((target) => typeof target !== "string" || target.length === 0 || target.length > 512))
+        throw new TypeError("Curated derived tombstone targets are invalid");
+    return Object.freeze(unique);
+}
+async function readTombstoneChunks(protocol, ids) {
+    const found = [];
+    for (let index = 0; index < ids.length; index += 1024)
+        found.push(...await protocol.readTombstones(ids.slice(index, index + 1024)));
+    return found;
+}
+async function readMutationTombstones(protocol, membership, derivedTargets) {
+    const membershipTombstones = await protocol.readTombstones(membership);
+    const membershipSet = new Set(membership);
+    const disjointDerived = [...new Set(derivedTargets)].filter((target) => !membershipSet.has(target)).sort();
+    const derivedTombstones = disjointDerived.length === 0 ? [] : await readTombstoneChunks(protocol, disjointDerived);
+    return { membership: membershipTombstones, derived: derivedTombstones };
+}
+/** Fresh accepted authority barrier used immediately before and after every
+ * curated mutation. It deliberately rereads all liveness inputs in-kernel.
+ * Both source membership and mutation-specific derived targets are checked
+ * before the kernel write and reread after the slowest liveness reads. */
+async function assertFreshAcceptedBarrier(protocol, authority, membership, derivedTargets = []) {
+    const derived = [...new Set(derivedTargets)].sort();
+    if (derived.length > 4096 || derived.some((target) => typeof target !== "string" || target.length === 0 || target.length > 512))
+        throw new TypeError("Curated derived tombstone targets are invalid");
+    const jobMatchesAuthority = (candidate) => candidate !== null && candidate.id === authority.jobId && candidate.ownerHost === authority.ownerHost && candidate.policyId === authority.processingPolicyId && candidate.policyHash === authority.coordinationPolicyHash && candidate.policyEpoch === authority.coordinationPolicyEpoch && candidate.coordinationPolicyHash === authority.coordinationPolicyHash && candidate.coordinationPolicyEpoch === authority.coordinationPolicyEpoch && candidate.privacyEpoch === authority.privacyEpoch && candidate.membership.length === membership.length && candidate.membership.every((id, index) => id === membership[index]);
+    const controlMatches = (control) => control.ownerHost === authority.ownerHost && control.state === "active" && control.coordinationPolicyEpoch === authority.coordinationPolicyEpoch && control.coordinationPolicyHash === authority.coordinationPolicyHash && control.privacyEpoch === authority.privacyEpoch;
+    const proposalMatches = (proposal, job, claim) => proposal !== null && claim.acceptedProposalId !== null && claim.acceptedManifestHash !== null && proposal.id === claim.acceptedProposalId && proposal.jobId === job.id && proposal.ownerHost === job.ownerHost && proposal.processingPolicyId === job.policyId && proposal.coordinationPolicyEpoch === job.coordinationPolicyEpoch && proposal.coordinationPolicyHash === job.coordinationPolicyHash && proposal.privacyEpoch === job.privacyEpoch && proposal.expiresAt === job.expiresAt && proposal.manifestHash === claim.acceptedManifestHash && proposal.membership.length === job.membership.length && proposal.membership.every((id, index) => id === job.membership[index]);
+    const control = await protocol.readControl();
+    const job = await protocol.readJob(authority.jobId);
+    const claim = await protocol.readLease(authority.jobId);
+    if (!jobMatchesAuthority(job) || claim === null || claim.acceptedProposalId === null)
+        throw new TypeError("Curated write claim barrier failed");
+    const proposal = await protocol.readProposal(claim.acceptedProposalId);
+    const firstTombstones = await readMutationTombstones(protocol, membership, derived);
+    const now = authority.now();
+    if (!controlMatches(control) || !proposalMatches(proposal, job, claim) || !authority.matchesClaim(claim) || claim.state !== "accepted" || Date.parse(claim.expiresAt) <= now || jobExpired(job, now, authority.maxClockSkewMs) || firstTombstones.membership.length > 0 || firstTombstones.derived.length > 0)
+        throw new TypeError("Curated write first barrier failed");
+    const finalControl = await protocol.readControl();
+    const finalJob = await protocol.readJob(authority.jobId);
+    const finalProposal = await protocol.readProposal(claim.acceptedProposalId);
+    const finalClaim = await protocol.readLease(authority.jobId);
+    const finalTombstones = await readMutationTombstones(protocol, membership, derived);
+    const finalNow = authority.now();
+    if (!jobMatchesAuthority(finalJob) || finalClaim === null || !controlMatches(finalControl) || !proposalMatches(finalProposal, finalJob, finalClaim) || !authority.matchesClaim(finalClaim) || finalClaim.state !== "accepted" || Date.parse(finalClaim.expiresAt) <= finalNow || jobExpired(finalJob, finalNow, authority.maxClockSkewMs) || finalTombstones.membership.length > 0 || finalTombstones.derived.length > 0)
+        throw new TypeError("Curated write final barrier failed");
+    if (canonicalStringify(finalControl) !== canonicalStringify(control) || canonicalStringify(finalJob) !== canonicalStringify(job) || canonicalStringify(finalProposal) !== canonicalStringify(proposal) || canonicalStringify(finalClaim) !== canonicalStringify(claim) || canonicalStringify(finalTombstones) !== canonicalStringify(firstTombstones))
+        throw new TypeError("Curated write authority changed during barrier");
+}
+/** @internal Raw-protocol immutable curated write; the production class routes through its named safe method. */
+async function insertCuratedOnProtocol(protocol, target, scope, authority, input) {
+    // GLOBAL RULE: snapshot the caller record EXACTLY ONCE into an owned
+    // canonical clone; only the clone is validated and persisted.
+    const record = ownedCuratedRecordSnapshot(input.record);
+    const derivedTargets = curatedMutationTombstoneTargets(record);
+    const job = await protocol.readJob(authority.jobId);
+    if (job === null)
+        throw new TypeError("Curated write job is missing");
+    await assertFreshAcceptedBarrier(protocol, authority, job.membership, derivedTargets);
+    await protocol.insertCurated(record);
+    const reread = await protocol.readCurated(record.recordType, record.id);
+    let exactReadback = reread !== null && reread.id === record.id && reread.contentHash === record.contentHash && canonicalRecordHash(reread) === reread.contentHash && deepEqual(reread, record);
+    if (!exactReadback && reread !== null && record.recordType === "evidence_link" && reread.recordType === "evidence_link" && equivalentEvidenceLinkExceptJob(reread, record)) {
+        const priorJob = await protocol.readJob(reread.jobId);
+        const priorLease = priorJob === null ? null : await protocol.readLease(priorJob.id);
+        exactReadback = priorJob !== null && priorLease !== null && (priorLease.state === "accepted" || priorLease.state === "released" || priorLease.state === "completed") && priorLease.acceptedProposalId !== null && priorLease.acceptedManifestHash !== null && claimIdentityMatchesJob(priorLease, priorJob) && priorJob.ownerHost === target.ownerHost && priorJob.policyId === record.processingPolicyId && priorJob.policyHash === record.coordinationPolicyHash && priorJob.policyEpoch === record.coordinationPolicyEpoch && priorJob.privacyEpoch === record.privacyEpoch && priorJob.extractorRevision === record.extractorRevision && priorJob.expiresAt === record.expiresAt && priorJob.membership.includes(record.targetId);
+    }
+    if (!exactReadback)
+        throw new TypeError("Curated record did not read back exactly");
+    if (record.recordType === "curated_memory") {
+        const intendedVector = record.vector;
+        const actualVector = reread.vector;
+        if (!Array.isArray(intendedVector) || intendedVector.length !== 1024 || !Array.isArray(actualVector) || actualVector.length !== 1024 || actualVector.some((value, index) => value !== intendedVector[index]))
+            throw new TypeError("Curated vector did not read back exactly");
+    }
+    else if (reread.vector !== undefined)
+        throw new TypeError("Unexpected curated vector read back");
+    await assertFreshAcceptedBarrier(protocol, authority, job.membership, derivedTargets);
+    return reread;
+}
+/** @internal Raw-protocol OCC current upsert; the production class routes through its named safe method. */
+async function upsertCuratedCurrentOnProtocol(protocol, target, scope, authority, input) {
+    // GLOBAL RULE: snapshot the caller input EXACTLY ONCE; only the owned
+    // canonical clone is validated, CASed and persisted.
+    const expectedVersion = input.expectedVersion;
+    const record = ownedCuratedRecordSnapshot(input.record);
+    if (record.recordType !== "curated_current")
+        throw new TypeError("Curated current record is invalid");
+    let derivedTargets = [...curatedMutationTombstoneTargets(record)];
+    if (record.resolution === "conflict") {
+        const manifestValue = await protocol.readCurated("conflict_manifest", record.conflictManifestHash);
+        if (manifestValue === null || manifestValue.recordType !== "conflict_manifest" || manifestValue.id !== record.conflictManifestHash || manifestValue.stateKey !== record.stateKey || manifestValue.contentHash !== canonicalRecordHash(manifestValue))
+            throw new TypeError("Curated conflict current manifest is invalid");
+        derivedTargets = [...new Set([...derivedTargets, ...manifestValue.members])].sort();
+        if (derivedTargets.length > 4096)
+            throw new TypeError("Curated derived tombstone targets are invalid");
+    }
+    const job = await protocol.readJob(authority.jobId);
+    if (job === null)
+        throw new TypeError("Curated current job is missing");
+    await assertFreshAcceptedBarrier(protocol, authority, job.membership, derivedTargets);
+    if (expectedVersion === null) {
+        await protocol.insertCurated(record);
+        const reread = await protocol.readCurated("curated_current", record.id);
+        if (reread === null || reread.id !== record.id || reread.contentHash !== record.contentHash || canonicalRecordHash(reread) !== reread.contentHash || !deepEqual(reread, record))
+            throw new TypeError("Curated current did not read back exactly");
+        if (record.resolution === "resolved" && (!Array.isArray(record.vector) || !Array.isArray(reread.vector) || reread.vector.some((value, index) => value !== record.vector[index])))
+            throw new TypeError("Curated current vector did not read back exactly");
+        if (record.resolution === "conflict" && reread.vector !== undefined)
+            throw new TypeError("Unexpected conflict current vector");
+        await assertFreshAcceptedBarrier(protocol, authority, job.membership, derivedTargets);
+        return reread;
+    }
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1)
+        throw new TypeError("Curated current expected version is invalid");
+    const current = await protocol.readCurated("curated_current", record.id);
+    if (current === null || current.recordType !== "curated_current" || current.version !== expectedVersion)
+        return null;
+    const precondition = {
+        kind: "current-cas", ownerHost: target.ownerHost, recordType: "curated_current", id: record.id,
+        expectedVersion, expectedEpoch: current.coordinationPolicyEpoch, expectedPolicyHash: current.coordinationPolicyHash, expectedProcessingPolicyId: current.processingPolicyId, expectedExpiresAt: current.expiresAt,
+        expectedPrivacyEpoch: current.privacyEpoch, expectedResolution: current.resolution,
+        expectedContentId: current.resolution === "resolved" ? current.contentId ?? null : null,
+        expectedConflictManifestHash: current.resolution === "conflict" ? current.conflictManifestHash ?? null : null,
+        expectedContentHash: current.contentHash,
+    };
+    const applied = await protocol.casCuratedCurrent({ id: physicalPointId("curated_current", record.id), precondition, next: record });
+    if (!applied)
+        return null;
+    const reread = await protocol.readCurated("curated_current", record.id);
+    if (reread === null || reread.id !== record.id || reread.contentHash !== record.contentHash || canonicalRecordHash(reread) !== reread.contentHash || !deepEqual(reread, record))
+        return null;
+    if (record.resolution === "resolved" && (!Array.isArray(record.vector) || !Array.isArray(reread.vector) || reread.vector.some((value, index) => value !== record.vector[index])))
+        return null;
+    if (record.resolution === "conflict" && reread.vector !== undefined)
+        return null;
+    await assertFreshAcceptedBarrier(protocol, authority, job.membership, derivedTargets);
+    return reread;
+}
 /** @internal Raw-protocol acceptance wrapper; the production class routes through its named safe method. */
 /** @internal */
 async function acceptProposalOnProtocol(protocol, target, scope, authority, input) {
@@ -2053,8 +2941,16 @@ async function acceptProposalOnProtocol(protocol, target, scope, authority, inpu
         throw new TypeError("Accept proposal authority does not match the store");
     if (!authority.matchesScope(scope))
         throw new TypeError("Accept proposal authority does not match the store authority scope");
-    const proposalId = input.proposalId;
-    if (input === null || typeof input !== "object" || typeof proposalId !== "string" || proposalId.length === 0 || proposalId.length > 512)
+    // Reject malformed/proxy options before any property access, then snapshot
+    // the one contractual field from an own enumerable data descriptor. Unknown
+    // fields (including explosive getters) are intentionally untouched.
+    if (input === null || typeof input !== "object" || Array.isArray(input) || nodeTypes.isProxy(input))
+        throw new TypeError("Accept proposal inputs are invalid");
+    const proposalDescriptor = Object.getOwnPropertyDescriptor(input, "proposalId");
+    if (proposalDescriptor === undefined || !("value" in proposalDescriptor) || proposalDescriptor.enumerable !== true)
+        throw new TypeError("Accept proposal inputs are invalid");
+    const proposalId = proposalDescriptor.value;
+    if (typeof proposalId !== "string" || proposalId.length === 0 || proposalId.length > 512)
         throw new TypeError("Accept proposal inputs are invalid");
     return acceptLeaseAuthorityOnProtocol(protocol, target, scope, authority, proposalId);
 }
@@ -2152,9 +3048,7 @@ async function createTombstoneOnProtocol(protocol, target, scope, input) {
 // ---------------------------------------------------------------------------
 // Authority kernel: reconcile (lexical; NOT exported)
 // ---------------------------------------------------------------------------
-async function markCoverageOnProtocol(protocol, target, scope, input) {
-    // OWNED SNAPSHOTS at entry: every field exactly once; the coverage ID and
-    // the record are computed from the locals only.
+function snapshotMarkCoverageInput(input) {
     const ownerHost = input.ownerHost;
     const episodeId = input.episodeId;
     const extractorRevision = input.extractorRevision;
@@ -2163,20 +3057,38 @@ async function markCoverageOnProtocol(protocol, target, scope, input) {
     const privacyEpoch = input.privacyEpoch;
     const createdAt = input.createdAt;
     const processingPolicyId = input.processingPolicyId;
-    if (target.ownerHost !== ownerHost)
+    return Object.freeze({ ownerHost, episodeId, extractorRevision, policyHash, policyEpoch, privacyEpoch, createdAt, processingPolicyId });
+}
+function coverageRecordForInput(target, input) {
+    const record = { ownerHost: input.ownerHost, schemaRevision: 1, createdAt: input.createdAt, privacyEpoch: input.privacyEpoch, processingPolicyId: input.processingPolicyId, expiresAt: null, recordType: "coverage", id: coverageId({ ownerHost: input.ownerHost, episodeId: input.episodeId, extractorRevision: input.extractorRevision, coordinationPolicyHash: input.policyHash, coordinationPolicyEpoch: input.policyEpoch, policyIntersectionId: input.processingPolicyId, privacyEpoch: input.privacyEpoch }), episodeId: input.episodeId, extractorRevision: input.extractorRevision, coordinationPolicyHash: input.policyHash, coordinationPolicyEpoch: input.policyEpoch, contentHash: "pending" };
+    if (target.ownerHost !== input.ownerHost)
         throw new TypeError("Coverage store owner does not match the target owner");
-    const record = {
-        ownerHost, schemaRevision: 1, createdAt, privacyEpoch,
-        processingPolicyId, expiresAt: null, recordType: "coverage",
-        id: coverageId({ ownerHost, episodeId, extractorRevision, coordinationPolicyHash: policyHash, coordinationPolicyEpoch: policyEpoch, policyIntersectionId: processingPolicyId, privacyEpoch }),
-        episodeId, extractorRevision, coordinationPolicyHash: policyHash,
-        coordinationPolicyEpoch: policyEpoch, contentHash: "pending",
-    };
-    const final = { ...record, contentHash: canonicalRecordHash(record) };
+    return { ...record, contentHash: canonicalRecordHash(record) };
+}
+async function assertCoverageRecordBoundToJob(record, job, ownerHost) {
+    if (record.ownerHost !== ownerHost || record.ownerHost !== job.ownerHost || !job.membership.includes(record.episodeId) || record.processingPolicyId !== job.policyId || record.coordinationPolicyHash !== job.coordinationPolicyHash || record.coordinationPolicyEpoch !== job.coordinationPolicyEpoch || record.privacyEpoch !== job.privacyEpoch || record.extractorRevision !== job.extractorRevision || record.expiresAt !== null || record.contentHash !== canonicalRecordHash(record) || record.id !== coverageId({ ownerHost, episodeId: record.episodeId, extractorRevision: record.extractorRevision, coordinationPolicyHash: record.coordinationPolicyHash, coordinationPolicyEpoch: record.coordinationPolicyEpoch, policyIntersectionId: job.policyId, privacyEpoch: record.privacyEpoch }))
+        throw new TypeError("Coverage is not bound to the accepted job membership");
+}
+async function markCoverageOnProtocol(protocol, target, scope, authority, input) {
+    const normalized = snapshotMarkCoverageInput(input);
+    const final = coverageRecordForInput(target, normalized);
+    const job = await protocol.readJob(authority.jobId);
+    if (job === null)
+        throw new TypeError("Coverage job is missing");
+    await assertCoverageRecordBoundToJob(final, job, target.ownerHost);
+    const episodes = await protocol.readEpisodes([final.episodeId]);
+    if (episodes.length === 1) {
+        if (episodes[0].id !== final.episodeId || episodes[0].ownerHost !== target.ownerHost || episodes[0].createdAt !== final.createdAt)
+            throw new TypeError("Coverage timestamp is not bound to its canonical episode");
+    }
+    else if (final.createdAt !== job.createdAt)
+        throw new TypeError("Coverage timestamp requires its canonical episode");
+    await assertFreshAcceptedBarrier(protocol, authority, job.membership);
     await protocol.insertCoverage(final);
     const reread = await protocol.readCoverage([final.id]);
-    if (reread.length !== 1 || reread[0].id !== final.id)
-        throw new TypeError("Coverage insert did not read back");
+    if (reread.length !== 1 || reread[0].id !== final.id || reread[0].contentHash !== final.contentHash || canonicalRecordHash(reread[0]) !== reread[0].contentHash || !deepEqual(reread[0], final))
+        throw new TypeError("Coverage insert did not read back exactly");
+    await assertFreshAcceptedBarrier(protocol, authority, job.membership);
     return reread[0];
 }
 // ---------------------------------------------------------------------------

@@ -36,7 +36,7 @@ export type LeaseCasPrecondition = {
   expectedPolicyEpoch: number;
   expectedPolicyHash: string;
   expectedPrivacyEpoch: number;
-  expectedState: "leased" | "accepted" | "released";
+  expectedState: "leased" | "accepted" | "released" | "completed";
   /** Every lease CAS pins the exact current owner (never null). */
   expectedOwner: string;
   expectedAcceptedProposalId: string | null;
@@ -48,7 +48,30 @@ export type LeaseCasPrecondition = {
   expiresBefore?: number;
   expiresAfter?: number;
 };
-export type TypedUpdatePrecondition = ControlCasPrecondition | LeaseCasPrecondition;
+/**
+ * OCC precondition for the single mutable `curated_current` point of one
+ * logical state key under one coordination policy epoch. The update_filter
+ * pins owner/record/version/epoch/hash/privacy/resolution and the exact
+ * resolved content (content_id) or conflict manifest, so a concurrent current
+ * write can never be overwritten silently (the CAS returns false instead).
+ */
+export type CuratedCurrentCasPrecondition = {
+  kind: "current-cas";
+  ownerHost: HostId;
+  recordType: "curated_current";
+  id: string;
+  expectedVersion: number;
+  expectedEpoch: number;
+  expectedPolicyHash: string;
+  expectedProcessingPolicyId: string;
+  expectedExpiresAt: string | null;
+  expectedPrivacyEpoch: number;
+  expectedResolution: "resolved" | "conflict";
+  expectedContentId: string | null;
+  expectedConflictManifestHash: string | null;
+  expectedContentHash: string;
+};
+export type TypedUpdatePrecondition = ControlCasPrecondition | LeaseCasPrecondition | CuratedCurrentCasPrecondition;
 export interface QdrantReadClient { readonly endpoint: string; readonly ownerHost: HostId; readonly collection: HostScopedQdrantCollection; readonly maxClockSkewMs: number; health(): Promise<unknown>; collectionInfo(): Promise<QdrantCollectionInfo>; retrieve(ids: readonly PointId[], policy: QdrantReadPolicy, options?: ReadOptions): Promise<QdrantPoint[]>; scroll(input: { policy: QdrantReadPolicy; offset?: PointId; limit?: number }): Promise<QdrantScrollResult>; search(input: { vector: readonly number[]; limit: number; policy: QdrantReadPolicy }): Promise<QdrantSearchHit[]>; count(policy: QdrantReadPolicy): Promise<number>; }
 export function validatePurpose(purpose: ReadPurpose, recordTypes: readonly PointRecordType[]): void { if (!["memory", "control", "metadata", "query", "internal", "write_verification"].includes(purpose)) throw new TypeError("Read purpose is invalid"); if ((purpose === "metadata" && (recordTypes.length !== 1 || recordTypes[0] !== "collection_metadata")) || (purpose === "control" && (recordTypes.length !== 1 || recordTypes[0] !== "collection_control")) || ((purpose === "memory" || purpose === "query") && (recordTypes.length === 0 || recordTypes.some((type) => !["episode", "curated_memory", "curated_current", "raptor_summary"].includes(type)))) || ((purpose === "internal" || purpose === "write_verification") && recordTypes.length === 0)) throw new TypeError("Read purpose and record types do not match"); }
 export function readPolicy(input: { ownerHost: HostId; purpose: ReadPurpose; recordTypes: readonly PointRecordType[]; now?: number; maxClockSkewMs?: number; projectId?: string; processingPolicyId?: string }): QdrantReadPolicy {
@@ -62,7 +85,7 @@ export function readPolicy(input: { ownerHost: HostId; purpose: ReadPurpose; rec
   const now = input.now ?? Date.now();
   const skew = input.maxClockSkewMs ?? 0;
   if (ownerHost !== "pi" && ownerHost !== "prime") throw new TypeError("Read owner is invalid");
-  if (recordTypes.length === 0 || recordTypes.some((type) => !["episode", "curated_memory", "curated_current", "raptor_summary", "collection_control", "processing_policy", "job", "lease", "proposal", "coverage", "evidence_link", "tombstone", "collection_metadata"].includes(type))) throw new TypeError("Read record type policy is invalid");
+  if (recordTypes.length === 0 || recordTypes.some((type) => !["episode", "curated_memory", "curated_current", "conflict_manifest", "raptor_summary", "collection_control", "processing_policy", "job", "lease", "proposal", "coverage", "evidence_link", "tombstone", "collection_metadata"].includes(type))) throw new TypeError("Read record type policy is invalid");
   if (!Number.isFinite(now) || !Number.isFinite(skew) || skew < 0) throw new TypeError("Read expiry policy is invalid");
   if (projectId !== undefined && (typeof projectId !== "string" || projectId.length === 0) || processingPolicyId !== undefined && (typeof processingPolicyId !== "string" || processingPolicyId.length === 0)) throw new TypeError("Read scope policy is invalid");
   validatePurpose(purpose, recordTypes);

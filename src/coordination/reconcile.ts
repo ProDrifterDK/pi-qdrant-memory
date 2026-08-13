@@ -1,6 +1,6 @@
 import { canonicalRecordHash, isPersistedMemoryRecord, type CoverageRecord, type EpisodeRecord } from "../domain/records.js";
 import { coverageId } from "../domain/ids.js";
-import { ProductionCoordinationStore } from "../qdrant/write.js";
+import { ProductionCoordinationStore, LeaseAuthority } from "../qdrant/write.js";
 import type { HostId } from "../types.js";
 
 export interface MarkCoverageInput {
@@ -20,9 +20,10 @@ export interface MarkCoverageInput {
  * intersection + privacy epoch, so pre-forget coverage can never suppress
  * post-forget work.
  */
-export async function markCoverage(store: ProductionCoordinationStore, input: MarkCoverageInput): Promise<CoverageRecord> {
+export async function markCoverage(store: ProductionCoordinationStore, authority: LeaseAuthority, input: MarkCoverageInput): Promise<CoverageRecord> {
   if (!ProductionCoordinationStore.isValid(store)) throw new TypeError("Coverage mark requires a genuine production store");
-  return store.markCoverage(input);
+  if (!LeaseAuthority.isValid(authority)) throw new TypeError("Coverage mark requires a genuine accepted lease authority");
+  return store.markCoverage(authority, input);
 }
 export interface EpisodeSlice { episodes: readonly EpisodeRecord[]; nextOffset?: string; }
 export interface FindMissingInput {

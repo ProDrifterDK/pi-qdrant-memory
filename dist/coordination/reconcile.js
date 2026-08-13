@@ -1,6 +1,6 @@
 import { canonicalRecordHash, isPersistedMemoryRecord } from "../domain/records.js";
 import { coverageId } from "../domain/ids.js";
-import { ProductionCoordinationStore } from "../qdrant/write.js";
+import { ProductionCoordinationStore, LeaseAuthority } from "../qdrant/write.js";
 /**
  * Coverage truth is deterministic coverage IDs + batch retrieve; the scan
  * cursor is optimization only. The identity is policy-specific: owner +
@@ -8,10 +8,12 @@ import { ProductionCoordinationStore } from "../qdrant/write.js";
  * intersection + privacy epoch, so pre-forget coverage can never suppress
  * post-forget work.
  */
-export async function markCoverage(store, input) {
+export async function markCoverage(store, authority, input) {
     if (!ProductionCoordinationStore.isValid(store))
         throw new TypeError("Coverage mark requires a genuine production store");
-    return store.markCoverage(input);
+    if (!LeaseAuthority.isValid(authority))
+        throw new TypeError("Coverage mark requires a genuine accepted lease authority");
+    return store.markCoverage(authority, input);
 }
 function validateSlice(slice, batchSize, cursor, ownerHost) {
     if (slice === null || typeof slice !== "object" || !Array.isArray(slice.episodes) || slice.episodes.length > batchSize)
