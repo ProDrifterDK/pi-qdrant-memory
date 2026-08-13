@@ -1,4 +1,4 @@
-import { type ConflictManifestRecord, type ControlRecord, type CoverageRecord, type CuratedCurrentRecord, type CuratedMemoryRecord, type EpisodeRecord, type EvidenceLinkRecord, type JobRecord, type LeaseRecord, type MemoryRecord, type ProcessingPolicyRecord, type ProposalRecord, type TombstoneRecord } from "../domain/records.js";
+import { type ConflictManifestRecord, type ControlRecord, type CoverageRecord, type CuratedCurrentRecord, type CuratedMemoryRecord, type EpisodeRecord, type EvidenceLinkRecord, type JobRecord, type LeaseRecord, type MemoryRecord, type ProcessingPolicyRecord, type RaptorSummaryRecord, type ProposalRecord, type TombstoneRecord } from "../domain/records.js";
 import type { AuthorizedDestination, HostId, RuntimeConfig } from "../types.js";
 import { type QdrantClientOptions, type QdrantPoint } from "./client.js";
 import { RootWorkerContext } from "../coordination/root.js";
@@ -126,8 +126,10 @@ export declare class ProductionCoordinationStore {
         nextOffset?: string;
     }>;
     readEpisode(episodeIdValue: string): Promise<EpisodeRecord | null>;
+    readRaptorSummary(id: string): Promise<RaptorSummaryRecord | null>;
     readEpisodes(episodeIds: readonly string[]): Promise<EpisodeRecord[]>;
     private assertAcceptedAuthorityBase;
+    private assertRaptorAuthority;
     private assertCuratedRecordAgainstJob;
     claimLease(worker: RootWorkerContext, input: ClaimLeaseInput): Promise<LeaseAuthority | null>;
     renewLease(authority: LeaseAuthority): Promise<LeaseAuthority | null>;
@@ -156,6 +158,24 @@ export declare class ProductionCoordinationStore {
         record: CuratedCurrentRecord;
         expectedVersion: number | null;
     }): Promise<CuratedCurrentRecord | null>;
+    /** Stable, capability-gated RAPTOR authority checkpoint around every visible operation. */
+    readRaptorBarrier(authority: LeaseAuthority, input: {
+        destinationIds: readonly string[];
+        evidenceIds: readonly string[];
+    }): Promise<string>;
+    /** Insert one immutable summary/manifest node and require exact vector-aware readback. */
+    writeRaptorSummary(authority: LeaseAuthority, input: {
+        record: RaptorSummaryRecord;
+        destinationIds: readonly string[];
+        evidenceIds: readonly string[];
+    }): Promise<RaptorSummaryRecord>;
+    /** Single fenced publication CAS; losing immutable nodes remain unreachable. */
+    publishRaptorGeneration(authority: LeaseAuthority, input: {
+        expected: ControlRecord;
+        generationId: string;
+        destinationIds: readonly string[];
+        evidenceIds: readonly string[];
+    }): Promise<boolean>;
     createTombstone(input: CreateTombstoneInput): Promise<TombstoneRecord[]>;
     initializeControl(initial: ControlRecord): Promise<ControlRecord>;
     beginPolicyDrain(input: {

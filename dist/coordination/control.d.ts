@@ -1,6 +1,6 @@
-import { ProductionCoordinationStore, QuiescenceProof } from "../qdrant/write.js";
+import { LeaseAuthority, ProductionCoordinationStore, QuiescenceProof } from "../qdrant/write.js";
 export { ProductionCoordinationStore, QuiescenceProof, createQdrantCoordinationStore } from "../qdrant/write.js";
-import type { ControlRecord } from "../domain/records.js";
+import type { ControlRecord, RaptorSummaryRecord } from "../domain/records.js";
 import type { IngestControlReader } from "../outbox/delivery.js";
 /**
  * Thin Production-brand-only coordination surface. There is NO structural-
@@ -65,6 +65,24 @@ export declare function rotateCoordinationPolicy(store: ProductionCoordinationSt
 export declare function beginForgetBarrier(store: ProductionCoordinationStore, input: {
     now: number;
 }): Promise<ControlRecord>;
+/** Exact stable RAPTOR checkpoint over control/job/lease/tombstones and bound destinations. */
+export declare function readRaptorBarrier(store: ProductionCoordinationStore, authority: LeaseAuthority, input: {
+    destinationIds: readonly string[];
+    evidenceIds: readonly string[];
+}): Promise<string>;
+/** Capability-gated immutable RAPTOR node insert with exact vector-aware readback. */
+export declare function writeRaptorSummary(store: ProductionCoordinationStore, authority: LeaseAuthority, input: {
+    record: RaptorSummaryRecord;
+    destinationIds: readonly string[];
+    evidenceIds: readonly string[];
+}): Promise<RaptorSummaryRecord>;
+/** Capability-gated one-winner active-generation CAS. */
+export declare function publishRaptorGeneration(store: ProductionCoordinationStore, authority: LeaseAuthority, input: {
+    expected: ControlRecord;
+    generationId: string;
+    destinationIds: readonly string[];
+    evidenceIds: readonly string[];
+}): Promise<boolean>;
 /**
  * Nominal, frozen, privately branded bound control reader: bounded revocation
  * snapshot from the single control point of its genuine production store.

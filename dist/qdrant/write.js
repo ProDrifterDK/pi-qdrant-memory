@@ -703,7 +703,7 @@ export function recordFromPayload(value, ownerHost, semanticVector) {
             continue;
         record[SNAKE_TO_CAMEL.get(wire) ?? wire] = raw;
     }
-    const supportsNamedVector = recordType === "episode" || recordType === "curated_memory" || recordType === "curated_current" && owned.resolution === "resolved";
+    const supportsNamedVector = recordType === "episode" || recordType === "curated_memory" || recordType === "curated_current" && owned.resolution === "resolved" || recordType === "raptor_summary";
     let vectorSnapshot;
     if (semanticVector !== undefined) {
         let ownedVector;
@@ -1354,6 +1354,9 @@ export class ProductionCoordinationStore {
             readCurated: async (recordType, id) => this.#readCurated(recordType, id),
             insertCurated: async (record) => engine.insertOnly(record),
             casCuratedCurrent: async (input) => engine.casCuratedCurrent(input),
+            readRaptor: async (id) => this.readRaptorSummary(id),
+            insertRaptor: async (record) => engine.insertOnly(record),
+            publishGenerationControl: async (expectedVersion, expectedBaseGeneration, next) => engine.publishControlCas({ expectedVersion, expectedBaseGeneration, next }),
         };
         this.#protocol = Object.freeze(facade);
         Object.freeze(this);
@@ -1535,6 +1538,32 @@ export class ProductionCoordinationStore {
             return null;
         return parsed;
     }
+    async readRaptorSummary(id) {
+        try {
+            if (!validBoundedText(id))
+                return null;
+            const physicalId = physicalPointId("raptor_summary", id);
+            const points = ownedPointsSnapshot(await this.#bound.retrieve([physicalId], this.internalPolicy("raptor_summary"), { includeVector: true }));
+            const matches = points.filter((candidate) => candidate.id === physicalId);
+            if (points.length !== matches.length || matches.length > 1)
+                return null;
+            const point = matches[0];
+            if (point === undefined || point.payload.record_type !== "raptor_summary")
+                return null;
+            const semantic = point.vector?.semantic;
+            const parsed = recordFromPayload(point.payload, this.ownerHost, semantic);
+            if (parsed.recordType !== "raptor_summary" || parsed.id !== id || physicalPointId("raptor_summary", parsed.id) !== point.id)
+                return null;
+            if (parsed.vector !== undefined && (!Array.isArray(semantic) || semantic.length !== 1024 || !semantic.every((value) => typeof value === "number" && Number.isFinite(value))))
+                return null;
+            if (parsed.vector === undefined && point.vector !== undefined)
+                return null;
+            return parsed;
+        }
+        catch {
+            return null;
+        }
+    }
     async readEpisodes(episodeIds) {
         if (!Array.isArray(episodeIds) || episodeIds.length === 0 || episodeIds.length > 1024 || episodeIds.some((id) => typeof id !== "string" || id.length === 0 || id.length > 512) || new Set(episodeIds).size !== episodeIds.length)
             throw new TypeError("Episode IDs are invalid");
@@ -1567,6 +1596,29 @@ export class ProductionCoordinationStore {
         if (jobExpired(job, now, authority.maxClockSkewMs) || Date.parse(claim.expiresAt) <= now)
             throw new TypeError("Curated write authority is expired");
         return job;
+    }
+    async assertRaptorAuthority(authority, destinationIds, targetIds) {
+        if (!LeaseAuthority.isValid(authority) || !authority.matchesStore(this) || !authority.matchesScope(this.#authorityScope) || (authority.state !== "leased" && authority.state !== "accepted"))
+            throw new TypeError("RAPTOR operation requires a genuine live lease authority");
+        if (!Array.isArray(destinationIds) || destinationIds.length < 2 || destinationIds.length > 3 || destinationIds.some((id) => !validBoundedText(id, 256)) || new Set(destinationIds).size !== destinationIds.length)
+            throw new TypeError("RAPTOR destination identity is invalid");
+        if (!Array.isArray(targetIds) || targetIds.length === 0 || targetIds.length > 1024 || targetIds.some((id) => !validBoundedText(id)) || new Set(targetIds).size !== targetIds.length)
+            throw new TypeError("RAPTOR evidence targets are invalid");
+        const control = await this.readControl();
+        const job = await this.readJob(authority.jobId);
+        const claim = await this.readLease(authority.jobId);
+        if (job === null || claim === null || !authority.matchesClaim(claim) || claim.state !== authority.state || !claimIdentityMatchesJob(claim, job))
+            throw new TypeError("RAPTOR authority claim is stale");
+        const now = authority.now();
+        if (jobExpired(job, now, authority.maxClockSkewMs) || Date.parse(claim.expiresAt) <= now || control.state !== "active" || control.privacyEpoch !== authority.privacyEpoch || control.coordinationPolicyEpoch !== authority.coordinationPolicyEpoch || control.coordinationPolicyHash !== authority.coordinationPolicyHash || destinationIds.some((id) => control.revokedDestinationIds.includes(id)))
+            throw new TypeError("RAPTOR authority is expired or revoked");
+        if (job.ownerHost !== this.ownerHost || job.id !== authority.jobId || job.policyId !== authority.processingPolicyId || job.policyHash !== authority.coordinationPolicyHash || job.policyEpoch !== authority.coordinationPolicyEpoch || job.privacyEpoch !== authority.privacyEpoch || targetIds.some((id) => !job.membership.includes(id)))
+            throw new TypeError("RAPTOR authority is not bound to the job membership");
+        const tombstones = await this.readTombstones(targetIds);
+        if (tombstones.length !== 0)
+            throw new TypeError("RAPTOR evidence is tombstoned");
+        const digest = canonicalStringify({ control, job, claim, destinationIds: [...destinationIds].sort(), targetIds: [...targetIds].sort(), tombstones });
+        return { job, control, claim, digest };
     }
     async assertCuratedRecordAgainstJob(record, job) {
         if (record.ownerHost !== this.ownerHost || record.processingPolicyId !== job.policyId || record.coordinationPolicyEpoch !== job.coordinationPolicyEpoch || record.coordinationPolicyHash !== job.coordinationPolicyHash || record.privacyEpoch !== job.privacyEpoch || record.expiresAt !== job.expiresAt)
@@ -1745,6 +1797,44 @@ export class ProductionCoordinationStore {
         const record = ownedCuratedRecordSnapshot(input.record);
         await this.assertCuratedRecordAgainstJob(record, job);
         return upsertCuratedCurrentOnProtocol(this.#protocol, this, this.#authorityScope, authority, { record, expectedVersion });
+    }
+    /** Stable, capability-gated RAPTOR authority checkpoint around every visible operation. */
+    async readRaptorBarrier(authority, input) {
+        return (await this.assertRaptorAuthority(authority, input.destinationIds, input.evidenceIds)).digest;
+    }
+    /** Insert one immutable summary/manifest node and require exact vector-aware readback. */
+    async writeRaptorSummary(authority, input) {
+        const before = await this.assertRaptorAuthority(authority, input.destinationIds, input.evidenceIds);
+        const record = parseMemoryRecord(input.record, { ownerHost: this.ownerHost, privacyEpoch: authority.privacyEpoch, coordinationPolicyEpoch: authority.coordinationPolicyEpoch, vectorDimension: 1024 });
+        if (record.recordType !== "raptor_summary" || record.ownerHost !== this.ownerHost || record.jobId !== before.job.id || record.fencingToken !== authority.fencingToken || record.processingPolicyId !== before.job.policyId || record.coordinationPolicyHash !== before.job.policyHash || record.coordinationPolicyEpoch !== before.job.policyEpoch || record.privacyEpoch !== before.job.privacyEpoch || record.expiresAt !== before.job.expiresAt || record.contentHash !== canonicalRecordHash(record))
+            throw new TypeError("RAPTOR summary is not bound to the live job");
+        await this.#protocol.insertRaptor(record);
+        const after = await this.assertRaptorAuthority(authority, input.destinationIds, input.evidenceIds);
+        if (after.digest !== before.digest)
+            throw new TypeError("RAPTOR authority changed during summary write");
+        const readback = await this.readRaptorSummary(record.id);
+        if (readback === null || canonicalStringify(readback) !== canonicalStringify(record))
+            throw new TypeError("RAPTOR summary readback is not exact");
+        return readback;
+    }
+    /** Single fenced publication CAS; losing immutable nodes remain unreachable. */
+    async publishRaptorGeneration(authority, input) {
+        const generationId = input.generationId;
+        if (!validBoundedText(generationId))
+            throw new TypeError("RAPTOR generation ID is invalid");
+        const before = await this.assertRaptorAuthority(authority, input.destinationIds, input.evidenceIds);
+        const expected = parseMemoryRecord(input.expected, { ownerHost: this.ownerHost });
+        if (expected.recordType !== "collection_control" || canonicalStringify(expected) !== canonicalStringify(before.control) || expected.state !== "active")
+            return false;
+        const pending = { ...expected, version: expected.version + 1, activeGeneration: generationId, activeBaseGeneration: expected.activeGeneration, contentHash: "pending" };
+        const next = { ...pending, contentHash: canonicalRecordHash(pending) };
+        const second = await this.assertRaptorAuthority(authority, input.destinationIds, input.evidenceIds);
+        if (second.digest !== before.digest)
+            return false;
+        if (!await this.#protocol.publishGenerationControl(expected.version, expected.activeBaseGeneration, next))
+            return false;
+        const final = await this.readControl();
+        return canonicalStringify(final) === canonicalStringify(next);
     }
     async createTombstone(input) {
         return createTombstoneOnProtocol(this.#protocol, this, this.#authorityScope, input);

@@ -290,6 +290,10 @@ describe("curated current resolution, sorted provenance, and exact-once payload 
     expect(() => recordFromPayload(wire, "pi", sparseVector)).toThrow(/semantic vector is invalid/i);
     const denseVector = Array.from({ length: 1024 }, (_, index) => index / 1024);
     expect(recordFromPayload(wire, "pi", denseVector)).toEqual(record);
+    // RAPTOR summaries also round-trip their optional named semantic vector.
+    const raptorBase: MemoryRecord = { ...derivedEnvelope, recordType: "raptor_summary", id: "summary-vector", generationId: "generation-1", clusterId: "cluster-1", membershipHash: manifestHash(["episode-1"]), level: 1, memberIds: ["episode-1"], summary: "safe summary", modelId: "model", embeddingDimension: 1024, promptRevision: "prompt", algorithm: "raptor", seed: 7, jobId: "job-1", fencingToken: 1, temporalFrom: envelope.createdAt, temporalTo: envelope.createdAt, coveredProjects: ["project-1"], algorithmParameters: { revision: 1 } };
+    const raptorRecord = canonical({ ...raptorBase, vector: denseVector }); const raptorWire = recordPayload(raptorRecord);
+    expect(recordFromPayload(raptorWire, "pi", denseVector)).toEqual(raptorRecord);
     // A conflict current rejects the named vector transport.
     expect(() => recordFromPayload(recordPayload(canonical(conflictCurrent())), "pi", denseVector)).toThrow(/vector/i);
     // A resolved current REQUIRES the named vector transport on readback.

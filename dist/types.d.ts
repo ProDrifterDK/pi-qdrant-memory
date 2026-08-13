@@ -39,6 +39,17 @@ export interface MemoryModelConfig {
     timeoutMs: number;
     maxOutputTokens: number;
 }
+export interface RaptorConfig extends Record<string, unknown> {
+    rebuildEpisodeDelta: number;
+    maxLevels: number;
+    summaryInputTokens: number;
+    umapDimensions: number;
+    localNeighbors: number;
+    gmmMaxClusters: number;
+    membershipThreshold: number;
+    /** Explicit uint32 or a deterministic collection+policy-derived seed. */
+    seed?: number;
+}
 export interface RuntimeConfig {
     host: HostId;
     configPath: string;
@@ -95,16 +106,7 @@ export interface RuntimeConfig {
         maxInputTokens: number;
     };
     memoryModel: MemoryModelConfig;
-    raptor: {
-        rebuildEpisodeDelta: number;
-        maxLevels: number;
-        summaryInputTokens: number;
-        umapDimensions: number;
-        localNeighbors: number;
-        gmmMaxClusters: number;
-        membershipThreshold: number;
-        seed?: number;
-    };
+    raptor: RaptorConfig;
 }
 export interface ConfigLoadDependencies {
     env: Record<string, string | undefined>;

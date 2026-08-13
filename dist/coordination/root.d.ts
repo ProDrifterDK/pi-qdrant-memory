@@ -1,6 +1,8 @@
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { HostId } from "../types.js";
+import { ProductionCoordinationStore } from "../qdrant/write.js";
 import { type CurationRunResult, type CurationWorkerInput } from "../curation/worker.js";
+import { type RaptorBuildInput, type RaptorBuildResult } from "../raptor/builder.js";
 /**
  * Nominal root capability.  There is intentionally no public issuer or
  * runtime/factory adapter: only the high-level lifecycle operation below can
@@ -28,3 +30,16 @@ export type RootCurationLifecycleInput = Omit<CurationWorkerInput, "rootWorker">
     env: Record<string, string | undefined>;
 };
 export declare function runCurationFromLifecycle(sessionManager: SessionManager, input: RootCurationLifecycleInput): Promise<CurationRunResult>;
+export type RootRaptorLifecycleInput = RaptorBuildInput & {
+    readonly store: ProductionCoordinationStore;
+    readonly env: Record<string, string | undefined>;
+    readonly nodeId: string;
+    readonly leaseMs: number;
+    readonly maxClockSkewMs: number;
+    readonly extractorRevision: string;
+    readonly clock?: () => number;
+};
+/** The sole RAPTOR root entry point; the private root/lease capability never escapes. */
+export declare function runRaptorFromLifecycle(sessionManager: SessionManager, input: RootRaptorLifecycleInput): Promise<RaptorBuildResult | {
+    readonly state: "child";
+}>;

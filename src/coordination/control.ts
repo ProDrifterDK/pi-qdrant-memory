@@ -1,6 +1,6 @@
-import { ProductionCoordinationStore, QuiescenceProof, createQdrantCoordinationStore } from "../qdrant/write.js";
+import { LeaseAuthority, ProductionCoordinationStore, QuiescenceProof, createQdrantCoordinationStore } from "../qdrant/write.js";
 export { ProductionCoordinationStore, QuiescenceProof, createQdrantCoordinationStore } from "../qdrant/write.js";
-import type { ControlRecord } from "../domain/records.js";
+import type { ControlRecord, RaptorSummaryRecord } from "../domain/records.js";
 import type { IngestControlReader } from "../outbox/delivery.js";
 
 /**
@@ -79,6 +79,22 @@ export async function rotateCoordinationPolicy(store: ProductionCoordinationStor
 export async function beginForgetBarrier(store: ProductionCoordinationStore, input: { now: number }): Promise<ControlRecord> {
   if (!ProductionCoordinationStore.isValid(store)) throw new TypeError("Forget barrier requires a genuine production store");
   return store.beginForgetBarrier(input);
+}
+
+/** Exact stable RAPTOR checkpoint over control/job/lease/tombstones and bound destinations. */
+export async function readRaptorBarrier(store: ProductionCoordinationStore, authority: LeaseAuthority, input: { destinationIds: readonly string[]; evidenceIds: readonly string[] }): Promise<string> {
+  if (!ProductionCoordinationStore.isValid(store) || !LeaseAuthority.isValid(authority)) throw new TypeError("RAPTOR barrier requires genuine production capabilities");
+  return store.readRaptorBarrier(authority, input);
+}
+/** Capability-gated immutable RAPTOR node insert with exact vector-aware readback. */
+export async function writeRaptorSummary(store: ProductionCoordinationStore, authority: LeaseAuthority, input: { record: RaptorSummaryRecord; destinationIds: readonly string[]; evidenceIds: readonly string[] }): Promise<RaptorSummaryRecord> {
+  if (!ProductionCoordinationStore.isValid(store) || !LeaseAuthority.isValid(authority)) throw new TypeError("RAPTOR write requires genuine production capabilities");
+  return store.writeRaptorSummary(authority, input);
+}
+/** Capability-gated one-winner active-generation CAS. */
+export async function publishRaptorGeneration(store: ProductionCoordinationStore, authority: LeaseAuthority, input: { expected: ControlRecord; generationId: string; destinationIds: readonly string[]; evidenceIds: readonly string[] }): Promise<boolean> {
+  if (!ProductionCoordinationStore.isValid(store) || !LeaseAuthority.isValid(authority)) throw new TypeError("RAPTOR publication requires genuine production capabilities");
+  return store.publishRaptorGeneration(authority, input);
 }
 
 /** Module-private unexported issuer: control readers are constructed only through the factory. */

@@ -1,4 +1,4 @@
-import { ProductionCoordinationStore, QuiescenceProof, createQdrantCoordinationStore } from "../qdrant/write.js";
+import { LeaseAuthority, ProductionCoordinationStore, QuiescenceProof, createQdrantCoordinationStore } from "../qdrant/write.js";
 export { ProductionCoordinationStore, QuiescenceProof, createQdrantCoordinationStore } from "../qdrant/write.js";
 /**
  * Thin Production-brand-only coordination surface. There is NO structural-
@@ -70,6 +70,24 @@ export async function beginForgetBarrier(store, input) {
     if (!ProductionCoordinationStore.isValid(store))
         throw new TypeError("Forget barrier requires a genuine production store");
     return store.beginForgetBarrier(input);
+}
+/** Exact stable RAPTOR checkpoint over control/job/lease/tombstones and bound destinations. */
+export async function readRaptorBarrier(store, authority, input) {
+    if (!ProductionCoordinationStore.isValid(store) || !LeaseAuthority.isValid(authority))
+        throw new TypeError("RAPTOR barrier requires genuine production capabilities");
+    return store.readRaptorBarrier(authority, input);
+}
+/** Capability-gated immutable RAPTOR node insert with exact vector-aware readback. */
+export async function writeRaptorSummary(store, authority, input) {
+    if (!ProductionCoordinationStore.isValid(store) || !LeaseAuthority.isValid(authority))
+        throw new TypeError("RAPTOR write requires genuine production capabilities");
+    return store.writeRaptorSummary(authority, input);
+}
+/** Capability-gated one-winner active-generation CAS. */
+export async function publishRaptorGeneration(store, authority, input) {
+    if (!ProductionCoordinationStore.isValid(store) || !LeaseAuthority.isValid(authority))
+        throw new TypeError("RAPTOR publication requires genuine production capabilities");
+    return store.publishRaptorGeneration(authority, input);
 }
 /** Module-private unexported issuer: control readers are constructed only through the factory. */
 const INGEST_CONTROL_READER_ISSUER = Symbol("pi-qdrant-memory-v2.ingest-control-reader-issuer");

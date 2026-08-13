@@ -3,7 +3,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { RootWorkerContext, runCurationFromLifecycle } from "../../src/coordination/root.js";
 const options = (extra: Record<string, unknown> = {}): Record<string, unknown> => ({ host: "pi", env: {}, membership: [], nodeId: "node-a", leaseMs: 30_000, maxClockSkewMs: 1_000, workerPolicy: {}, extractorRevision: "x", producerPolicies: [], embedding: {}, llm: {}, createdAt: () => "2026-08-10T00:00:00.000Z", ...extra });
 describe("Task 9 root capability issuance boundary", () => {
-  it("exports only nominal context and lifecycle operation", async () => { const real = await import("../../src/coordination/root.js"); expect(Object.keys(real).sort()).toEqual(["RootWorkerContext", "runCurationFromLifecycle"]); expect(Object.getOwnPropertyNames(RootWorkerContext).sort()).toEqual(["isValid", "length", "name", "prototype"]); });
+  it("exports only nominal context and lifecycle operation", async () => { const real = await import("../../src/coordination/root.js"); expect(Object.keys(real).sort()).toEqual(["RootWorkerContext", "runCurationFromLifecycle", "runRaptorFromLifecycle"]); expect(Object.getOwnPropertyNames(RootWorkerContext).sort()).toEqual(["isValid", "length", "name", "prototype"]); });
   it("rejects fake/proxy/subclass-like managers before touching options", async () => {
     const manager = SessionManager.inMemory(); const explosive = new Proxy({}, { get() { throw new Error("options getter fired"); } });
     expect(await runCurationFromLifecycle({} as SessionManager, explosive as never)).toEqual({ state: "child" });
@@ -22,6 +22,10 @@ describe("Task 9 root capability issuance boundary", () => {
     expect(RootWorkerContext.isValid({})).toBe(false);
   });
   it("uses host markers fail-closed", async () => { const manager = SessionManager.inMemory(); await expect(runCurationFromLifecycle(manager, options({ env: { PI_SUBAGENT_CHILD: "1" } }) as never)).resolves.toEqual({ state: "child" }); await expect(runCurationFromLifecycle(manager, options({ env: { PI_SUBAGENT_DEPTH: "2" } }) as never)).resolves.toEqual({ state: "child" }); });
+  it("exposes RAPTOR only through a genuine lifecycle and touches no RAPTOR options for fake managers", async () => {
+    const { runRaptorFromLifecycle } = await import("../../src/coordination/root.js"); let reads = 0; const explosive = {} as Record<string, unknown>; for (const key of ["store", "leaves", "workerPolicy", "llm", "embedding"]) Object.defineProperty(explosive, key, { enumerable: true, get() { reads += 1; throw new Error("invoked"); } });
+    expect(await runRaptorFromLifecycle({} as never, explosive as never)).toEqual({ state: "child" }); expect(reads).toBe(0);
+  });
   it("rejects a post-import prototype hook before touching options", async () => {
     const manager = SessionManager.inMemory();
     const descriptor = Object.getOwnPropertyDescriptor(SessionManager.prototype, "getHeader");

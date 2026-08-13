@@ -5,6 +5,10 @@ import { resolveAgentMarker, type AgentMarker } from "../capture/episode.js";
 import { canonicalStringify, sha256Hex } from "../domain/canonical.js";
 import { ProductionCoordinationStore } from "../qdrant/write.js";
 import { runCurationCore, type CurationRunResult, type CurationWorkerInput } from "../curation/worker.js";
+import { buildRaptorGeneration, type RaptorBuildInput, type RaptorBuildResult } from "../raptor/builder.js";
+import { intersectPolicies } from "../domain/policy.js";
+import { createJob } from "./jobs.js";
+import { claimLease, releaseLease } from "./leases.js";
 
 const ROOT_WORKER_ISSUER = Symbol("pi-qdrant-memory-v2.root-worker-issuer");
 const SESSION_MANAGER_PROTOTYPE = SessionManager.prototype;
@@ -83,7 +87,7 @@ interface GenuineSessionManagerSnapshot {
 function snapshotGenuineSessionManager(value: unknown): GenuineSessionManagerSnapshot | null {
   if (nodeTypes.isProxy(value) || !(value instanceof SessionManager)) return null;
   if (Object.getPrototypeOf(value) !== SESSION_MANAGER_PROTOTYPE) return null;
-  if (Object.prototype.hasOwnProperty.call(value, "getHeader") || Object.prototype.hasOwnProperty.call(value, "getBranch")) return null;
+  if (Object.prototype.hasOwnProperty.call(value, "getHeader") || Object.prototype.hasOwnProperty.call(value, "getBranch") || Object.prototype.hasOwnProperty.call(value, "getEntries") || Object.prototype.hasOwnProperty.call(value, "getSessionId")) return null;
   const prototype = SESSION_MANAGER_PROTOTYPE;
   const getHeader = SESSION_MANAGER_METHODS.getHeader;
   const getBranch = SESSION_MANAGER_METHODS.getBranch;
@@ -256,3 +260,43 @@ export async function runCurationFromLifecycle(sessionManager: SessionManager, i
   });
 }
 Object.freeze(runCurationFromLifecycle);
+
+
+export type RootRaptorLifecycleInput = RaptorBuildInput & {
+  readonly store: ProductionCoordinationStore;
+  readonly env: Record<string, string | undefined>;
+  readonly nodeId: string;
+  readonly leaseMs: number;
+  readonly maxClockSkewMs: number;
+  readonly extractorRevision: string;
+  readonly clock?: () => number;
+};
+/** The sole RAPTOR root entry point; the private root/lease capability never escapes. */
+export async function runRaptorFromLifecycle(sessionManager: SessionManager, input: RootRaptorLifecycleInput): Promise<RaptorBuildResult | { readonly state: "child" }> {
+  const managerSnapshot = snapshotGenuineSessionManager(sessionManager); if (managerSnapshot === null) return Object.freeze({ state: "child" });
+  if (input === null || typeof input !== "object" || Array.isArray(input) || nodeTypes.isProxy(input)) return Object.freeze({ state: "child" });
+  const host = input.host; let env: Record<string, string | undefined>; try { env = snapshotEnvironment(input.env ?? {}); } catch { return Object.freeze({ state: "child" }); }
+  if (host !== "pi" && host !== "prime") return Object.freeze({ state: "child" });
+  let marker: AgentMarker; try { marker = validLifecycleMarker(host, managerSnapshot.header, env); } catch { return Object.freeze({ state: "child" }); }
+  if (!marker.rootWorkAllowed || !marker.valid || marker.role !== "root") return Object.freeze({ state: "child" });
+  const lifecycleDigest = managerSnapshot.verifyRootState(); if (lifecycleDigest === null) return Object.freeze({ state: "child" });
+  const store = input.store; if (!ProductionCoordinationStore.isValid(store) || store.ownerHost !== host) return Object.freeze({ state: "child" });
+  let leaves: RaptorBuildInput["leaves"]; let workerPolicy: RaptorBuildInput["workerPolicy"];
+  try { leaves = ownedDenseArray<RaptorBuildInput["leaves"][number]>(input.leaves, "RAPTOR lifecycle leaves"); workerPolicy = ownedCanonicalSnapshot(input.workerPolicy, "RAPTOR lifecycle worker policy"); } catch { return Object.freeze({ state: "child" }); }
+  const policy = intersectPolicies(leaves.map((leaf) => leaf.policy), workerPolicy); if (policy === null || policy.destinationIds.llm === undefined) return Object.freeze({ state: "pending", reason: "incompatible_policy" });
+  const membership = Object.freeze(leaves.map((leaf) => leaf.id).sort()); if (membership.length === 0 || new Set(membership).size !== membership.length) return Object.freeze({ state: "pending", reason: "invalid_input" });
+  const evidenceHash = sha256Hex(canonicalStringify({ host, marker, lifecycleDigest })); let worker: RootWorkerContext;
+  try { worker = new RootWorkerContext(host, evidenceHash, ROOT_WORKER_ISSUER, input.clock, input.nodeId, input.leaseMs, input.maxClockSkewMs); } catch { return Object.freeze({ state: "child" }); }
+  const control = await store.readControl(); if (control.state !== "active") return Object.freeze({ state: "pending", reason: "authority_changed" });
+  const createdAt = leaves.map((leaf) => leaf.eventAt).sort()[0]!;
+  const job = await createJob(store, { ownerHost: host, membership, policyIntersectionId: policy.id, policyHash: control.coordinationPolicyHash, policyEpoch: control.coordinationPolicyEpoch, extractorRevision: input.extractorRevision, privacyEpoch: control.privacyEpoch, createdAt, expiresAt: policy.expiresAt });
+  const authority = await claimLease(store, worker, { jobId: job.id, policyEpoch: control.coordinationPolicyEpoch, policyHash: control.coordinationPolicyHash, privacyEpoch: control.privacyEpoch });
+  if (authority === null) return Object.freeze({ state: "pending", reason: "authority_changed" });
+  const buildInput: RaptorBuildInput = { host, workerPolicy, leaves, llm: input.llm, embedding: input.embedding, modelId: input.modelId, homeDir: input.homeDir, seed: input.seed, maxLevels: input.maxLevels, summaryInputTokens: input.summaryInputTokens, umapDimensions: input.umapDimensions, localNeighbors: input.localNeighbors, gmmMaxClusters: input.gmmMaxClusters, membershipThreshold: input.membershipThreshold, ...(input.global === undefined ? {} : { global: input.global }), ...(input.scan === undefined ? {} : { scan: input.scan }), ...(input.signal === undefined ? {} : { signal: input.signal }), ...(input.reuseCandidates === undefined ? {} : { reuseCandidates: input.reuseCandidates }) };
+  const result = await buildRaptorGeneration(store, authority, buildInput);
+  // The RAPTOR job has no proposal/coverage terminal; after atomic generation
+  // publication the lease is explicitly released as completed work metadata.
+  await releaseLease(store, authority).catch(() => false);
+  return result;
+}
+Object.freeze(runRaptorFromLifecycle);
