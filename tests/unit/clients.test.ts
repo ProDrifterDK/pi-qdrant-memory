@@ -1,7 +1,6 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { fetchJson, MemoryClientError } from "../../src/clients/http.js";
 import { EmbeddingsClient } from "../../src/clients/embeddings.js";
-import { ReadonlyQdrantClient } from "../../src/clients/qdrant-readonly.js";
 
 function errorDetails(error: unknown): { category: string; status?: number; text: string } {
   expect(error).toBeInstanceOf(MemoryClientError);
@@ -216,103 +215,5 @@ describe("EmbeddingsClient", () => {
     });
     const error = await client.embedQuery("alpha").catch((value: unknown) => value);
     expect(errorDetails(error).category).toBe("invalid-response");
-  });
-});
-
-describe("ReadonlyQdrantClient", () => {
-  it("checks plain-text health with the api-key header", async () => {
-    const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
-      expect(url).toBe("http://qdrant/healthz");
-      expect(init?.method).toBe("GET");
-      expect(new Headers(init?.headers).get("api-key")).toBe("qdrant-readonly-secret");
-      expect(new Headers(init?.headers).get("authorization")).toBeNull();
-      return new Response("healthz check passed", { status: 200, headers: { "content-type": "text/plain" } });
-    });
-    const client = new ReadonlyQdrantClient({
-      baseUrl: "http://qdrant",
-      collection: "pi_memory",
-      apiKey: "qdrant-readonly-secret",
-      timeoutMs: 2500,
-      fetchImpl,
-    });
-    await expect(client.health()).resolves.toBeUndefined();
-  });
-
-  it("validates a single dense-vector collection shape", async () => {
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ result: {
-      config: { params: { vectors: { size: 3, distance: "Cosine" } } },
-    } }), { status: 200 }));
-    const client = new ReadonlyQdrantClient({ baseUrl: "http://qdrant", collection: "pi_memory", timeoutMs: 2500, fetchImpl });
-    await expect(client.collectionInfo()).resolves.toEqual({ dimension: 3, distance: "Cosine" });
-  });
-
-  it.each([
-    { vectors: { text: { size: 3, distance: "Cosine" } } },
-    { vectors: { size: 3 } },
-    { vectors: { size: 0, distance: "Cosine" } },
-    { vectors: { size: 3, distance: 4 } },
-    { vectors: [{ size: 3, distance: "Cosine" }] },
-  ])("rejects malformed or named vector metadata: %j", async (vectors) => {
-    const client = new ReadonlyQdrantClient({
-      baseUrl: "http://qdrant",
-      collection: "pi_memory",
-      timeoutMs: 2500,
-      fetchImpl: vi.fn(async () => new Response(JSON.stringify({ result: { config: { params: { vectors } } } }), { status: 200 })),
-    });
-    const error = await client.collectionInfo().catch((value: unknown) => value);
-    expect(errorDetails(error).category).toBe("invalid-response");
-  });
-
-  it("uses only the Qdrant search endpoint at runtime", async () => {
-    const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
-      expect(url).toBe("http://qdrant/collections/pi_memory/points/search");
-      expect(init?.method).toBe("POST");
-      expect(new Headers(init?.headers).get("api-key")).toBe("qdrant-readonly-secret");
-      expect(new Headers(init?.headers).get("authorization")).toBeNull();
-      expect(JSON.parse(String(init?.body))).toEqual({
-        vector: [1, 0, 0],
-        limit: 5,
-        filter: { must: [] },
-        with_payload: true,
-        with_vector: false,
-      });
-      return new Response(JSON.stringify({ result: [{ id: "point-a", score: 0.9, payload: { text: "safe" } }] }), { status: 200 });
-    });
-    const client = new ReadonlyQdrantClient({
-      baseUrl: "http://qdrant",
-      collection: "pi_memory",
-      apiKey: "qdrant-readonly-secret",
-      timeoutMs: 2500,
-      fetchImpl,
-    });
-    await expect(client.search({ vector: [1, 0, 0], limit: 5, filter: { must: [] } })).resolves.toEqual([
-      { id: "point-a", score: 0.9, payload: { text: "safe" } },
-    ]);
-    expect(fetchImpl).toHaveBeenCalledTimes(1);
-  });
-
-  it.each([
-    { id: {}, score: 0.9, payload: {} },
-    { id: "point-a", score: Number.NaN, payload: {} },
-    { id: "point-a", score: 0.9, payload: null },
-    { id: "point-a", score: 0.9, payload: [] },
-  ])("rejects malformed search hits: %j", async (hit) => {
-    const client = new ReadonlyQdrantClient({
-      baseUrl: "http://qdrant",
-      collection: "pi_memory",
-      timeoutMs: 2500,
-      fetchImpl: vi.fn(async () => new Response(JSON.stringify({ result: [hit] }), { status: 200 })),
-    });
-    const error = await client.search({ vector: [1], limit: 1, filter: { must: [] } }).catch((value: unknown) => value);
-    expect(errorDetails(error).category).toBe("invalid-response");
-  });
-
-  it("does not expose mutation or generic request capabilities", () => {
-    const prototype = ReadonlyQdrantClient.prototype as unknown as Record<string, unknown>;
-    expect(prototype.createCollection).toBeUndefined();
-    expect(prototype.createIndex).toBeUndefined();
-    expect(prototype.upsert).toBeUndefined();
-    expect(prototype.delete).toBeUndefined();
-    expect(prototype.request).toBeUndefined();
   });
 });

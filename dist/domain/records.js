@@ -28,8 +28,8 @@ const COMMON_KEYS = new Set(["recordType", "id", "ownerHost", "schemaRevision", 
 const DERIVED_KEYS = new Set(["coordinationPolicyHash", "coordinationPolicyEpoch"]);
 const RECORD_KEYS = {
     episode: new Set([...COMMON_KEYS, "sourceEntryId", "host", "projectId", "projectIdentityKind", "sessionId", "turnId", "agentRole", "depth", "eventKind", "eventAt", "modelId", "embeddingDimension", "originProvider", "destinationId", "status", "redactionStatus", "secretScan", "text", "toolName", "toolArgs", "errorFingerprint", "vector", "producerId", "nodeId", "sessionSequence"]),
-    curated_memory: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "contentId", "observationId", "eventAt", "effectiveAt", "sourceEpisodeIds", "manifestHash", "primaryEvidenceEpisodeId", "effectiveOrder", "stateKey", "category", "scope", "subject", "predicate", "value", "text", "provenance", "confidence", "vector"]),
-    curated_current: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "contentId", "observationId", "version", "stateKey", "resolution", "conflictManifestHash", "effectiveOrder", "sourceEpisodeIds", "text", "vector"]),
+    curated_memory: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "contentId", "observationId", "eventAt", "effectiveAt", "sourceEpisodeIds", "manifestHash", "primaryEvidenceEpisodeId", "effectiveOrder", "stateKey", "projectId", "category", "scope", "subject", "predicate", "value", "text", "provenance", "confidence", "vector"]),
+    curated_current: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "contentId", "observationId", "version", "stateKey", "resolution", "conflictManifestHash", "effectiveOrder", "sourceEpisodeIds", "projectId", "scope", "text", "vector"]),
     raptor_summary: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "generationId", "clusterId", "membershipHash", "level", "memberIds", "manifestHash", "summary", "vector", "modelId", "embeddingDimension", "promptRevision", "algorithm", "seed", "jobId", "fencingToken", "temporalFrom", "temporalTo", "coveredProjects", "algorithmParameters"]),
     collection_control: new Set([...COMMON_KEYS, "version", "activeGeneration", "activeBaseGeneration", "privacyEpoch", "coordinationPolicyEpoch", "coordinationPolicyHash", "state", "scanCursor", "lastForgetBarrier", "revokedDestinationIds"]),
     processing_policy: new Set([...COMMON_KEYS, "policy", "canonicalHash"]),
@@ -199,6 +199,7 @@ function validate(value, context) {
                 strictlySorted("provenance", value.provenance);
             }
             optionalText("stateKey", value.stateKey);
+            optionalText("projectId", value.projectId);
             optionalText("category", value.category, MAX_ID_CHARS, false);
             optionalText("scope", value.scope, MAX_ID_CHARS, false);
             optionalText("subject", value.subject, MAX_ID_CHARS, false);
@@ -259,6 +260,8 @@ function validate(value, context) {
         case "curated_current":
             integer("version", value.version, 1);
             text("stateKey", value.stateKey);
+            optionalText("projectId", value.projectId);
+            optionalText("scope", value.scope);
             try {
                 validateEffectiveOrder(value.effectiveOrder);
             }

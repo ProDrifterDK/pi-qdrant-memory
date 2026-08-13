@@ -1,8 +1,13 @@
 import { Type } from "typebox";
 import { formatMemoryContextResult, formatMemoryProvenance } from "./format.js";
-const memorySearchParameters = Type.Object({
+import { parseRetrievalWindow } from "./query.js";
+export const MEMORY_SEARCH_MODES = ["all", "current", "historical", "episodes", "curated", "raptor"];
+export const memorySearchParameters = Type.Object({
     query: Type.String({ minLength: 1, maxLength: 4000 }),
     limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
+    mode: Type.Optional(Type.Union(MEMORY_SEARCH_MODES.map((mode) => Type.Literal(mode)))),
+    after: Type.Optional(Type.String()),
+    before: Type.Optional(Type.String()),
 }, { additionalProperties: false });
 function safeLimit(value, fallback) {
     const candidate = typeof value === "number" && Number.isFinite(value) ? Math.trunc(value) : Math.trunc(fallback);
@@ -46,7 +51,14 @@ export function createMemorySearchTool(input) {
         async execute(_toolCallId, params, signal, _onUpdate, ctx) {
             try {
                 const limit = safeLimit(params.limit, input.defaultLimit);
-                const result = await input.service.search(params.query, limit, ctx, signal);
+                const window = parseRetrievalWindow(params.after, params.before);
+                const request = {
+                    query: params.query,
+                    limit,
+                    mode: params.mode ?? "all",
+                    ...window,
+                };
+                const result = await input.service.search(request, ctx, signal);
                 const budget = Math.min(input.toolResultBudgetChars, input.hardContextCharBudget);
                 const formatted = formatMemoryContextResult(result.hits, budget);
                 const details = {

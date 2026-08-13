@@ -1,43 +1,36 @@
-function clampLimit(value) {
-    if (Number.isNaN(value))
-        return 1;
-    if (value === Number.POSITIVE_INFINITY)
-        return 10;
-    if (value === Number.NEGATIVE_INFINITY)
-        return 1;
-    return Math.min(10, Math.max(1, Math.trunc(value)));
+const RRF_K = 60;
+function clampLimit(value) { return Number.isFinite(value) ? Math.min(10, Math.max(1, Math.trunc(value))) : value === Number.POSITIVE_INFINITY ? 10 : 1; }
+function key(candidate) {
+    if (candidate.lane === "historical" && candidate.observationId !== undefined)
+        return `observation:${candidate.observationId}`;
+    if (candidate.contentId !== undefined)
+        return `content:${candidate.contentId}`;
+    if (candidate.evidenceIds.length > 0)
+        return `evidence:${[...candidate.evidenceIds].sort().join("\u0000")}`;
+    return `id:${candidate.id}`;
 }
-function normalizedId(value) {
-    if (typeof value === "string" && value.length > 0)
-        return value;
-    if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
-        return String(value);
-    return undefined;
-}
+/** Deterministic reciprocal-rank fusion across incomparable internal lane scores. */
 export function mergeCandidates(input) {
-    const byId = new Map();
-    for (const [lane, candidates] of [["project", input.project], ["host", input.host]]) {
-        for (const candidate of candidates) {
-            if (!Number.isFinite(candidate.rawScore) || candidate.rawScore < input.minScore)
-                continue;
-            const id = normalizedId(candidate.id);
-            if (id === undefined)
-                continue;
-            const adjustedScore = lane === "project" ? candidate.rawScore + input.projectBoost : candidate.rawScore;
-            const normalized = { ...candidate, id, lane, adjustedScore };
-            const previous = byId.get(id);
-            if (previous === undefined || normalized.adjustedScore > previous.adjustedScore) {
-                byId.set(id, normalized);
-            }
+    const fused = new Map();
+    for (const lane of input.lanes) {
+        const ranked = [...lane].filter((candidate) => Number.isFinite(candidate.rawScore)).sort((left, right) => right.rawScore - left.rawScore || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+        for (let index = 0; index < ranked.length; index += 1) {
+            const candidate = ranked[index];
+            const score = 1 / (RRF_K + index + 1) + (candidate.projectId !== undefined ? input.projectBoost : 0);
+            const prior = fused.get(candidate.id);
+            if (prior === undefined)
+                fused.set(candidate.id, { ...candidate, adjustedScore: score, evidenceIds: [...candidate.evidenceIds] });
+            else
+                fused.set(candidate.id, { ...prior, adjustedScore: prior.adjustedScore + score });
         }
     }
-    return [...byId.values()]
-        .sort((left, right) => {
-        const scoreOrder = right.adjustedScore - left.adjustedScore;
-        if (scoreOrder !== 0)
-            return scoreOrder;
-        return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
-    })
-        .slice(0, clampLimit(input.limit));
+    const byEvidence = new Map();
+    for (const candidate of [...fused.values()].sort((a, b) => b.adjustedScore - a.adjustedScore || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
+        const candidateKey = key(candidate);
+        const prior = byEvidence.get(candidateKey);
+        if (prior === undefined || candidate.adjustedScore > prior.adjustedScore || (candidate.adjustedScore === prior.adjustedScore && candidate.id < prior.id))
+            byEvidence.set(candidateKey, candidate);
+    }
+    return [...byEvidence.values()].sort((a, b) => b.adjustedScore - a.adjustedScore || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)).slice(0, clampLimit(input.limit));
 }
 //# sourceMappingURL=merge.js.map

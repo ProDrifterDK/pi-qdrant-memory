@@ -73,4 +73,13 @@ describe("formatMemoryContext", () => {
   it("returns an empty string for empty results", () => {
     expect(formatMemoryContext([], 2000)).toBe("");
   });
+  it("labels historical validity, policy epoch, scope, and concrete evidence count", () => {
+    const block = formatMemoryContext([hit({ lane: "historical", validFrom: "2026-01-01T00:00:00.000Z", validTo: "2026-03-01T00:00:00.000Z", policyEpoch: 9, scope: "project", evidenceIds: ["episode-a", "episode-b"] })], 2000);
+    expect(block).toContain("scope=project");
+    expect(block).toContain("valid_from=2026-01-01T00:00:00.000Z");
+    expect(block).toContain("valid_to=2026-03-01T00:00:00.000Z");
+    expect(block).toContain("policy_epoch=9");
+    expect(block).toContain("evidence_count=2");
+  });
+
 });

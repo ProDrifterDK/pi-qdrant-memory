@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { MemoryClientError } from "./clients/http.js";
 import { formatMemoryContext, MEMORY_CONTEXT_CUSTOM_TYPE, } from "./format.js";
 import { buildEffectiveQuery, priorUserPromptsFromBranch, userTextFromMessage, } from "./query.js";
-const HEALTH_PROBE = "pi-qdrant-memory health probe";
 const KNOWN_ERROR_CATEGORIES = new Set([
     "timeout",
     "cancelled",
@@ -36,6 +35,9 @@ function nonSecretRevision(host, config) {
             toolResultBudgetChars: config.retrieval.toolResultBudgetChars,
             hardContextCharBudget: config.retrieval.hardContextCharBudget,
             timeoutMs: config.retrieval.timeoutMs,
+            rootScope: config.retrieval.rootScope,
+            childSearch: config.retrieval.childSearch,
+            maxClockSkewMs: config.coordination.maxClockSkewMs,
         },
     }));
 }
@@ -75,18 +77,25 @@ export class MemoryService {
         }
         this.configRevision = nonSecretRevision(dependencies.host, dependencies.config);
     }
-    async search(query, limit, ctx, signal) {
+    async search(input, ctx, signal) {
         try {
-            const normalized = query.trim();
-            if (normalized.length < 1 || normalized.length > 4000) {
+            const normalized = input.query.trim();
+            if (normalized.length < 1 || normalized.length > 4000)
                 throw new MemoryClientError("configuration", "Memory query length is invalid");
-            }
+            const destination = this.dependencies.modelDestination(ctx);
+            if (destination === undefined)
+                throw new MemoryClientError("configuration", "Active model destination is unavailable");
             const project = await this.dependencies.projectResolver(ctx.cwd);
             return await this.dependencies.retriever.search({
                 query: normalized,
                 host: this.dependencies.host,
                 project,
-                limit,
+                isChild: this.dependencies.isChild(ctx),
+                modelDestination: destination,
+                limit: input.limit,
+                mode: input.mode,
+                ...(input.after === undefined ? {} : { after: input.after }),
+                ...(input.before === undefined ? {} : { before: input.before }),
                 ...(signal === undefined ? {} : { signal }),
             });
         }
@@ -147,17 +156,14 @@ export class MemoryService {
     }
     async checkHealth(ctx) {
         try {
-            const { qdrant, embeddings } = this.dependencies;
-            if (qdrant === undefined || embeddings === undefined) {
+            const { qdrant, embeddingHealth } = this.dependencies;
+            if (qdrant === undefined)
                 throw new MemoryClientError("configuration", "Memory health dependencies are unavailable");
-            }
             await qdrant.health(ctx.signal);
             const collection = await qdrant.collectionInfo(ctx.signal);
-            if (collection.dimension !== this.dependencies.config.embeddings.dimension ||
-                collection.distance.toLowerCase() !== "cosine") {
+            if (collection.dimension !== this.dependencies.config.embeddings.dimension || collection.distance.toLowerCase() !== "cosine")
                 throw new MemoryClientError("configuration", "Memory collection is incompatible");
-            }
-            await embeddings.embedQuery(HEALTH_PROBE, ctx.signal);
+            await embeddingHealth?.(ctx.signal);
         }
         catch (error) {
             this.warn(categoryFor(error), ctx);
@@ -168,19 +174,28 @@ export class MemoryService {
     }
     async recall(effectiveQuery, ctx) {
         const project = await this.dependencies.projectResolver(ctx.cwd);
+        const destination = this.dependencies.modelDestination(ctx);
+        if (destination === undefined)
+            return { query: effectiveQuery, hits: [] };
+        const isChild = this.dependencies.isChild(ctx);
         const cacheKey = sha256(JSON.stringify([
-            ctx.sessionManager.getSessionId(),
-            project.id,
-            effectiveQuery,
-            this.configRevision,
+            ctx.sessionManager.getSessionId(), project.id, project.identityKind, effectiveQuery, this.configRevision,
+            destination.id, destination.residency, destination.dataUse, isChild,
         ]));
-        return this.dependencies.cache.getOrCreate(cacheKey, () => this.dependencies.retriever.search({
+        const promise = this.dependencies.cache.getOrCreate(cacheKey, () => this.dependencies.retriever.search({
             query: effectiveQuery,
             host: this.dependencies.host,
             project,
+            isChild,
+            modelDestination: destination,
             limit: this.dependencies.config.retrieval.topK,
+            mode: "all",
             ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
         }));
+        // Cache only the in-flight operation. A settled hit set must never bypass a
+        // later privacy-epoch/tombstone/policy barrier on a subsequent injection.
+        void promise.finally(() => this.dependencies.cache.delete(cacheKey)).catch(() => undefined);
+        return promise;
     }
     warn(category, ctx) {
         if (this.warned.has(category))

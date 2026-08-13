@@ -51,10 +51,20 @@ function provenance(hit) {
     const project = formatMemoryProvenance(hit.projectLabel);
     const sourceType = formatMemoryProvenance(hit.sourceType);
     const sourceSystem = formatMemoryProvenance(hit.sourceSystem);
-    const date = hit.createdAt === undefined
-        ? ""
-        : `, date=${formatMemoryProvenance(hit.createdAt)}`;
-    return `Source: project=${project}, type=${sourceType}, system=${sourceSystem}${date}, score=${score(hit.adjustedScore)}\n`;
+    const labels = [`project=${project}`, `type=${sourceType}`, `system=${sourceSystem}`];
+    if (hit.scope !== undefined)
+        labels.push(`scope=${formatMemoryProvenance(hit.scope)}`);
+    if (hit.createdAt !== undefined)
+        labels.push(`date=${formatMemoryProvenance(hit.createdAt)}`);
+    if (hit.validFrom !== undefined)
+        labels.push(`valid_from=${formatMemoryProvenance(hit.validFrom)}`);
+    if (hit.validTo !== undefined)
+        labels.push(`valid_to=${formatMemoryProvenance(hit.validTo)}`);
+    if (hit.policyEpoch !== undefined && Number.isSafeInteger(hit.policyEpoch))
+        labels.push(`policy_epoch=${hit.policyEpoch}`);
+    labels.push(`evidence_count=${Array.isArray(hit.evidenceIds) ? Math.min(1024, hit.evidenceIds.length) : 0}`, `score=${score(hit.adjustedScore)}`);
+    return `Source: ${labels.join(", ")}
+`;
 }
 function candidateText(hit) {
     return escapeMemoryField(typeof hit.text === "string" ? hit.text : "");

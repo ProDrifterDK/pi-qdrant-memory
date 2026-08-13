@@ -19,6 +19,8 @@ export interface CurationProjection {
     readonly observationId: string;
     readonly currentId: string;
     readonly text: string;
+    readonly scope: string;
+    readonly projectId?: string;
 }
 export declare function primaryEvidence(evidence: readonly EpisodeRecord[]): EpisodeRecord;
 export declare function projectEffectiveOrder(evidence: readonly EpisodeRecord[], value: string): EffectiveOrder;

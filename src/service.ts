@@ -4,9 +4,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import type { RecallCache } from "./cache.js";
-import type { EmbeddingsClient } from "./clients/embeddings.js";
 import { MemoryClientError, type MemoryErrorCategory } from "./clients/http.js";
-import type { ReadonlyQdrantClient } from "./clients/qdrant-readonly.js";
 import {
   formatMemoryContext,
   MEMORY_CONTEXT_CUSTOM_TYPE,
@@ -18,11 +16,13 @@ import {
   userTextFromMessage,
 } from "./query.js";
 import type {
+  MemoryReadStore,
   MemoryRetriever,
   MemorySearchResult,
 } from "./retrieval/search.js";
 import type { ExplicitSearchService } from "./tool.js";
-import type { HostId, RuntimeConfig } from "./types.js";
+import type { AuthorizedDestination, HostId, RuntimeConfig } from "./types.js";
+import type { ExplicitMemorySearchInput } from "./tool.js";
 
 type AgentMessage = ContextEvent["messages"][number];
 type WarningCategory = MemoryErrorCategory | "format" | "internal" | "host";
@@ -44,11 +44,12 @@ export interface MemoryServiceDependencies {
   projectResolver(cwd: string): Promise<ProjectIdentity>;
   cache: RecallCache<MemorySearchResult>;
   warningSink: MemoryWarningSink;
-  qdrant?: Pick<ReadonlyQdrantClient, "health" | "collectionInfo">;
-  embeddings?: Pick<EmbeddingsClient, "embedQuery">;
+  modelDestination(ctx: ExtensionContext): AuthorizedDestination | undefined;
+  isChild(ctx: ExtensionContext): boolean;
+  qdrant?: Pick<MemoryReadStore, "health" | "collectionInfo">;
+  embeddingHealth?(signal?: AbortSignal): Promise<void>;
 }
 
-const HEALTH_PROBE = "pi-qdrant-memory health probe";
 const KNOWN_ERROR_CATEGORIES = new Set<MemoryErrorCategory>([
   "timeout",
   "cancelled",
@@ -84,6 +85,9 @@ function nonSecretRevision(host: HostId, config: RuntimeConfig): string {
       toolResultBudgetChars: config.retrieval.toolResultBudgetChars,
       hardContextCharBudget: config.retrieval.hardContextCharBudget,
       timeoutMs: config.retrieval.timeoutMs,
+      rootScope: config.retrieval.rootScope,
+      childSearch: config.retrieval.childSearch,
+      maxClockSkewMs: config.coordination.maxClockSkewMs,
     },
   }));
 }
@@ -128,22 +132,26 @@ export class MemoryService implements ExplicitSearchService {
   }
 
   async search(
-    query: string,
-    limit: number,
+    input: ExplicitMemorySearchInput,
     ctx: ExtensionContext,
     signal?: AbortSignal,
   ): Promise<MemorySearchResult> {
     try {
-      const normalized = query.trim();
-      if (normalized.length < 1 || normalized.length > 4000) {
-        throw new MemoryClientError("configuration", "Memory query length is invalid");
-      }
+      const normalized = input.query.trim();
+      if (normalized.length < 1 || normalized.length > 4000) throw new MemoryClientError("configuration", "Memory query length is invalid");
+      const destination = this.dependencies.modelDestination(ctx);
+      if (destination === undefined) throw new MemoryClientError("configuration", "Active model destination is unavailable");
       const project = await this.dependencies.projectResolver(ctx.cwd);
       return await this.dependencies.retriever.search({
         query: normalized,
         host: this.dependencies.host,
         project,
-        limit,
+        isChild: this.dependencies.isChild(ctx),
+        modelDestination: destination,
+        limit: input.limit,
+        mode: input.mode,
+        ...(input.after === undefined ? {} : { after: input.after }),
+        ...(input.before === undefined ? {} : { before: input.before }),
         ...(signal === undefined ? {} : { signal }),
       });
     } catch (error: unknown) {
@@ -204,19 +212,12 @@ export class MemoryService implements ExplicitSearchService {
 
   async checkHealth(ctx: ExtensionContext): Promise<void> {
     try {
-      const { qdrant, embeddings } = this.dependencies;
-      if (qdrant === undefined || embeddings === undefined) {
-        throw new MemoryClientError("configuration", "Memory health dependencies are unavailable");
-      }
+      const { qdrant, embeddingHealth } = this.dependencies;
+      if (qdrant === undefined) throw new MemoryClientError("configuration", "Memory health dependencies are unavailable");
       await qdrant.health(ctx.signal);
       const collection = await qdrant.collectionInfo(ctx.signal);
-      if (
-        collection.dimension !== this.dependencies.config.embeddings.dimension ||
-        collection.distance.toLowerCase() !== "cosine"
-      ) {
-        throw new MemoryClientError("configuration", "Memory collection is incompatible");
-      }
-      await embeddings.embedQuery(HEALTH_PROBE, ctx.signal);
+      if (collection.dimension !== this.dependencies.config.embeddings.dimension || collection.distance.toLowerCase() !== "cosine") throw new MemoryClientError("configuration", "Memory collection is incompatible");
+      await embeddingHealth?.(ctx.signal);
     } catch (error: unknown) {
       this.warn(categoryFor(error), ctx);
     }
@@ -231,21 +232,29 @@ export class MemoryService implements ExplicitSearchService {
     ctx: ExtensionContext,
   ): Promise<MemorySearchResult> {
     const project = await this.dependencies.projectResolver(ctx.cwd);
+    const destination = this.dependencies.modelDestination(ctx);
+    if (destination === undefined) return { query: effectiveQuery, hits: [] };
+    const isChild = this.dependencies.isChild(ctx);
     const cacheKey = sha256(JSON.stringify([
-      ctx.sessionManager.getSessionId(),
-      project.id,
-      effectiveQuery,
-      this.configRevision,
+      ctx.sessionManager.getSessionId(), project.id, project.identityKind, effectiveQuery, this.configRevision,
+      destination.id, destination.residency, destination.dataUse, isChild,
     ]));
-    return this.dependencies.cache.getOrCreate(cacheKey, () =>
+    const promise = this.dependencies.cache.getOrCreate(cacheKey, () =>
       this.dependencies.retriever.search({
         query: effectiveQuery,
         host: this.dependencies.host,
         project,
+        isChild,
+        modelDestination: destination,
         limit: this.dependencies.config.retrieval.topK,
+        mode: "all",
         ...(ctx.signal === undefined ? {} : { signal: ctx.signal }),
       }),
     );
+    // Cache only the in-flight operation. A settled hit set must never bypass a
+    // later privacy-epoch/tombstone/policy barrier on a subsequent injection.
+    void promise.finally(() => this.dependencies.cache.delete(cacheKey)).catch(() => undefined);
+    return promise;
   }
 
   private warn(category: WarningCategory, ctx: ExtensionContext): void {

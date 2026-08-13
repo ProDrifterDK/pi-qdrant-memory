@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createMemorySearchTool } from "../../src/tool.js";
+import { createMemorySearchTool, memorySearchParameters } from "../../src/tool.js";
 import type { MemoryCandidate } from "../../src/retrieval/search.js";
 
 function hit(overrides: Partial<MemoryCandidate> = {}): MemoryCandidate {
@@ -30,10 +30,11 @@ describe("memory_search tool", () => {
       hardContextCharBudget: 16000,
     });
 
-    expect(Object.keys(tool.parameters.properties)).toEqual(["query", "limit"]);
+    expect(Object.keys(tool.parameters.properties)).toEqual(["query", "limit", "mode", "after", "before"]);
+    expect(Object.keys(memorySearchParameters.properties).sort()).toEqual(["after", "before", "limit", "mode", "query"]);
     expect(tool.executionMode).toBe("parallel");
-    const result = await tool.execute("call-1", { query: "alpha", limit: 3 }, signal, undefined, fakeContext);
-    expect(service.search).toHaveBeenCalledWith("alpha", 3, fakeContext, signal);
+    const result = await tool.execute("call-1", { query: "alpha", limit: 3, mode: "historical", after: "2026-08-13T10:30:00-04:00", before: "2026-08-13T16:00:00+01:00" }, signal, undefined, fakeContext);
+    expect(service.search).toHaveBeenCalledWith({ query: "alpha", limit: 3, mode: "historical", after: "2026-08-13T14:30:00.000Z", before: "2026-08-13T15:00:00.000Z" }, fakeContext, signal);
     expect(result.content[0]).toMatchObject({ type: "text" });
     expect(String(result.content[0]?.text)).toContain('<memory-context trust="untrusted">');
     expect(result.details).toMatchObject({ hitCount: 1 });
@@ -51,7 +52,7 @@ describe("memory_search tool", () => {
       hardContextCharBudget: 16000,
     });
     const result = await tool.execute("call-2", { query: "alpha" }, undefined, undefined, fakeContext);
-    expect(service.search).toHaveBeenCalledWith("alpha", 5, fakeContext, undefined);
+    expect(service.search).toHaveBeenCalledWith({ query: "alpha", limit: 5, mode: "all" }, fakeContext, undefined);
     expect(result.content).toEqual([{ type: "text", text: "Memory search is temporarily unavailable." }]);
     expect(result.details).toEqual({ hitCount: 0, hits: [] });
     expect(JSON.stringify(result)).not.toContain("secret");
@@ -75,3 +76,12 @@ describe("memory_search tool", () => {
     expect(JSON.stringify(details)).not.toContain(delimiter);
   });
 });
+
+
+  it("fails closed before the service for malformed or reversed temporal bounds", async () => {
+    const service = { search: vi.fn(async () => ({ query: "alpha", hits: [] })) };
+    const tool = createMemorySearchTool({ service, defaultLimit: 5, toolResultBudgetChars: 8000, hardContextCharBudget: 16000 });
+    const result = await tool.execute("bad-window", { query: "alpha", after: "2026-08-13T16:00:00Z", before: "2026-08-13T15:00:00Z" }, undefined, undefined, fakeContext);
+    expect(result.details).toEqual({ hitCount: 0, hits: [] });
+    expect(service.search).not.toHaveBeenCalled();
+  });

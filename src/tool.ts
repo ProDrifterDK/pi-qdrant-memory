@@ -2,14 +2,19 @@ import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding
 import { Type } from "typebox";
 import type { MemoryCandidate, MemorySearchResult } from "./retrieval/search.js";
 import { formatMemoryContextResult, formatMemoryProvenance } from "./format.js";
+import { parseRetrievalWindow } from "./query.js";
 
+export const MEMORY_SEARCH_MODES = ["all", "current", "historical", "episodes", "curated", "raptor"] as const;
+export type MemorySearchMode = typeof MEMORY_SEARCH_MODES[number];
+export interface ExplicitMemorySearchInput {
+  query: string;
+  limit: number;
+  mode: MemorySearchMode;
+  after?: string;
+  before?: string;
+}
 export interface ExplicitSearchService {
-  search(
-    query: string,
-    limit: number,
-    ctx: ExtensionContext,
-    signal?: AbortSignal,
-  ): Promise<MemorySearchResult>;
+  search(input: ExplicitMemorySearchInput, ctx: ExtensionContext, signal?: AbortSignal): Promise<MemorySearchResult>;
 }
 
 export interface MemorySearchDetails {
@@ -28,9 +33,12 @@ export interface MemorySearchDetails {
   >>;
 }
 
-const memorySearchParameters = Type.Object({
+export const memorySearchParameters = Type.Object({
   query: Type.String({ minLength: 1, maxLength: 4000 }),
   limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
+  mode: Type.Optional(Type.Union(MEMORY_SEARCH_MODES.map((mode) => Type.Literal(mode)))),
+  after: Type.Optional(Type.String()),
+  before: Type.Optional(Type.String()),
 }, { additionalProperties: false });
 
 function safeLimit(value: unknown, fallback: number): number {
@@ -80,7 +88,14 @@ export function createMemorySearchTool(input: {
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
         const limit = safeLimit(params.limit, input.defaultLimit);
-        const result = await input.service.search(params.query, limit, ctx, signal);
+        const window = parseRetrievalWindow(params.after, params.before);
+        const request: ExplicitMemorySearchInput = {
+          query: params.query,
+          limit,
+          mode: params.mode ?? "all",
+          ...window,
+        };
+        const result = await input.service.search(request, ctx, signal);
         const budget = Math.min(input.toolResultBudgetChars, input.hardContextCharBudget);
         const formatted = formatMemoryContextResult(result.hits, budget);
         const details: MemorySearchDetails = {

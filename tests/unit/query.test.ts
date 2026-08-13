@@ -3,6 +3,7 @@ import {
   buildEffectiveQuery,
   isNaturalLanguagePrompt,
   priorUserPromptsFromBranch,
+  parseRetrievalWindow,
   userTextFromMessage,
 } from "../../src/query.js";
 
@@ -71,5 +72,27 @@ describe("buildEffectiveQuery", () => {
     expect(buildEffectiveQuery("  hello\n\tworld ", [])).toBe("hello world");
     expect(buildEffectiveQuery(" /help ", ["a substantive prompt that should not be used"])).toBeUndefined();
     expect(buildEffectiveQuery("   ", ["a substantive prompt that should not be used"])).toBeUndefined();
+  });
+});
+
+
+describe("parseRetrievalWindow", () => {
+  it("accepts strict RFC3339 offsets and canonicalizes them to instants", () => {
+    expect(parseRetrievalWindow("2026-08-13T10:30:00-04:00", "2026-08-13T16:00:00+01:00")).toEqual({
+      after: "2026-08-13T14:30:00.000Z",
+      before: "2026-08-13T15:00:00.000Z",
+    });
+    expect(parseRetrievalWindow(undefined, "2026-08-13T15:00:00Z")).toEqual({ before: "2026-08-13T15:00:00.000Z" });
+  });
+
+  it.each([
+    ["2026-08-13", undefined],
+    ["2026-08-13T15:00:00", undefined],
+    ["2026-02-30T15:00:00Z", undefined],
+    ["2026-08-13T25:00:00Z", undefined],
+    ["2026-08-13T15:00:00+25:00", undefined],
+    ["2026-08-13T16:00:00Z", "2026-08-13T15:00:00Z"],
+  ])("rejects malformed or reversed bounds (%s, %s)", (after, before) => {
+    expect(() => parseRetrievalWindow(after, before)).toThrow(/retrieval time/i);
   });
 });

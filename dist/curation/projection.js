@@ -42,7 +42,7 @@ export function projectCurationItem(host, policyHash, policyEpoch, item, episode
     const primary = primaryEvidence(present);
     const occurrence = observationId(policyEpoch, content, primary.id, order);
     const text = projectCurationText(item);
-    return Object.freeze({ stateKey: state, contentId: content, effectiveOrder: order, primary, evidence: Object.freeze(present), observationId: occurrence, currentId: curatedCurrentId(host, state, policyEpoch), text });
+    return Object.freeze({ stateKey: state, contentId: content, effectiveOrder: order, primary, evidence: Object.freeze(present), observationId: occurrence, currentId: curatedCurrentId(host, state, policyEpoch), text, scope: item.scope, ...(projectId === undefined ? {} : { projectId }) });
 }
 function orderKey(order) { return canonicalStringify(order); }
 function laterDeterministic(left, right) {

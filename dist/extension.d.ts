@@ -1,7 +1,7 @@
 import type { ExtensionContext, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { type ProjectIdentity } from "./project.js";
 import { type MemoryWarningSink } from "./service.js";
-import type { HostId, RuntimeConfig } from "./types.js";
+import type { AuthorizedDestination, HostId, RuntimeConfig } from "./types.js";
 type Environment = Record<string, string | undefined>;
 export interface MemoryExtensionDependencies {
     env?: Environment;
@@ -13,6 +13,8 @@ export interface MemoryExtensionDependencies {
     projectResolver?(cwd: string): Promise<ProjectIdentity>;
     now?: () => number;
     warningSink?: MemoryWarningSink;
+    modelDestinationResolver?(ctx: ExtensionContext, config: RuntimeConfig): AuthorizedDestination | undefined;
+    isChildResolver?(ctx: ExtensionContext, host: HostId, env: Environment): boolean;
 }
 /** Host/config gate shared by both lifecycle hooks. */
 export declare function serviceAutoRecallEnabled(ctx: ExtensionContext, host: HostId | undefined, config: RuntimeConfig | undefined, env?: Environment): boolean;

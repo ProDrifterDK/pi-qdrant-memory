@@ -135,8 +135,8 @@ export function bindConfiguredDestination(input: {
   const exact = (left: AuthorizedDestination, right: AuthorizedDestination): boolean => left.id === right.id && left.residency === right.residency && left.dataUse === right.dataUse;
   const valid = (destination: AuthorizedDestination): void => {
     if (typeof destination?.id !== "string" || destination.id.length === 0 || destination.id.length > 256 || !/^[A-Za-z0-9._:/-]+$/u.test(destination.id)) throw new TypeError("Configured destination identity is invalid");
-    const checked = redactAndScan({ text: destination.id, maxChars: 256, homeDir: "/" });
-    if (checked.dropped || checked.redactionStatus !== "unchanged" || checked.text !== destination.id) throw new TypeError("Configured destination identity is unsafe");
+    const derivedLocal = egressMode === "local_only" && /^local:[a-f0-9]{32}$/u.test(destination.id);
+    if (!derivedLocal) { const checked = redactAndScan({ text: destination.id, maxChars: 256, homeDir: "/" }); if (checked.dropped || checked.redactionStatus !== "unchanged" || checked.text !== destination.id) throw new TypeError("Configured destination identity is unsafe"); }
     validLabels(destination);
   };
   valid(configuredDestination); valid(requestedDestination);

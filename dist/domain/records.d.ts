@@ -71,6 +71,7 @@ export interface CuratedMemoryRecord extends DerivedEnvelope {
     primaryEvidenceEpisodeId?: string;
     effectiveOrder: EffectiveOrder;
     stateKey?: string;
+    projectId?: string;
     category?: string;
     scope?: string;
     subject?: string;
@@ -88,6 +89,8 @@ interface CuratedCurrentBase extends DerivedEnvelope {
     stateKey: string;
     effectiveOrder: EffectiveOrder;
     sourceEpisodeIds?: string[];
+    projectId?: string;
+    scope?: string;
     text?: string;
     vector?: number[];
 }

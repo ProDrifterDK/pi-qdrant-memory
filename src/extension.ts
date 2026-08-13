@@ -5,20 +5,21 @@ import type {
   ExtensionFactory,
 } from "@earendil-works/pi-coding-agent";
 import { RecallCache } from "./cache.js";
-import { EmbeddingsClient } from "./clients/embeddings.js";
+import { EmbeddingsClient, bindEmbeddingDestination, bindEmbeddingDocumentClient, createEmbeddingDestinationFactory } from "./clients/embeddings.js";
 import { MemoryClientError } from "./clients/http.js";
-import { ReadonlyQdrantClient } from "./clients/qdrant-readonly.js";
+import { destinationForEndpoint } from "./security/egress.js";
+import type { ControlRecord } from "./domain/records.js";
 import { loadConfig } from "./config.js";
 import { detectHost, resolvePrimeRlmDepth } from "./host.js";
 import { resolveProjectIdentity, type ProjectIdentity } from "./project.js";
-import { MemoryRetriever, type MemorySearchResult } from "./retrieval/search.js";
+import { createGuardedMemoryReadStore, MemoryRetriever, type MemorySearchResult } from "./retrieval/search.js";
 import {
   MemoryService,
   type MemoryWarning,
   type MemoryWarningSink,
 } from "./service.js";
 import { createMemorySearchTool, type ExplicitSearchService } from "./tool.js";
-import type { HostId, RuntimeConfig } from "./types.js";
+import type { AuthorizedDestination, HostId, RuntimeConfig } from "./types.js";
 
 const DEFAULT_TOP_K = 5;
 const DEFAULT_TOOL_BUDGET = 8000;
@@ -38,6 +39,8 @@ export interface MemoryExtensionDependencies {
   projectResolver?(cwd: string): Promise<ProjectIdentity>;
   now?: () => number;
   warningSink?: MemoryWarningSink;
+  modelDestinationResolver?(ctx: ExtensionContext, config: RuntimeConfig): AuthorizedDestination | undefined;
+  isChildResolver?(ctx: ExtensionContext, host: HostId, env: Environment): boolean;
 }
 
 class DisabledMemoryService implements ExplicitSearchService {
@@ -83,12 +86,37 @@ export function serviceAutoRecallEnabled(
     !config.enabled ||
     !config.autoRecall
   ) return false;
-  if (host === "pi") return true;
-  try {
-    return resolvePrimeRlmDepth(ctx.sessionManager.getHeader(), env) === 0;
-  } catch {
-    return false;
+  try { return resolvePrimeRlmDepth(ctx.sessionManager.getHeader(), env) === 0; }
+  catch { return false; }
+}
+
+function sameDestination(left: AuthorizedDestination, right: AuthorizedDestination): boolean { return left.id === right.id && left.residency === right.residency && left.dataUse === right.dataUse; }
+function activeModelDestination(ctx: ExtensionContext, config: RuntimeConfig): AuthorizedDestination | undefined {
+  const model = ctx.model; if (model === undefined) return undefined;
+  if (config.privacy.egressMode === "local_only") {
+    const nodeId = config.outbox.nodeId; if (nodeId === undefined) return undefined;
+    try { return destinationForEndpoint(model.baseUrl, nodeId, { residency: "local", dataUse: "memory" }); } catch { return undefined; }
   }
+  const ids = new Set([model.id, `${model.provider}/${model.id}`]);
+  const matches = config.privacy.allowedLlmDestinations.filter((destination) => ids.has(destination.id));
+  return matches.length === 1 ? Object.freeze({ ...matches[0]! }) : undefined;
+}
+function configuredQdrantDestination(config: RuntimeConfig): AuthorizedDestination | undefined {
+  if (config.privacy.egressMode === "local_only") {
+    const nodeId = config.outbox.nodeId; if (nodeId === undefined) return undefined;
+    try { return destinationForEndpoint(config.qdrant.url, nodeId, { residency: "local", dataUse: "memory" }); } catch { return undefined; }
+  }
+  return config.privacy.allowedQdrantDestinations.length === 1 ? Object.freeze({ ...config.privacy.allowedQdrantDestinations[0]! }) : undefined;
+}
+function configuredEmbeddingDestination(config: RuntimeConfig): AuthorizedDestination | undefined {
+  if (config.privacy.egressMode === "local_only") {
+    const nodeId = config.outbox.nodeId; if (nodeId === undefined) return undefined;
+    try { return destinationForEndpoint(config.embeddings.baseUrl, nodeId, { residency: "local", dataUse: "memory" }); } catch { return undefined; }
+  }
+  return config.privacy.allowedEmbeddingDestinations.length === 1 ? Object.freeze({ ...config.privacy.allowedEmbeddingDestinations[0]! }) : undefined;
+}
+function contextIsChild(ctx: ExtensionContext, _host: HostId, env: Environment): boolean {
+  try { return resolvePrimeRlmDepth(ctx.sessionManager.getHeader(), env) > 0; } catch { return true; }
 }
 
 /** Build a testable factory while keeping the default export host-portable. */
@@ -146,6 +174,7 @@ export function createMemoryExtension(
         config = await loadConfig(host, configDependencies);
 
         if (config.enabled) {
+          const activeConfig = config;
           const embeddings = new EmbeddingsClient(clientOptions({
             baseUrl: config.embeddings.baseUrl,
             model: config.embeddings.model,
@@ -153,16 +182,26 @@ export function createMemoryExtension(
             queryPrefix: config.embeddings.queryPrefix,
             timeoutMs: config.retrieval.timeoutMs,
           }, config.embeddings.apiKey, dependencies.fetchImpl));
-          const qdrant = new ReadonlyQdrantClient(clientOptions({
+          let validatedEmbeddings: ReturnType<typeof bindEmbeddingDocumentClient> | undefined;
+          try { validatedEmbeddings = bindEmbeddingDocumentClient({ endpoint: config.embeddings.baseUrl, client: embeddings }); } catch { validatedEmbeddings = undefined; }
+          const qdrantDestination = configuredQdrantDestination(activeConfig); if (qdrantDestination === undefined) throw new MemoryClientError("configuration", "Qdrant destination binding is unavailable");
+          const qdrant = createGuardedMemoryReadStore(clientOptions({
             baseUrl: config.qdrant.url,
             collection: config.qdrant.collection,
+            ownerHost: host,
             timeoutMs: config.retrieval.timeoutMs,
+            readConsistency: config.coordination.readConsistency,
+            maxClockSkewMs: config.coordination.maxClockSkewMs,
+            destination: qdrantDestination,
+            egressMode: config.privacy.egressMode,
+            ...(config.outbox.nodeId === undefined ? {} : { nodeId: config.outbox.nodeId }),
           }, config.qdrant.apiKey, dependencies.fetchImpl));
-          const retriever = new MemoryRetriever({
-            embeddings,
-            qdrant,
-            config: config.retrieval,
-          });
+          const resolveEmbedding = async (control: ControlRecord) => {
+            const destination = configuredEmbeddingDestination(activeConfig); if (destination === undefined || validatedEmbeddings === undefined || control.ownerHost !== host || control.state !== "active" || control.revokedDestinationIds.includes(destination.id)) return undefined;
+            const factory = createEmbeddingDestinationFactory({ endpoint: activeConfig.embeddings.baseUrl, destination, client: validatedEmbeddings, egressMode: activeConfig.privacy.egressMode, ...(activeConfig.outbox.nodeId === undefined ? {} : { nodeId: activeConfig.outbox.nodeId }), coordinationPolicyHash: control.coordinationPolicyHash, coordinationPolicyEpoch: control.coordinationPolicyEpoch });
+            return Object.freeze({ embedding: bindEmbeddingDestination(factory, destination), destination });
+          };
+          const retriever = new MemoryRetriever({ reader: qdrant, config: config.retrieval, resolveEmbedding, queryPrefix: config.embeddings.queryPrefix, maxClockSkewMs: config.coordination.maxClockSkewMs, ...(dependencies.now === undefined ? {} : { now: dependencies.now }) });
           const cacheOptions = {
             maxEntries: CACHE_MAX_ENTRIES,
             ttlMs: CACHE_TTL_MS,
@@ -175,8 +214,14 @@ export function createMemoryExtension(
             projectResolver: dependencies.projectResolver ?? resolveProjectIdentity,
             cache: new RecallCache<MemorySearchResult>(cacheOptions),
             warningSink: warnOnce,
+            modelDestination: (ctx) => (dependencies.modelDestinationResolver ?? activeModelDestination)(ctx, activeConfig),
+            isChild: (ctx) => (dependencies.isChildResolver ?? contextIsChild)(ctx, host!, env),
             qdrant,
-            embeddings,
+            embeddingHealth: async (signal) => {
+              const before = await qdrant.readControl(); const resolved = await resolveEmbedding(before); if (resolved === undefined) return;
+              await resolved.embedding.embed({ model: activeConfig.embeddings.model, text: "pi-qdrant-memory health probe", ...(signal === undefined ? {} : { signal }) });
+              const after = await qdrant.readControl(); if (before.contentHash !== after.contentHash) throw new MemoryClientError("configuration", "Memory authority changed during health probe");
+            },
           });
         }
       } catch {

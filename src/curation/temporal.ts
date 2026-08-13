@@ -384,7 +384,7 @@ export async function materializeCuration(authority: LeaseAuthority, input: Mate
       contentHash: "pending", contentId: contentIdValue, observationId: observationIdValue,
       eventAt: primary.eventAt, effectiveAt: primary.eventAt, sourceEpisodeIds: [...item.evidence].sort(),
       primaryEvidenceEpisodeId: primary.id, effectiveOrder, stateKey: stateKeyValue,
-      category: item.category, scope: item.scope, subject: item.subject, predicate: item.predicate,
+      category: item.category, scope: item.scope, ...(projection.projectId === undefined ? {} : { projectId: projection.projectId }), subject: item.subject, predicate: item.predicate,
       ...(item.value === undefined ? {} : { value: item.value }), text: material.text,
       provenance: [...item.evidence].sort(), ...(item.confidence === undefined ? {} : { confidence: item.confidence }),
       coordinationPolicyHash: authority.coordinationPolicyHash, coordinationPolicyEpoch: authority.coordinationPolicyEpoch,
@@ -459,6 +459,7 @@ export async function materializeCuration(authority: LeaseAuthority, input: Mate
         createdAt: currentCreatedAt, privacyEpoch: authority.privacyEpoch, processingPolicyId: policy.id,
         expiresAt: policy.expiresAt, contentHash: "pending", version: (current?.version ?? 0) + 1,
         stateKey: stateKeyValue, effectiveOrder: storedObservation.effectiveOrder,
+        scope: projection.scope, ...(projection.projectId === undefined ? {} : { projectId: projection.projectId }),
         sourceEpisodeIds: [...storedObservation.sourceEpisodeIds ?? []],
         coordinationPolicyHash: authority.coordinationPolicyHash, coordinationPolicyEpoch: authority.coordinationPolicyEpoch,
       };

@@ -14,11 +14,15 @@ const hit: MemoryCandidate = {
   text: "A recalled fact",
   rawScore: 0.9,
   adjustedScore: 0.95,
-  lane: "project",
+  lane: "episodes",
+  recordType: "episode",
   projectId: "project-id",
   projectLabel: "project",
-  sourceType: "conversation",
+  sourceType: "user",
   sourceSystem: "pi",
+  evidenceIds: ["memory-1"],
+  processingPolicyId: "policy-1",
+  privacyEpoch: 0,
 };
 
 function config(overrides: Partial<RuntimeConfig["retrieval"]> = {}): RuntimeConfig {
@@ -90,10 +94,10 @@ function makeService(input: {
   runtimeConfig?: RuntimeConfig;
   cache?: RecallCache<MemorySearchResult>;
   search?: ReturnType<typeof vi.fn>;
-  projectResolver?: (cwd: string) => Promise<{ id: string; label: string }>;
+  projectResolver?: (cwd: string) => Promise<{ id: string; label: string; identityKind: "registered" | "local_only" }>;
   warnings?: MemoryWarning[];
   qdrant?: { health(signal?: AbortSignal): Promise<void>; collectionInfo(signal?: AbortSignal): Promise<{ dimension: number; distance: string }> };
-  embeddings?: { embedQuery(query: string, signal?: AbortSignal): Promise<number[]> };
+  embeddingHealth?: (signal?: AbortSignal) => Promise<void>;
 } = {}) {
   const runtimeConfig = input.runtimeConfig ?? config();
   const search = input.search ?? vi.fn(async ({ query }: { query: string }) => ({ query, hits: [hit] }));
@@ -102,23 +106,40 @@ function makeService(input: {
     health: vi.fn(async () => undefined),
     collectionInfo: vi.fn(async () => ({ dimension: runtimeConfig.embeddings.dimension, distance: "Cosine" })),
   };
-  const embeddings = input.embeddings ?? {
-    embedQuery: vi.fn(async () => Array.from({ length: runtimeConfig.embeddings.dimension }, () => 0)),
-  };
+  const embeddingHealth = input.embeddingHealth ?? vi.fn(async () => undefined);
   const service = new MemoryService({
     host: runtimeConfig.host,
     config: runtimeConfig,
     retriever: { search },
-    projectResolver: input.projectResolver ?? (async () => ({ id: "project-id", label: "project" })),
+    projectResolver: input.projectResolver ?? (async () => ({ id: "project-id", label: "project", identityKind: "registered" })),
     cache: input.cache ?? new RecallCache({ maxEntries: 32, ttlMs: 300_000 }),
     warningSink: (warning) => { warnings.push(warning); },
+    modelDestination: () => ({ id: "provider/model", residency: "local", dataUse: "memory" }),
+    isChild: () => false,
     qdrant,
-    embeddings,
+    embeddingHealth,
   });
-  return { service, search, warnings, qdrant, embeddings };
+  return { service, search, warnings, qdrant, embeddingHealth };
 }
 
 describe("MemoryService recall lifecycle", () => {
+
+  it("binds explicit search to the active model, child role, project, mode and canonical window", async () => {
+    const search = vi.fn(async ({ query }: { query: string }) => ({ query, hits: [] }));
+    const runtimeConfig = config(); const warnings: MemoryWarning[] = [];
+    const service = new MemoryService({ host: "prime", config: runtimeConfig, retriever: { search }, projectResolver: async () => ({ id: "project-id", label: "project", identityKind: "registered" }), cache: new RecallCache({ maxEntries: 4, ttlMs: 1000 }), warningSink: (warning) => warnings.push(warning), modelDestination: () => ({ id: "provider/model", residency: "approved", dataUse: "memory" }), isChild: () => true });
+    await service.search({ query: " alpha ", limit: 3, mode: "historical", after: "2026-08-13T14:30:00.000Z", before: "2026-08-13T15:00:00.000Z" }, context());
+    expect(search).toHaveBeenCalledWith({ query: "alpha", host: "prime", project: { id: "project-id", label: "project", identityKind: "registered" }, isChild: true, modelDestination: { id: "provider/model", residency: "approved", dataUse: "memory" }, limit: 3, mode: "historical", after: "2026-08-13T14:30:00.000Z", before: "2026-08-13T15:00:00.000Z" });
+    expect(warnings).toEqual([]);
+  });
+
+  it("never calls retrieval when the active model has no trusted destination binding", async () => {
+    const search = vi.fn(); const runtimeConfig = config();
+    const service = new MemoryService({ host: "prime", config: runtimeConfig, retriever: { search }, projectResolver: async () => ({ id: "project-id", label: "project", identityKind: "registered" }), cache: new RecallCache({ maxEntries: 4, ttlMs: 1000 }), warningSink: () => undefined, modelDestination: () => undefined, isChild: () => false });
+    await expect(service.search({ query: "alpha", limit: 3, mode: "all" }, context())).rejects.toThrow("Memory recall is unavailable");
+    expect(search).not.toHaveBeenCalled();
+  });
+
   it("uses the same key before and after the host persists the accepted user leaf", async () => {
     const branch: unknown[] = [branchMessage(user("Explain the cache consistency requirements in detail"), "prior")];
     const ctx = context({ branch: () => branch });
@@ -145,16 +166,25 @@ describe("MemoryService recall lifecycle", () => {
     expect(ctx.sessionManager.getBranch()).not.toContainEqual(expect.objectContaining({ customType: MEMORY_CONTEXT_CUSTOM_TYPE }));
   });
 
-  it("removes prior plugin messages and appends at most one fresh block on retries and tool calls", async () => {
+  it("removes prior plugin messages, revalidates settled recalls, and appends at most one fresh block", async () => {
     const ctx = context();
     const { service, search } = makeService();
     const messages: AgentMessages = [user("A sufficiently detailed repeated memory question")];
     const first = await service.inject(messages, ctx);
     const second = await service.inject(first, ctx);
 
-    expect(search).toHaveBeenCalledTimes(1);
+    expect(search).toHaveBeenCalledTimes(2);
     expect(second.filter((message) => message.role === "custom" && message.customType === MEMORY_CONTEXT_CUSTOM_TYPE)).toHaveLength(1);
     expect(messages).toHaveLength(1);
+  });
+
+
+  it("does not reuse a settled result after a later privacy barrier hides it", async () => {
+    const search = vi.fn().mockResolvedValueOnce({ query: "alpha", hits: [hit] }).mockResolvedValueOnce({ query: "alpha", hits: [] });
+    const { service } = makeService({ search }); const ctx = context(); const messages = [user("A sufficiently detailed privacy barrier query")] as AgentMessages;
+    const first = await service.inject(messages, ctx); expect(first.some((message) => message.role === "custom")).toBe(true);
+    const second = await service.inject(first, ctx); expect(second.some((message) => message.role === "custom")).toBe(false);
+    expect(search).toHaveBeenCalledTimes(2);
   });
 
   it("reuses queued and repeated effective queries without using the mutable leaf id", async () => {
@@ -173,7 +203,7 @@ describe("MemoryService recall lifecycle", () => {
       user("more?", 3),
     ], ctx);
 
-    expect(search).toHaveBeenCalledTimes(1);
+    expect(search).toHaveBeenCalledTimes(2);
   });
 
   it("isolates branch-effective queries and session ids and supports explicit session clear", async () => {
@@ -249,7 +279,7 @@ describe("MemoryService recall lifecycle", () => {
     const { service, warnings } = makeService({ search });
     const ctx = context();
 
-    await expect(service.search("A valid explicit memory query", 5, ctx)).rejects.toThrow("Memory recall is unavailable");
+    await expect(service.search({ query: "A valid explicit memory query", limit: 5, mode: "all" }, ctx)).rejects.toThrow("Memory recall is unavailable");
     expect(warnings).toEqual([{ category: "internal", message: "pi-qdrant-memory: recall unavailable (internal)." }]);
     expect(JSON.stringify(warnings)).not.toContain("query and response secret");
   });
@@ -259,16 +289,16 @@ describe("MemoryService health", () => {
   it("uses a fixed non-sensitive probe and validates dimension and Cosine distance", async () => {
     const health = vi.fn(async () => undefined);
     const collectionInfo = vi.fn(async () => ({ dimension: 1024, distance: "cosine" }));
-    const embedQuery = vi.fn(async () => Array.from({ length: 1024 }, () => 0));
+    const embeddingHealth = vi.fn(async () => undefined);
     const { service, warnings } = makeService({
       qdrant: { health, collectionInfo },
-      embeddings: { embedQuery },
+      embeddingHealth,
     });
 
     await expect(service.checkHealth(context())).resolves.toBeUndefined();
     expect(health).toHaveBeenCalledTimes(1);
     expect(collectionInfo).toHaveBeenCalledTimes(1);
-    expect(embedQuery).toHaveBeenCalledWith("pi-qdrant-memory health probe", undefined);
+    expect(embeddingHealth).toHaveBeenCalledWith(undefined);
     expect(warnings).toEqual([]);
   });
 

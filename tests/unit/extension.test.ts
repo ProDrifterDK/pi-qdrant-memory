@@ -8,6 +8,12 @@ import type {
 import { describe, expect, it, vi } from "vitest";
 import extension, { createMemoryExtension } from "../../src/extension.js";
 import { MEMORY_CONTEXT_CUSTOM_TYPE } from "../../src/format.js";
+import { canonicalRecordHash, type ControlRecord, type EpisodeRecord, type ProcessingPolicyRecord } from "../../src/domain/records.js";
+import { processingPolicyHash, type ProcessingPolicy } from "../../src/domain/policy.js";
+import { COLLECTION_CONTROL_ID } from "../../src/qdrant/schema.js";
+import { physicalPointIdFor } from "../../src/qdrant/client.js";
+import { recordPayload } from "../../src/qdrant/write.js";
+import { destinationForEndpoint } from "../../src/security/egress.js";
 
 type Handler = (event: any, ctx: ExtensionContext) => unknown;
 type AgentMessages = ContextEvent["messages"];
@@ -50,6 +56,7 @@ function ctx(input: {
       getBranch: () => branch,
       getHeader: () => input.header ?? null,
     },
+    model: { id: "model", provider: "provider", baseUrl: "http://127.0.0.1:9999/v1" },
   } as unknown as ExtensionContext;
   return { value, branch, notifications };
 }
@@ -69,39 +76,41 @@ function hostConfig(autoRecall = true) {
       timeoutMs: 2500,
     },
     prime: { enabled: true, autoRecall },
+    outbox: { nodeId: "node-test" },
+    coordination: { readConsistency: 1, maxClockSkewMs: 300000 },
     pi: { enabled: true, autoRecall },
   });
 }
 
 function runtimeFetch(host: "prime" | "pi") {
   const calls: Array<{ url: string; body?: any }> = [];
-  const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
-    const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
-    calls.push({ url, body });
-    if (url.endsWith("/healthz")) return new Response("ok");
-    const collection = host === "pi" ? "pi_memory" : "prime_memory";
-    if (url.endsWith(`/collections/${collection}`)) {
-      return new Response(JSON.stringify({ result: { config: { params: { vectors: { size: 1024, distance: "Cosine" } } } } }));
+  const collection = host === "pi" ? "pi_memory" : "prime_memory";
+  const qdrantDestination = destinationForEndpoint("http://127.0.0.1:6333", "node-test", { residency: "local", dataUse: "memory" });
+  const embeddingDestination = destinationForEndpoint("http://127.0.0.1:8080/v1", "node-test", { residency: "local", dataUse: "memory" });
+  const llmDestination = destinationForEndpoint("http://127.0.0.1:9999/v1", "node-test", { residency: "local", dataUse: "memory" });
+  const policyBase: ProcessingPolicy = { id: "pending", ownerHost: host, destinationIds: { qdrant: qdrantDestination.id, embedding: embeddingDestination.id, llm: llmDestination.id }, originProvider: "provider", allowCrossProviderReplay: false, expiresAt: null, residency: "local", dataUse: "memory", policyRevision: "processing-policy-v1" };
+  const policy: ProcessingPolicy = { ...policyBase, id: processingPolicyHash(policyBase) };
+  const canonical = <T extends { contentHash: string }>(value: T): T => ({ ...value, contentHash: canonicalRecordHash(value as never) });
+  const policyRecord = canonical<ProcessingPolicyRecord>({ recordType: "processing_policy", id: policy.id, ownerHost: host, schemaRevision: 1, createdAt: "2026-08-13T15:00:00.000Z", privacyEpoch: 0, processingPolicyId: policy.id, expiresAt: null, policy, canonicalHash: policy.id, contentHash: "pending" });
+  const control = canonical<ControlRecord>({ recordType: "collection_control", id: COLLECTION_CONTROL_ID, ownerHost: host, schemaRevision: 1, createdAt: "2026-08-13T15:00:00.000Z", privacyEpoch: 0, processingPolicyId: policy.id, expiresAt: null, version: 1, activeGeneration: null, activeBaseGeneration: null, coordinationPolicyEpoch: 1, coordinationPolicyHash: "coord-hash", state: "active", scanCursor: null, lastForgetBarrier: null, revokedDestinationIds: [], contentHash: "pending" });
+  const episode = canonical<EpisodeRecord>({ recordType: "episode", id: "11111111-1111-5111-8111-111111111111", ownerHost: host, schemaRevision: 1, createdAt: "2026-08-13T15:00:00.000Z", privacyEpoch: 0, processingPolicyId: policy.id, expiresAt: null, sourceEntryId: "entry-1", host, projectId: "project-id", projectIdentityKind: "registered", sessionId: "session-1", turnId: "turn-1", agentRole: "root", depth: 0, eventKind: "user", eventAt: "2026-08-13T15:00:00.000Z", modelId: "model", embeddingDimension: 1024, originProvider: "provider", destinationId: llmDestination.id, status: "active", redactionStatus: "unchanged", secretScan: "passed", text: "Portable recalled context for root agents", vector: Array.from({ length: 1024 }, () => 0.1), contentHash: "pending" });
+  const points = new Map([
+    [COLLECTION_CONTROL_ID, { id: COLLECTION_CONTROL_ID, payload: recordPayload(control) }],
+    [physicalPointIdFor("processing_policy", policy.id), { id: physicalPointIdFor("processing_policy", policy.id), payload: recordPayload(policyRecord) }],
+    [episode.id, { id: episode.id, payload: recordPayload(episode), vector: { semantic: episode.vector! } }],
+  ]);
+  const fetchImpl = vi.fn(async (rawUrl: string, init?: RequestInit) => {
+    const parsedUrl = new URL(rawUrl); const body = init?.body === undefined ? undefined : JSON.parse(String(init.body)); calls.push({ url: rawUrl, body });
+    if (parsedUrl.pathname === "/healthz") return new Response("ok");
+    if (parsedUrl.pathname === `/collections/${collection}`) return new Response(JSON.stringify({ result: { config: { params: { vectors: { semantic: { size: 1024, distance: "Cosine" } } } } } }));
+    if (parsedUrl.pathname.endsWith("/embeddings")) return new Response(JSON.stringify({ data: [{ embedding: Array.from({ length: 1024 }, () => 0.1) }] }));
+    if (parsedUrl.pathname.endsWith("/points/scroll")) return new Response(JSON.stringify({ result: { points: [{ id: episode.id, payload: recordPayload(episode), vector: { semantic: episode.vector! } }], next_page_offset: null } }));
+    if (parsedUrl.pathname.endsWith("/points/search")) {
+      const wantsEpisode = body?.filter?.must?.some((condition: any) => condition.key === "record_type" && (condition.match?.value === "episode" || condition.match?.any?.includes("episode")));
+      return new Response(JSON.stringify({ result: wantsEpisode ? [{ id: episode.id, score: 0.9, payload: recordPayload(episode), vector: { semantic: episode.vector! } }] : [] }));
     }
-    if (url.endsWith("/embeddings")) {
-      return new Response(JSON.stringify({ data: [{ embedding: Array.from({ length: 1024 }, () => 0.1) }] }));
-    }
-    if (url.endsWith("/points/search")) {
-      const isProject = body?.filter?.must?.some((condition: any) => condition.key === "project_id");
-      const result = isProject ? [{
-        id: "memory-1",
-        score: 0.9,
-        payload: {
-          text: "Portable recalled context",
-          host,
-          project_id: "project-id",
-          project_label: "project",
-          source_type: "conversation",
-          source_system: "hermes",
-          status: "active",
-          secret_scan: "passed",
-        },
-      }] : [];
+    if (parsedUrl.pathname.endsWith("/points/retrieve")) {
+      const result = (body?.ids ?? []).map((id: string) => points.get(id)).filter(Boolean);
       return new Response(JSON.stringify({ result }));
     }
     return new Response("not found", { status: 404 });
@@ -118,7 +127,7 @@ function factoryFor(host: "prime" | "pi", input: { autoRecall?: boolean; fetchIm
       homeDir: "/home/test",
       readTextFile: async () => hostConfig(input.autoRecall ?? true),
       fetchImpl: input.fetchImpl ?? runtime.fetchImpl,
-      projectResolver: async () => ({ id: "project-id", label: "project" }),
+      projectResolver: async () => ({ id: "project-id", label: "project", identityKind: "registered" }),
     }),
     calls: runtime.calls,
     fetchImpl: runtime.fetchImpl,
@@ -182,9 +191,9 @@ describe("portable memory extension", () => {
     const fake = fakeApi();
     await runtime.factory(fake.api);
     const context = ctx({ header: { rlmDepth: 0 } });
-    const messages = [user("Explain portable root-agent auto recall behavior")];
+    const messages = [user("Portable recalled context for root agents")];
 
-    await invokeBefore(fake.handler("before_agent_start"), "Explain portable root-agent auto recall behavior", context.value);
+    await invokeBefore(fake.handler("before_agent_start"), "Portable recalled context for root agents", context.value);
     const result = await fake.handler("context")({ type: "context", messages }, context.value) as { messages: AgentMessages };
     const recalled = result.messages.filter((message) => message.role === "custom" && message.customType === MEMORY_CONTEXT_CUSTOM_TYPE);
 
@@ -198,8 +207,8 @@ describe("portable memory extension", () => {
     });
     expect(result.messages).not.toBe(messages);
     expect(context.value.sessionManager.getBranch()).not.toContainEqual(expect.objectContaining({ customType: MEMORY_CONTEXT_CUSTOM_TYPE }));
-    expect(runtime.calls.filter((call) => call.url.endsWith("/embeddings"))).toHaveLength(1);
-    expect(runtime.calls.filter((call) => call.url.endsWith("/points/search"))).toHaveLength(2);
+    expect(runtime.calls.filter((call) => new URL(call.url).pathname.endsWith("/points/scroll"))).toHaveLength(1);
+    expect(runtime.calls.filter((call) => new URL(call.url).pathname.endsWith("/embeddings"))).toHaveLength(0);
   });
 
   it("keeps the explicit tool but disables auto recall for Prime children and invalid depth", async () => {
@@ -214,7 +223,7 @@ describe("portable memory extension", () => {
 
     const toolResult = await fake.tools[0]!.execute(
       "call-child",
-      { query: "Explicit recall remains available to child agents", limit: 3 },
+      { query: "Portable recalled context for root agents", limit: 3 },
       undefined,
       undefined,
       child.value,
@@ -229,14 +238,14 @@ describe("portable memory extension", () => {
     expect(runtime.calls).toHaveLength(count);
   });
 
-  it("uses Pi auto-recall configuration without inspecting Prime depth", async () => {
+  it("enables Pi auto-recall only for a verified root depth", async () => {
     const runtime = factoryFor("pi");
     const fake = fakeApi();
     await runtime.factory(fake.api);
-    const context = ctx({ header: { rlmDepth: "not-a-prime-depth" } });
-    const messages = [user("Pi should recall this sufficiently detailed prompt")];
+    const context = ctx({ header: { rlmDepth: 0 } });
+    const messages = [user("Portable recalled context for root agents")];
 
-    await invokeBefore(fake.handler("before_agent_start"), "Pi should recall this sufficiently detailed prompt", context.value);
+    await invokeBefore(fake.handler("before_agent_start"), "Portable recalled context for root agents", context.value);
     const result = await fake.handler("context")({ type: "context", messages }, context.value) as { messages: AgentMessages };
     expect(result.messages.some((message) => message.role === "custom" && message.customType === MEMORY_CONTEXT_CUSTOM_TYPE)).toBe(true);
 
@@ -247,27 +256,25 @@ describe("portable memory extension", () => {
     expect(await disabledFake.handler("context")({ type: "context", messages }, context.value)).toBeUndefined();
   });
 
-  it("deduplicates context retries and clears recall cache on session lifecycle", async () => {
+  it("revalidates settled context retries and clears in-flight recall state on lifecycle", async () => {
     const runtime = factoryFor("prime");
     const fake = fakeApi();
     await runtime.factory(fake.api);
     const context = ctx({ header: { rlmDepth: 0 } });
-    const messages = [user("Repeat this root prompt across provider tool calls")];
+    const messages = [user("Portable recalled context for root agents")];
 
     const first = await fake.handler("context")({ type: "context", messages }, context.value) as { messages: AgentMessages };
     const retry = await fake.handler("context")({ type: "context", messages: first.messages }, context.value) as { messages: AgentMessages };
     expect(retry.messages.filter((message) => message.role === "custom" && message.customType === MEMORY_CONTEXT_CUSTOM_TYPE)).toHaveLength(1);
-    expect(runtime.calls.filter((call) => call.url.endsWith("/embeddings"))).toHaveLength(1);
+    expect(runtime.calls.filter((call) => new URL(call.url).pathname.endsWith("/points/scroll"))).toHaveLength(2);
 
     await fake.handler("session_start")({ type: "session_start", reason: "resume" }, context.value);
-    const healthProbe = runtime.calls.find((call) => call.url.endsWith("/embeddings") && call.body?.input === "search_query: pi-qdrant-memory health probe");
-    expect(healthProbe).toBeDefined();
+    expect(runtime.calls.some((call) => new URL(call.url).pathname === "/healthz")).toBe(true);
     await fake.handler("context")({ type: "context", messages }, context.value);
-    const recallEmbeddings = runtime.calls.filter((call) => call.url.endsWith("/embeddings") && call.body?.input !== "search_query: pi-qdrant-memory health probe");
-    expect(recallEmbeddings).toHaveLength(2);
+    expect(runtime.calls.filter((call) => new URL(call.url).pathname.endsWith("/points/scroll"))).toHaveLength(3);
 
     await fake.handler("session_shutdown")({ type: "session_shutdown", reason: "quit" }, context.value);
     await fake.handler("context")({ type: "context", messages }, context.value);
-    expect(runtime.calls.filter((call) => call.url.endsWith("/embeddings") && call.body?.input !== "search_query: pi-qdrant-memory health probe")).toHaveLength(3);
+    expect(runtime.calls.filter((call) => new URL(call.url).pathname.endsWith("/points/scroll"))).toHaveLength(4);
   });
 });
