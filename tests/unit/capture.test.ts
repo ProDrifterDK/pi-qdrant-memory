@@ -30,16 +30,30 @@ describe("Task 4 persisted capture", () => {
       msg("u", "user", "final user"), msg("a", "assistant", "final assistant"),
       msg("call", "assistant", [{ type: "toolCall", name: "shell", arguments: { command: "ls" } }]),
       msg("memory-tool", "assistant", [{ type: "toolCall", name: "memory_search", arguments: { query: "x" } }]),
+      msg("qdrant-memory-tool", "assistant", [{ type: "toolCall", name: "qdrant_memory_search", arguments: { query: "x" } }]),
       msg("tool", "toolResult", [{ type: "text", text: "output" }, { type: "json", value: { status: "ok", code: 0 } }], { toolName: "shell", isError: false, status: "completed" }),
       msg("tool-error", "toolResult", [{ type: "text", text: "stderr boom" }], { toolName: "shell", isError: true, status: "error", stderr: "stderr boom", code: 2 }),
       msg("tool-partial", "toolResult", "partial", { partial: true }),
       msg("tool-memory", "toolResult", "memory", { toolName: "memory_search", status: "completed" }),
+      msg("tool-qdrant-memory", "toolResult", "memory", { toolName: "qdrant_memory_search", status: "completed" }),
     ]);
     expect(result.map((entry) => entry.sourceEntryId)).toEqual(["u", "a", "call", "tool", "tool-error"]);
+    expect(result.some((entry) => entry.toolName === "memory_search" || entry.toolName === "qdrant_memory_search")).toBe(false);
     const selectedSecret = selectPersistedEntries([msg("raw", "user", "Authorization: Bearer raw-secret-value-123456")]);
     expect(JSON.stringify(selectedSecret)).not.toContain("raw-secret-value-123456");
     expect(result.find((entry) => entry.sourceEntryId === "call")?.eventKind).toBe("tool_call");
     expect(result.find((entry) => entry.sourceEntryId === "tool-error")?.eventKind).toBe("tool_error");
+  });
+
+  it("excludes only the two owned search tools and catches details-only or wrapped results", () => {
+    const result = selectPersistedEntries([
+      msg("other-call", "assistant", [{ type: "toolCall", name: "qdrant_memory", arguments: { safe: true } }]),
+      msg("other-result", "toolResult", "ordinary result", { toolName: "qdrant_memory", status: "completed" }),
+      msg("details-owned", "toolResult", "ordinary owned result", { details: { toolName: "qdrant_memory_search", status: "completed" } }),
+      msg("wrapped-other", "toolResult", '<memory-context trust="untrusted">recall</memory-context>', { toolName: "other_tool", status: "completed" }),
+    ]);
+    expect(result.map((entry) => entry.sourceEntryId)).toEqual(["other-call", "other-result"]);
+    expect(result.map((entry) => entry.toolName)).toEqual(["qdrant_memory", "qdrant_memory"]);
   });
 
   it("excludes all memory-context wrapper forms and rejects array headers/contradictory Pi markers", () => {
@@ -80,7 +94,7 @@ describe("Task 4 persisted capture", () => {
   it("retains finalized tool calls whose safe name has no arguments", async () => {
     const state = new Map<string, string>(); const entries: Entry[] = [msg("before-tool-noargs", "user", "old")];
     const deps = { sessionId: "tool-noargs", host: "pi" as const, getEntries: () => entries.slice(), readActivation: async (key: string) => state.get(key), writeActivation: async (key: string, value: string) => { state.set(key, value); }, now: () => 1 };
-    await activateCapture(deps); entries.push(msg("tool-noargs", "assistant", [{ type: "toolCall", name: "shell" }]), msg("memory-noargs", "assistant", [{ type: "toolCall", name: "memory_search" }]));
+    await activateCapture(deps); entries.push(msg("tool-noargs", "assistant", [{ type: "toolCall", name: "shell" }]), msg("memory-noargs", "assistant", [{ type: "toolCall", name: "memory_search" }]), msg("qdrant-memory-noargs", "assistant", [{ type: "toolCall", name: "qdrant_memory_search" }]));
     const records = await capturePersistedEntries({ ...deps, lifecycle: "agent_end", activationDir: "/unused" });
     expect(records).toHaveLength(1); expect(records[0]).toMatchObject({ eventKind: "tool_call", toolName: "shell" }); expect(records[0]?.text).toBeUndefined(); expect(records[0]?.toolArgs).toBeUndefined();
   });

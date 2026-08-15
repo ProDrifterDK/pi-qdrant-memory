@@ -447,15 +447,29 @@ try {
   activeModelRegistry = completion.registry;
   assert.equal(typeof activeModelRegistry.getAvailable, "function");
   assert.equal(typeof hostModule.discoverAndLoadExtensions, "function");
+  const syntheticHermesExtensionPath = join(tempRoot, "synthetic-hermes-memory.mjs");
+  await writeFile(syntheticHermesExtensionPath, `export default function syntheticHermesMemory(pi) {
+  pi.registerTool({
+    name: "memory_search",
+    label: "Memory Search",
+    description: "Synthetic Hermes memory tool for coexistence verification.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    async execute() { return { content: [{ type: "text", text: "synthetic" }] }; },
+  });
+}\n`, "utf8");
   const loaded = await hostModule.discoverAndLoadExtensions(
-    [extensionPath],
+    [syntheticHermesExtensionPath, extensionPath],
     tempRoot,
     join(tempRoot, "agent"),
   );
   assert.deepEqual(loaded.errors, []);
-  assert.equal(loaded.extensions.length, 1);
-  const extension = loaded.extensions[0];
-  assert.deepEqual([...extension.tools.keys()], ["memory_search"]);
+  assert.equal(loaded.extensions.length, 2);
+  const loadedToolNames = loaded.extensions.flatMap((loadedExtension) => [...loadedExtension.tools.keys()]);
+  assert.deepEqual([...new Set(loadedToolNames)].sort(), ["memory_search", "qdrant_memory_search"]);
+  assert.equal(loadedToolNames.length, 2);
+  const extension = loaded.extensions.find((loadedExtension) => loadedExtension.path === extensionPath);
+  assert.ok(extension, "packed Qdrant extension must load alongside Hermes memory_search");
+  assert.deepEqual([...extension.tools.keys()], ["qdrant_memory_search"]);
   assert.equal(extension.tools.size, 1);
   assert.deepEqual(
     [...extension.handlers.keys()].sort(),
@@ -468,10 +482,10 @@ try {
   const agentEnd = oneHandler(extension, "agent_end");
   const beforeCompact = oneHandler(extension, "session_before_compact");
   const shutdown = oneHandler(extension, "session_shutdown");
-  const toolEntry = extension.tools.get("memory_search");
+  const toolEntry = extension.tools.get("qdrant_memory_search");
   assert.ok(toolEntry && typeof toolEntry === "object");
   const tool = toolEntry.definition;
-  assert.equal(tool?.name, "memory_search");
+  assert.equal(tool?.name, "qdrant_memory_search");
   assert.equal(typeof tool.execute, "function");
 
   const { completeMemory } = await import(pathToFileURL(join(dirname(extensionPath), "curation", "llm.js")).href);
@@ -549,7 +563,7 @@ try {
     rootContext,
   );
   assert.equal(typeof toolResult.content?.[0]?.text, "string");
-  assert.ok((toolResult.details?.hitCount ?? 0) > 0, "memory_search must return a positive fixture hit");
+  assert.ok((toolResult.details?.hitCount ?? 0) > 0, "qdrant_memory_search must return a positive fixture hit");
   assert.match(toolResult.content?.[0]?.text ?? "", /<memory-context trust="untrusted">/);
   assert.match(toolResult.content?.[0]?.text ?? "", /compatibility untrusted fixture/);
 
@@ -563,7 +577,7 @@ try {
     const childAgentEnd = oneHandler(childExtension, "agent_end");
     const childBeforeCompact = oneHandler(childExtension, "session_before_compact");
     const childShutdown = oneHandler(childExtension, "session_shutdown");
-    const childTool = childExtension.tools.get("memory_search").definition;
+    const childTool = childExtension.tools.get("qdrant_memory_search").definition;
     const childBranch = [{ type: "message", message: { role: "user", content: "remember child alpha architecture" } }];
     const childContext = await makeContext({ tempRoot, branch: childBranch, sessionId: "compat-session-child", rlmDepth: expectedHost === "prime" ? 1 : undefined, expectedHost, child: true });
     const childMessages = [structuredClone(childBranch[0].message)];
@@ -626,7 +640,7 @@ try {
   const freshBefore = oneHandler(freshExtension, "before_agent_start");
   const freshContextHandler = oneHandler(freshExtension, "context");
   const freshShutdown = oneHandler(freshExtension, "session_shutdown");
-  const freshTool = freshExtension.tools.get("memory_search").definition;
+  const freshTool = freshExtension.tools.get("qdrant_memory_search").definition;
   const freshBranch = [{ type: "message", message: { role: "user", content: "post-cutoff captured compatibility memory" } }];
   const freshContext = await makeContext({ tempRoot, branch: freshBranch, sessionId: "compat-session-fresh", rlmDepth: expectedHost === "prime" ? 0 : undefined, expectedHost });
   await freshStart({ type: "session_start" }, freshContext);
@@ -634,7 +648,7 @@ try {
   const freshResult = await freshContextHandler({ type: "context", messages: [structuredClone(freshBranch[0].message)] }, freshContext);
   assert.ok(freshResult?.messages?.some((message) => message?.customType === "pi-qdrant-memory-context" && message.content.includes("post-cutoff captured compatibility memory")), "fresh packed extension instance must recover and recall the durable captured episode");
   const freshToolResult = await freshTool.execute("compat-tool-fresh", { query: "post-cutoff captured compatibility memory", limit: 1 }, undefined, undefined, freshContext);
-  assert.ok((freshToolResult.details?.hitCount ?? 0) > 0, "fresh memory_search must recover the durable captured episode");
+  assert.ok((freshToolResult.details?.hitCount ?? 0) > 0, "fresh qdrant_memory_search must recover the durable captured episode");
   await freshShutdown({ type: "session_shutdown" }, freshContext);
 
   process.stdout.write(

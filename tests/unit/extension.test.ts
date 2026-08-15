@@ -181,7 +181,8 @@ describe("portable memory extension", () => {
     const fake = fakeApi();
     await factory(fake.api);
 
-    expect(fake.tools.map((tool) => tool.name)).toEqual(["memory_search"]);
+    expect(fake.tools.map((tool) => tool.name)).toEqual(["qdrant_memory_search"]);
+    expect(fake.tools.some((tool) => tool.name === "memory_search")).toBe(false);
     expect([...fake.handlers.keys()].sort()).toEqual([
       "agent_end",
       "before_agent_start",
@@ -225,7 +226,8 @@ describe("portable memory extension", () => {
     const result = await fake.handler("context")({ type: "context", messages }, context.value) as { messages: AgentMessages };
     const recalled = result.messages.filter((message) => message.role === "custom" && message.customType === MEMORY_CONTEXT_CUSTOM_TYPE);
 
-    expect(fake.tools.map((tool) => tool.name)).toEqual(["memory_search"]);
+    expect(fake.tools.map((tool) => tool.name)).toEqual(["qdrant_memory_search"]);
+    expect(fake.tools.some((tool) => tool.name === "memory_search")).toBe(false);
     expect(recalled).toHaveLength(1);
     expect(recalled[0]).toMatchObject({
       role: "custom",

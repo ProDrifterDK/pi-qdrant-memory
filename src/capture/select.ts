@@ -28,7 +28,7 @@ export interface SelectedCaptureEntry {
 
 const MAX_TOOL_ARGS = 2_000;
 const MAX_TOOL_RESULT = 4_000;
-const MEMORY_TOOL = /^(?:memory[_-]search|qdrant[_-]memory(?:[_-]search)?)$/iu;
+const MEMORY_TOOLS = new Set(["memory_search", "qdrant_memory_search"]);
 const PRIVATE_PART = /^(?:thinking|reasoning|signature|thought|redacted_thinking)$/iu;
 function record(value: unknown): Record<string, unknown> | undefined { return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined; }
 function bounded(value: string, max: number): string { return [...value].slice(0, max).join(""); }
@@ -61,7 +61,10 @@ function textOf(content: unknown): string | undefined {
 }
 function partsOf(content: unknown): unknown[] { return Array.isArray(content) ? content : [content]; }
 function toolNameFrom(value: Record<string, unknown>): string | undefined {
-  return str(value.name) ?? str(value.toolName) ?? str(value.tool_name);
+  const direct = str(value.name) ?? str(value.toolName) ?? str(value.tool_name);
+  if (direct !== undefined) return direct;
+  const details = record(value.details);
+  return str(details?.name) ?? str(details?.toolName) ?? str(details?.tool_name);
 }
 function toolArgsFrom(value: Record<string, unknown>): string | undefined {
   const args = value.arguments ?? value.args ?? value.input ?? value.parameters;
@@ -69,7 +72,7 @@ function toolArgsFrom(value: Record<string, unknown>): string | undefined {
   if (typeof args === "string") return bounded(args, MAX_TOOL_ARGS);
   try { return bounded(JSON.stringify(args), MAX_TOOL_ARGS); } catch { return undefined; }
 }
-function ownMemoryTool(name: string | undefined): boolean { return name !== undefined && MEMORY_TOOL.test(name); }
+function ownMemoryTool(name: string | undefined): boolean { return name !== undefined && MEMORY_TOOLS.has(name); }
 function nonEmptyError(value: unknown): boolean {
   if (typeof value === "string") return value.trim().length > 0;
   return value !== undefined && value !== null && value !== false;
@@ -172,6 +175,7 @@ export function selectPersistedEntries(entries: readonly PersistedEntry[], optio
         if (typeof stderr === "string" && stderr.trim() !== "") fields.push(`stderr: ${stderr}`);
       }
       const body = textOf(content);
+      if (body !== undefined && isMemoryContextText(body)) continue;
       if (explicitFailure && body !== undefined) fields.unshift(body);
       const textSource = fields.join("\n");
       const textResult = cleanText(textSource, toolResultChars, homeDir);

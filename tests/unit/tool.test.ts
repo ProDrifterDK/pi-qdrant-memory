@@ -19,7 +19,7 @@ function hit(overrides: Partial<MemoryCandidate> = {}): MemoryCandidate {
 
 const fakeContext = { cwd: "/repo" } as unknown as ExtensionContext;
 
-describe("memory_search tool", () => {
+describe("qdrant_memory_search tool", () => {
   it("exposes only query and optional limit, forwards context and host signal, and caps details", async () => {
     const signal = new AbortController().signal;
     const service = { search: vi.fn(async () => ({ query: "alpha", hits: [hit()] })) };
@@ -30,6 +30,8 @@ describe("memory_search tool", () => {
       hardContextCharBudget: 16000,
     });
 
+    expect(tool.name).toBe("qdrant_memory_search");
+    expect(tool.name).not.toBe("memory_search");
     expect(Object.keys(tool.parameters.properties)).toEqual(["query", "limit", "mode", "after", "before"]);
     expect(Object.keys(memorySearchParameters.properties).sort()).toEqual(["after", "before", "limit", "mode", "query"]);
     expect(tool.executionMode).toBe("parallel");

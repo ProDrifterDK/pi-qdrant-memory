@@ -1,6 +1,6 @@
 # Pi Qdrant Memory v2
 
-`@prodrifterdk/pi-qdrant-memory` provides redacted, durable memory for Pi and Prime Agent. Each host owns a physically separate Qdrant collection (`pi_memory` or `prime_memory`), while the only model-callable surface is `memory_search`.
+`@prodrifterdk/pi-qdrant-memory` provides redacted, durable memory for Pi and Prime Agent. Each host owns a physically separate Qdrant collection (`pi_memory` or `prime_memory`), exposed through the Qdrant-backed model-callable `qdrant_memory_search` tool. It coexists with the separately owned Hermes `memory_search` tool.
 
 ## Compatibility
 

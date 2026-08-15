@@ -49,6 +49,9 @@ describe("v2 active release surface", () => {
 
     const extension = await readFile("src/extension.ts", "utf8");
     expect(extension.match(/\.registerTool\(/gu)).toHaveLength(1); expect(extension).toContain("createMemorySearchTool");
+    const tool = await readFile("src/tool.ts", "utf8");
+    expect(tool).toContain('"qdrant_memory_search"');
+    expect(tool).not.toContain('name: "memory_search"');
     const ci = await readFile(".github/workflows/ci.yml", "utf8"); expect(ci).toContain("npm ci --include=dev"); expect(ci).toContain("tests/compat/run-isolated-smokes.sh");
     const isolated = await readFile("tests/compat/run-isolated-smokes.sh", "utf8"); expect(isolated).toContain("qdrant/qdrant:v1.17.1");
   });

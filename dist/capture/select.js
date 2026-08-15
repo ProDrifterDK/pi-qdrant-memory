@@ -3,7 +3,7 @@ import { redactStructure } from "../security/redaction.js";
 import { MAX_SESSION_SEQUENCE, SESSION_SEQUENCE_STRIDE } from "../domain/ids.js";
 const MAX_TOOL_ARGS = 2_000;
 const MAX_TOOL_RESULT = 4_000;
-const MEMORY_TOOL = /^(?:memory[_-]search|qdrant[_-]memory(?:[_-]search)?)$/iu;
+const MEMORY_TOOLS = new Set(["memory_search", "qdrant_memory_search"]);
 const PRIVATE_PART = /^(?:thinking|reasoning|signature|thought|redacted_thinking)$/iu;
 function record(value) { return typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined; }
 function bounded(value, max) { return [...value].slice(0, max).join(""); }
@@ -44,7 +44,11 @@ function textOf(content) {
 }
 function partsOf(content) { return Array.isArray(content) ? content : [content]; }
 function toolNameFrom(value) {
-    return str(value.name) ?? str(value.toolName) ?? str(value.tool_name);
+    const direct = str(value.name) ?? str(value.toolName) ?? str(value.tool_name);
+    if (direct !== undefined)
+        return direct;
+    const details = record(value.details);
+    return str(details?.name) ?? str(details?.toolName) ?? str(details?.tool_name);
 }
 function toolArgsFrom(value) {
     const args = value.arguments ?? value.args ?? value.input ?? value.parameters;
@@ -59,7 +63,7 @@ function toolArgsFrom(value) {
         return undefined;
     }
 }
-function ownMemoryTool(name) { return name !== undefined && MEMORY_TOOL.test(name); }
+function ownMemoryTool(name) { return name !== undefined && MEMORY_TOOLS.has(name); }
 function nonEmptyError(value) {
     if (typeof value === "string")
         return value.trim().length > 0;
@@ -196,6 +200,8 @@ export function selectPersistedEntries(entries, options = {}) {
                     fields.push(`stderr: ${stderr}`);
             }
             const body = textOf(content);
+            if (body !== undefined && isMemoryContextText(body))
+                continue;
             if (explicitFailure && body !== undefined)
                 fields.unshift(body);
             const textSource = fields.join("\n");

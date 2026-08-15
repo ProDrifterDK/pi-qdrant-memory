@@ -6,7 +6,7 @@ Pi Qdrant Memory v2 treats host state, Qdrant payloads, recalled text, shared ou
 
 - Pi owns `pi_memory`; Prime owns `prime_memory`. Endpoint/collection collisions are rejected when both hosts are enabled.
 - Runtime credentials are collection-scoped. `PI_QDRANT_MEMORY_ADMIN_QDRANT_API_KEY` is consumed only by human CLI code.
-- The model-callable API is only `memory_search`. It cannot select endpoints, collections, credentials, project registration, privacy changes, curation, reconciliation, RAPTOR, or deletion.
+- This extension exposes only the Qdrant-backed model-callable API `qdrant_memory_search`; it coexists with the separately owned Hermes `memory_search` tool. Qdrant search cannot select endpoints, collections, credentials, project registration, privacy changes, curation, reconciliation, RAPTOR, or deletion.
 - Project registration is operator authority. Unregistered or mismatched projects are installation-local and cannot raise global scope.
 - Root lifecycle work is determined from strict host session markers. Children cannot run automatic recall, capture delivery, curation, reconciliation, or RAPTOR publication. Explicit child search remains bounded and project-only when enabled.
 

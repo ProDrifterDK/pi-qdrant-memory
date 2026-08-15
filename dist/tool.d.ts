@@ -1,6 +1,7 @@
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { MemoryCandidate, MemorySearchResult } from "./retrieval/search.js";
+export declare const QDRANT_MEMORY_SEARCH_TOOL_NAME: "qdrant_memory_search";
 export declare const MEMORY_SEARCH_MODES: readonly ["all", "current", "historical", "episodes", "curated", "raptor"];
 export type MemorySearchMode = typeof MEMORY_SEARCH_MODES[number];
 export interface ExplicitMemorySearchInput {
