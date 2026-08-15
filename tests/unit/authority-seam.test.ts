@@ -269,7 +269,7 @@ declare module "@earendil-works/pi-coding-agent" { export class SessionManager {
     const externalTypesPath = join(dir, "external-types.d.ts");
     writeFileSync(externalTypesPath, externalTypes);
     execFileSync("npx", ["tsc", "--noEmit", "--strict", "--module", "nodenext", "--moduleResolution", "nodenext", "--target", "es2022", externalTypesPath, join(dir, "consumer.ts")], { cwd: process.cwd(), stdio: "pipe" });
-  });
+  }, 30_000);
 
   it("GLOBAL RULE: Qdrant options accessors are snapshotted EXACTLY ONCE; late swapped values can never mint or relabel", async () => {
     // Variant A: fetchImpl getter returns undefined first, a FAKE fetch later.
