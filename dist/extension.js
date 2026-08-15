@@ -34,7 +34,9 @@ const LIFECYCLE_RECOVERY_PRODUCERS = 64;
 const LIFECYCLE_RECOVERY_NODES = 512;
 const RECOVERY_SCAN_ENTRIES = 512;
 const RECOVERY_SCAN_BYTES = 4 * 1024 * 1024;
-const RECOVERY_SCAN_TIME_MS = 250;
+// Inode-safe recovery performs several syscalls per candidate; keep a finite
+// startup bound without starving the 64-producer page on slower supported hosts.
+const RECOVERY_SCAN_TIME_MS = 2_000;
 const RECOVERY_MAX_TIME = Date.parse("2100-12-31T23:59:59.999Z");
 const RAPTOR_PAGE_SIZE = 256;
 const RAPTOR_MAX_LEAVES = 65_536;
