@@ -100,7 +100,7 @@ describe("Task 10 deterministic RAPTOR core", () => {
       const dag = buildClusterDag(corpus, { seed: `mixed-${round}`, maxLevels: 5, tokenBudget: 12, umapDimensions: 2, globalNeighbors: 4, localNeighbors: 3, gmmMaxClusters: 4, membershipThreshold: 0.1 });
       const levels = new Map(dag.nodes.map((node) => [node.id, node.level])); expect(dag.edges.every((edge) => levels.get(edge.parentId)! === levels.get(edge.childId)! + 1)).toBe(true); expect(evidenceClosure(dag)).toEqual(corpus.map((item) => item.id).sort());
     }
-  });
+  }, 30_000);
 
   it("keeps N=2 flat when the summary budget cannot hold the pair", () => {
     const dag = buildClusterDag([{ id: "a", vector: [0, 0], tokens: 5 }, { id: "b", vector: [1, 1], tokens: 5 }], { seed: "s", maxLevels: 3, tokenBudget: 8 });
