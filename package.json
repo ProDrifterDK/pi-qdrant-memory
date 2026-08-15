@@ -11,7 +11,7 @@
     "prime-agent"
   ],
   "engines": {
-    "node": ">=20",
+    "node": ">=22.19",
     "npm": ">=11.10"
   },
   "files": [

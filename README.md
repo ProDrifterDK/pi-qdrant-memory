@@ -4,7 +4,7 @@
 
 ## Compatibility
 
-- Node.js >=20 and npm >=11.10.
+- Node.js >=22.19 and npm >=11.10. The pinned Pi 0.84.1 runtime depends on this floor.
 - Pi `@earendil-works/pi-coding-agent` 0.84.1.
 - Prime Agent commit `a18809e00ea30638584d87b3afea7285a9d7296c`.
 - Qdrant >=1.17.0; the isolated matrix uses 1.17.1.
