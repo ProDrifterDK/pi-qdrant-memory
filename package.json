@@ -1,6 +1,6 @@
 {
   "name": "@prodrifterdk/pi-qdrant-memory",
-  "version": "2.0.0-dev.0",
+  "version": "2.0.0",
   "description": "Autonomous redacted memory capture and retrieval for Pi and Prime Agent",
   "type": "module",
   "license": "MIT",
@@ -20,7 +20,8 @@
     "LICENSE",
     "docs/configuration.md",
     "docs/security.md",
-    "compatibility.json"
+    "compatibility.json",
+    "src/vendor/umap-license-apache-2.0.txt"
   ],
   "bin": {
     "pi-qdrant-memory": "./dist/admin/cli.js"

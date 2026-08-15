@@ -49,7 +49,7 @@ const COMMAND_HELP: Record<ShellCommand, string> = {
   raptor: "Usage: pi-qdrant-memory raptor rebuild --enqueue|--wait [--job <id>] [--json]",
   reconcile: "Usage: pi-qdrant-memory reconcile --enqueue|--wait [--job <id>] [--json]",
   inspect: "Usage: pi-qdrant-memory inspect [--id <id>] [--type <record-type>] [--limit <n>] [--json]",
-  forget: "Usage: pi-qdrant-memory forget [--scope occurrence|content|state] [selector] [--plan <plan-id>] [--approve <plan-id>] [--json]",
+  forget: "Usage: pi-qdrant-memory forget [--scope occurrence|content|state] [--current <id>|--observation <id>|--episode <id>|--content <id>|--state <id>] [--plan <plan-id>] [--approve <plan-id>] [--json]",
 };
 
 export class CliInputError extends Error { constructor(message = "invalid arguments or configuration") { super(message); this.name = "CliInputError"; } }

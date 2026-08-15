@@ -188,5 +188,6 @@ describe("human admin operations", () => {
     const deps = cli({ writeStdout: value => { output += value; } });
     await expect(main(["--help", "--json"], deps)).resolves.toBe(0);
     expect(output).toContain("project"); expect(output).toContain("forget"); expect(output).not.toContain("import");
+    output = ""; await expect(main(["forget", "--help"], deps)).resolves.toBe(0); expect(output).toContain("--episode <id>"); expect(output).not.toContain("[selector]");
   });
 });
