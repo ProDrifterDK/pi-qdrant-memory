@@ -64,7 +64,7 @@ function validatePolicy(policy, configuredOwner) { if (!isRecord(policy) || poli
 }
 catch {
     failInput("Read policy purpose is invalid");
-} if (policy.projectId !== undefined && (typeof policy.projectId !== "string" || policy.projectId.length === 0) || policy.processingPolicyId !== undefined && (typeof policy.processingPolicyId !== "string" || policy.processingPolicyId.length === 0))
+} if (policy.projectId !== undefined && (typeof policy.projectId !== "string" || policy.projectId.length === 0) || policy.processingPolicyId !== undefined && (typeof policy.processingPolicyId !== "string" || policy.processingPolicyId.length === 0) || policy.privacyEpoch !== undefined && (!Number.isSafeInteger(policy.privacyEpoch) || policy.privacyEpoch < 0))
     failInput("Read policy scope is invalid"); }
 /** Coordination points are control-state, not memory; their envelope expiry is lease/claim state. */
 const COORDINATION_POINT_TYPES = new Set(["collection_control", "processing_policy", "job", "lease", "proposal", "coverage", "evidence_link", "tombstone", "collection_metadata"]);
@@ -84,13 +84,18 @@ function validatePayloadForPolicy(payload, policy) {
         failResponse("Qdrant point project policy mismatch");
     if (policy.processingPolicyId !== undefined && payload.processing_policy_id !== policy.processingPolicyId)
         failResponse("Qdrant processing policy mismatch");
+    if (policy.privacyEpoch !== undefined && payload.privacy_epoch !== policy.privacyEpoch)
+        failResponse("Qdrant privacy epoch mismatch");
 }
 function point(value, policy, includeVector) { if (!isRecord(value) || !validId(value.id))
     failResponse("Qdrant point ID is invalid"); const payload = validatePayload(value.payload, true); validatePayloadForPolicy(payload, policy); let vector; if (value.vector !== undefined) {
-    if (!isRecord(value.vector) || Object.keys(value.vector).length !== 1 || !isFiniteVector(value.vector.semantic))
+    if (!isRecord(value.vector))
         failResponse("Qdrant named vector is invalid");
-    if (includeVector)
-        vector = { semantic: [...value.vector.semantic] };
+    const keys = Object.keys(value.vector);
+    if (keys.length !== 0 && (keys.length !== 1 || keys[0] !== "semantic" || !isFiniteVector(value.vector.semantic)))
+        failResponse("Qdrant named vector is invalid");
+    if (includeVector && keys.length === 1)
+        vector = { semantic: value.vector.semantic.map(component => Math.fround(component)) };
 } return vector === undefined ? { id: value.id, payload } : { id: value.id, payload, vector }; }
 function responsePoints(value, policy, includeVector) { if (!Array.isArray(value))
     failResponse("Qdrant points result is invalid"); return value.map((item) => point(item, policy, includeVector)); }
@@ -99,10 +104,11 @@ function serverFilter(policy) { validatePolicy(policy, policy.ownerHost); const 
 else
     must.push({ key: "record_type", match: { any: [...policy.recordTypes] } }); if (policy.projectId !== undefined)
     must.push({ key: "project_id", match: { value: policy.projectId } }); if (policy.processingPolicyId !== undefined)
-    must.push({ key: "processing_policy_id", match: { value: policy.processingPolicyId } }); return { must, must_not: policy.purpose === "internal" || policy.purpose === "write_verification" ? [] : [{ key: "record_type", match: { value: "tombstone" } }], should: policy.purpose === "internal" && policy.recordTypes.every((type) => COORDINATION_POINT_TYPES.has(type)) ? [] : [{ is_null: { key: "expires_at" } }, { key: "expires_at", range: { gt: new Date(policy.now + policy.maxClockSkewMs).toISOString() } }] }; }
+    must.push({ key: "processing_policy_id", match: { value: policy.processingPolicyId } }); if (policy.privacyEpoch !== undefined)
+    must.push({ key: "privacy_epoch", match: { value: policy.privacyEpoch } }); return { must, must_not: policy.purpose === "internal" || policy.purpose === "write_verification" ? [] : [{ key: "record_type", match: { value: "tombstone" } }], should: policy.purpose === "internal" && policy.recordTypes.every((type) => COORDINATION_POINT_TYPES.has(type)) ? [] : [{ is_null: { key: "expires_at" } }, { key: "expires_at", range: { gt: new Date(policy.now + policy.maxClockSkewMs).toISOString() } }] }; }
 function responseCollection(value) { const result = envelope(value); if (!isRecord(result) || !isRecord(result.config) || !isRecord(result.config.params) || !isRecord(result.config.params.vectors))
-    failResponse("Collection configuration is invalid"); const vectors = result.config.params.vectors; if (!isRecord(vectors) || Object.keys(vectors).length !== 1 || !isRecord(vectors.semantic) || vectors.semantic.size !== 1024 || vectors.semantic.distance !== "Cosine")
-    failResponse("Collection must have exactly semantic 1024/Cosine vector"); let pointsCount = null; if (result.points_count !== undefined && result.points_count !== null) {
+    failResponse("Collection configuration is invalid"); const vectors = result.config.params.vectors; if (!isRecord(vectors) || Object.keys(vectors).length !== 1 || !isRecord(vectors.semantic) || vectors.semantic.size !== 1024 || vectors.semantic.distance !== "Dot")
+    failResponse("Collection must have exactly semantic 1024/Dot vector"); let pointsCount = null; if (result.points_count !== undefined && result.points_count !== null) {
     if (!Number.isSafeInteger(result.points_count) || Number(result.points_count) < 0)
         failResponse("Collection point count is invalid");
     pointsCount = result.points_count;
@@ -115,7 +121,7 @@ function responseCollection(value) { const result = envelope(value); if (!isReco
             failResponse("Collection payload schema entry is invalid");
         payloadSchema[field] = value;
     }
-} const status = typeof result.status === "string" ? result.status : undefined; return { ...(status === undefined ? {} : { status }), dimension: 1024, distance: "Cosine", vectors: { semantic: { size: 1024, distance: "Cosine" } }, pointsCount, ...(payloadSchema === undefined ? {} : { payloadSchema }), raw: value }; }
+} const status = typeof result.status === "string" ? result.status : undefined; return { ...(status === undefined ? {} : { status }), dimension: 1024, distance: "Dot", vectors: { semantic: { size: 1024, distance: "Dot" } }, pointsCount, ...(payloadSchema === undefined ? {} : { payloadSchema }), raw: value }; }
 function freezeOptions(input) {
     // GLOBAL RULE: snapshot every field EXACTLY ONCE into a plain frozen object;
     // validate/use ONLY the snapshot (no spread of the caller object).
@@ -191,7 +197,7 @@ class RestQdrantReadClient {
         failResponse("Health response is invalid"); return parsed; }
     async collectionInfo() { return responseCollection(await fetchJson(consistency(collectionPath(restState(this).options), restState(this).options.readConsistency), { method: "GET", headers: headers(restState(this).options.apiKey) }, requestOptions(restState(this).options, restState(this).fetchImpl))); }
     async retrieve(ids, policy, options = {}) { validatePolicy(policy, this.ownerHost); if (!Array.isArray(ids) || ids.length === 0 || ids.length > 1024 || ids.some((id) => !validId(id)))
-        failInput("Retrieve IDs are invalid"); const response = await fetchJson(consistency(collectionPath(restState(this).options, "/points/retrieve"), restState(this).options.readConsistency), { method: "POST", headers: headers(restState(this).options.apiKey, true), body: JSON.stringify({ ids, with_payload: true, with_vector: options.includeVector === true }) }, requestOptions(restState(this).options, restState(this).fetchImpl)); return responsePoints(envelope(response), policy, options.includeVector === true); }
+        failInput("Retrieve IDs are invalid"); const init = { method: "POST", headers: headers(restState(this).options.apiKey, true), body: JSON.stringify({ ids, with_payload: true, with_vector: options.includeVector === true }) }; const response = await fetchJson(consistency(collectionPath(restState(this).options, "/points"), restState(this).options.readConsistency), init, requestOptions(restState(this).options, restState(this).fetchImpl)); return responsePoints(envelope(response), policy, options.includeVector === true); }
     async scroll(input) { validatePolicy(input.policy, this.ownerHost); if (input.offset !== undefined && !validId(input.offset))
         failInput("Scroll offset is invalid"); const limit = input.limit ?? 256; if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1024)
         failInput("Scroll limit is invalid"); const response = await fetchJson(consistency(collectionPath(restState(this).options, "/points/scroll"), restState(this).options.readConsistency), { method: "POST", headers: headers(restState(this).options.apiKey, true), body: JSON.stringify({ offset: input.offset ?? null, limit, with_payload: true, with_vector: false, filter: serverFilter(input.policy) }) }, requestOptions(restState(this).options, restState(this).fetchImpl)); const result = envelope(response); if (!isRecord(result) || !Array.isArray(result.points))
@@ -334,5 +340,7 @@ function readClientFor(options, fetchImpl) {
 /** @internal */ export async function adminHealth(options, fetchImpl) { return adminClientFor(options, fetchImpl).health(); }
 /** @internal */ export async function statusCollectionInfo(options, fetchImpl) { return readClientFor(options, fetchImpl).collectionInfo(); }
 /** @internal */ export async function statusHealth(options, fetchImpl) { return readClientFor(options, fetchImpl).health(); }
-/** @internal */ export async function statusRetrieve(options, fetchImpl, ids, policy) { return readClientFor(options, fetchImpl).retrieve(ids, policy); }
+/** @internal */ export async function statusRetrieve(options, fetchImpl, ids, policy, includeVector = false) { return readClientFor(options, fetchImpl).retrieve(ids, policy, { includeVector }); }
+/** @internal */ export async function statusScroll(options, fetchImpl, policy, offset, limit = 64) { return readClientFor(options, fetchImpl).scroll({ policy, ...(offset === undefined ? {} : { offset }), limit }); }
+/** @internal */ export async function statusCount(options, fetchImpl, policy) { return readClientFor(options, fetchImpl).count(policy); }
 //# sourceMappingURL=transport.js.map

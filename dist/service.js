@@ -86,11 +86,12 @@ export class MemoryService {
             if (destination === undefined)
                 throw new MemoryClientError("configuration", "Active model destination is unavailable");
             const project = await this.dependencies.projectResolver(ctx.cwd);
+            const isChild = this.dependencies.isChild(ctx);
             return await this.dependencies.retriever.search({
                 query: normalized,
                 host: this.dependencies.host,
                 project,
-                isChild: this.dependencies.isChild(ctx),
+                isChild,
                 modelDestination: destination,
                 limit: input.limit,
                 mode: input.mode,
@@ -161,7 +162,7 @@ export class MemoryService {
                 throw new MemoryClientError("configuration", "Memory health dependencies are unavailable");
             await qdrant.health(ctx.signal);
             const collection = await qdrant.collectionInfo(ctx.signal);
-            if (collection.dimension !== this.dependencies.config.embeddings.dimension || collection.distance.toLowerCase() !== "cosine")
+            if (collection.dimension !== this.dependencies.config.embeddings.dimension || collection.distance.toLowerCase() !== "dot")
                 throw new MemoryClientError("configuration", "Memory collection is incompatible");
             await embeddingHealth?.(ctx.signal);
         }

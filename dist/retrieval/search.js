@@ -162,16 +162,41 @@ export class MemoryRetriever {
                 }
             }
             if (embedding !== undefined && embeddingDestination !== undefined && BoundEmbeddingDestination.isValid(embedding) && embedding.destination.id === embeddingDestination.id && embedding.destination.residency === embeddingDestination.residency && embedding.destination.dataUse === embeddingDestination.dataUse && embedding.coordination.policyHash === control.coordinationPolicyHash && embedding.coordination.policyEpoch === control.coordinationPolicyEpoch && !control.revokedDestinationIds.includes(embeddingDestination.id)) {
+                // Query embedding is itself policy-bound egress. Authorize it from the
+                // active control policy or an exact, already-local candidate before
+                // sending query text to the embedding destination.
+                const preflightIds = [...new Set([control.processingPolicyId, ...exactCandidates.flatMap((value) => [value.processingPolicyId, ...(value.authorizationPolicyIds ?? [])])])].sort();
+                const preflightRecords = [];
                 try {
-                    denseVector = await embedding.embed({ model: "bge-m3", text: `${this.dependencies.queryPrefix ?? "search_query: "}${query}`, ...(input.signal === undefined ? {} : { signal: input.signal }) });
+                    for (let index = 0; index < preflightIds.length; index += 1024)
+                        preflightRecords.push(...await this.dependencies.reader.readPolicies(preflightIds.slice(index, index + 1024)));
                 }
                 catch {
-                    denseVector = undefined;
+                    preflightRecords.length = 0;
                 }
-                if (denseVector !== undefined) {
-                    const afterEmbedding = parseMemoryRecord(await this.dependencies.reader.readControl());
-                    if (!sameControl(control, afterEmbedding))
-                        return { query, hits: [] };
+                const preflightById = new Map(preflightRecords.map((raw) => [raw.id, raw]));
+                const preflightAuthorized = preflightById.size === preflightIds.length && preflightIds.every((id) => {
+                    const raw = preflightById.get(id);
+                    if (raw === undefined)
+                        return false;
+                    const record = parseMemoryRecord(raw);
+                    if (record.recordType !== "processing_policy")
+                        return false;
+                    const policy = record.policy;
+                    return record.ownerHost === input.host && record.privacyEpoch === control.privacyEpoch && policy.ownerHost === input.host && policy.id === record.id && record.id === id && policy.destinationIds.qdrant === readerDestination.id && policy.destinationIds.embedding === embeddingDestination.id && policy.destinationIds.llm === input.modelDestination.id && policy.residency === readerDestination.residency && policy.dataUse === readerDestination.dataUse && policy.residency === embeddingDestination.residency && policy.dataUse === embeddingDestination.dataUse && policy.residency === input.modelDestination.residency && policy.dataUse === input.modelDestination.dataUse && !isPolicyExpired(policy, now, skew) && !control.revokedDestinationIds.includes(readerDestination.id) && !control.revokedDestinationIds.includes(embeddingDestination.id) && !control.revokedDestinationIds.includes(input.modelDestination.id);
+                });
+                if (preflightAuthorized) {
+                    try {
+                        denseVector = await embedding.embed({ model: "bge-m3", text: `${this.dependencies.queryPrefix ?? "search_query: "}${query}`, ...(input.signal === undefined ? {} : { signal: input.signal }) });
+                    }
+                    catch {
+                        denseVector = undefined;
+                    }
+                    if (denseVector !== undefined) {
+                        const afterEmbedding = parseMemoryRecord(await this.dependencies.reader.readControl());
+                        if (!sameControl(control, afterEmbedding))
+                            return { query, hits: [] };
+                    }
                 }
             }
             const denseLanes = mode === "all" ? ["current", "historical", "episodes", "curated", "raptor"] : mode === "curated" ? ["current", "historical"] : [mode];
@@ -309,7 +334,7 @@ export class MemoryRetriever {
             const destinationAuthorized = (processingPolicyId) => {
                 const record = policies.get(processingPolicyId);
                 const policy = record?.policy;
-                return record !== undefined && policy !== undefined && record.ownerHost === input.host && record.privacyEpoch === control.privacyEpoch && policy.ownerHost === input.host && policy.id === processingPolicyId && policy.destinationIds.qdrant === readerDestination.id && policy.destinationIds.llm === input.modelDestination.id && policy.residency === readerDestination.residency && policy.dataUse === readerDestination.dataUse && policy.residency === input.modelDestination.residency && policy.dataUse === input.modelDestination.dataUse && !isPolicyExpired(policy, now, skew) && !control.revokedDestinationIds.includes(input.modelDestination.id);
+                return record !== undefined && policy !== undefined && record.ownerHost === input.host && record.privacyEpoch === control.privacyEpoch && policy.ownerHost === input.host && policy.id === processingPolicyId && policy.destinationIds.qdrant === readerDestination.id && policy.destinationIds.llm === input.modelDestination.id && (denseVector === undefined || embeddingDestination !== undefined && policy.destinationIds.embedding === embeddingDestination.id && policy.residency === embeddingDestination.residency && policy.dataUse === embeddingDestination.dataUse && !control.revokedDestinationIds.includes(embeddingDestination.id)) && policy.residency === readerDestination.residency && policy.dataUse === readerDestination.dataUse && policy.residency === input.modelDestination.residency && policy.dataUse === input.modelDestination.dataUse && !isPolicyExpired(policy, now, skew) && !control.revokedDestinationIds.includes(input.modelDestination.id);
             };
             const authorized = candidates.filter((value) => !isExpired(value.expiresAt, now, skew) && [value.processingPolicyId, ...(value.authorizationPolicyIds ?? [])].every(destinationAuthorized) && value.evidenceIds.every((id) => { const evidence = evidenceById.get(id); return evidence === undefined ? value.recordType === "episode" && id === value.id : destinationAuthorized(evidence.processingPolicyId); }));
             if (authorized.length === 0)
@@ -389,9 +414,14 @@ function envelope(value) { if (!isRecord(value) || !("result" in value) || (valu
 function vector(value) {
     if (value === undefined)
         return undefined;
-    if (!isRecord(value) || Object.keys(value).length !== 1 || !Array.isArray(value.semantic) || value.semantic.length !== 1024 || !value.semantic.every((part) => typeof part === "number" && Number.isFinite(part)))
+    if (!isRecord(value))
         invalid("Qdrant semantic vector is invalid");
-    return [...value.semantic];
+    const keys = Object.keys(value);
+    if (keys.length === 0)
+        return undefined;
+    if (keys.length !== 1 || keys[0] !== "semantic" || !Array.isArray(value.semantic) || value.semantic.length !== 1024 || !value.semantic.every((part) => typeof part === "number" && Number.isFinite(part)))
+        invalid("Qdrant semantic vector is invalid");
+    return value.semantic.map(part => Math.fround(part));
 }
 function point(value) {
     if (!isRecord(value) || typeof value.id !== "string" || !UUID.test(value.id) || !isRecord(value.payload))
@@ -466,9 +496,9 @@ export class GuardedMemoryReadStore {
     async collectionInfo(signal) {
         const raw = await fetchJson(url(this.#options, ""), { method: "GET", headers: this.#options.apiKey === undefined ? {} : { "api-key": this.#options.apiKey } }, requestOptions(this.#options, signal));
         const result = envelope(raw);
-        if (!isRecord(result) || !isRecord(result.config) || !isRecord(result.config.params) || !isRecord(result.config.params.vectors) || !isRecord(result.config.params.vectors.semantic) || result.config.params.vectors.semantic.size !== 1024 || result.config.params.vectors.semantic.distance !== "Cosine")
+        if (!isRecord(result) || !isRecord(result.config) || !isRecord(result.config.params) || !isRecord(result.config.params.vectors) || !isRecord(result.config.params.vectors.semantic) || result.config.params.vectors.semantic.size !== 1024 || result.config.params.vectors.semantic.distance !== "Dot")
             invalid("Qdrant collection is incompatible");
-        return { dimension: 1024, distance: "Cosine" };
+        return { dimension: 1024, distance: "Dot" };
     }
     async search(input) {
         mandatory(input.filter, this.#options.ownerHost);
@@ -526,7 +556,8 @@ export class GuardedMemoryReadStore {
         const ids = refs.map((ref) => ref.recordType === "collection_control" ? ref.id : physicalPointIdFor(ref.recordType, ref.id));
         if (new Set(ids).size !== ids.length)
             throw new MemoryClientError("configuration", "Retrieve references are ambiguous");
-        const raw = await fetchJson(url(this.#options, "/points/retrieve"), { method: "POST", headers: headers(this.#options), body: JSON.stringify({ ids, with_payload: true, with_vector: true }) }, requestOptions(this.#options, signal));
+        const init = { method: "POST", headers: headers(this.#options), body: JSON.stringify({ ids, with_payload: true, with_vector: true }) };
+        const raw = await fetchJson(url(this.#options, "/points"), init, requestOptions(this.#options, signal));
         const result = envelope(raw);
         if (!Array.isArray(result))
             invalid("Qdrant retrieve result is invalid");
@@ -541,7 +572,8 @@ export class GuardedMemoryReadStore {
             throw new MemoryClientError("configuration", "Evidence IDs are invalid");
         const types = ["episode", "curated_memory", "curated_current", "raptor_summary"];
         const physicalIds = [...new Set(ids.flatMap((id) => types.map((recordType) => physicalPointIdFor(recordType, id))))];
-        const raw = await fetchJson(url(this.#options, "/points/retrieve"), { method: "POST", headers: headers(this.#options), body: JSON.stringify({ ids: physicalIds, with_payload: true, with_vector: true }) }, requestOptions(this.#options));
+        const init = { method: "POST", headers: headers(this.#options), body: JSON.stringify({ ids: physicalIds, with_payload: true, with_vector: true }) };
+        const raw = await fetchJson(url(this.#options, "/points"), init, requestOptions(this.#options));
         const result = envelope(raw);
         if (!Array.isArray(result))
             invalid("Qdrant evidence result is invalid");

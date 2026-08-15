@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { seedWords, Xoshiro128StarStar } from "../../src/raptor/random.js";
 import { reduceUmap, reduceUmapPair } from "../../src/raptor/umap.js";
 import { fitDiagonalGmm, selectDiagonalGmm } from "../../src/raptor/gmm.js";
-import { buildClusterDag, evidenceClosure, stableTokenPartition } from "../../src/raptor/cluster.js";
+import { buildClusterDag, buildClusterDagOffThread, evidenceClosure, stableTokenPartition } from "../../src/raptor/cluster.js";
 import { groupRaptorLeavesByPolicy } from "../../src/raptor/builder.js";
 import { processingPolicyHash, type ProcessingPolicy } from "../../src/domain/policy.js";
 
@@ -114,6 +114,21 @@ describe("Task 10 deterministic RAPTOR core", () => {
     const accessorLeaf = Object.create(Object.prototype) as Record<string, unknown>; Object.defineProperty(accessorLeaf, "id", { enumerable: true, get() { calls += 1; throw new Error("invoked"); } }); Object.defineProperty(accessorLeaf, "vector", { enumerable: true, value: [0, 0] }); Object.defineProperty(accessorLeaf, "tokens", { enumerable: true, value: 1 });
     expect(() => buildClusterDag([accessorLeaf as never], { seed: "s", maxLevels: 2, tokenBudget: 4 })).toThrow(/own data/i); expect(calls).toBe(0);
     const sparse = Array(2) as number[][]; sparse[0] = [0, 0]; expect(() => reduceUmap(sparse, { seed: "s", scope: "global", dimensions: 2, neighbors: 2 })).toThrow(/dense|sparse/i);
+  });
+
+  it("keeps the production worker kernel deterministic for varied high-dimensional vectors", async () => {
+    const leaves = Array.from({ length: 41 }, (_, index) => ({ id: `leaf-${String(index).padStart(3, "0")}`, tokens: 4 + (index % 5), vector: Array.from({ length: 24 }, (_unused, dimension) => Math.sin((index + 1) * (dimension + 3)) + Math.cos(index * 0.17 + dimension * 0.31)) }));
+    const options = { seed: "worker-varied", maxLevels: 3, tokenBudget: 40, umapDimensions: 10, globalNeighbors: 7, localNeighbors: 5, gmmMaxClusters: 8, membershipThreshold: 0.15 } as const;
+    const expected = buildClusterDag(leaves, options); const actual = await buildClusterDagOffThread(leaves, options, { timeoutMs: 120_000 });
+    expect(actual).toEqual(expected); expect(evidenceClosure(actual)).toHaveLength(41);
+  });
+
+  it("terminates an in-flight clustering worker on abort without blocking the host event loop", async () => {
+    const leaves = Array.from({ length: 63 }, (_, index) => ({ id: `abort-${String(index).padStart(3, "0")}`, tokens: 8, vector: Array.from({ length: 128 }, (_unused, dimension) => Math.sin(index * 1.7 + dimension * 0.013) + Math.cos(index * dimension * 0.007)) }));
+    const controller = new AbortController(); let hostTurnRan = false;
+    const pending = buildClusterDagOffThread(leaves, { seed: "worker-abort", maxLevels: 4, tokenBudget: 64, umapDimensions: 10, globalNeighbors: 8, localNeighbors: 6, gmmMaxClusters: 50, membershipThreshold: 0.1 }, { signal: controller.signal, timeoutMs: 120_000 });
+    setImmediate(() => { hostTurnRan = true; controller.abort(); });
+    await expect(pending).rejects.toThrow(/cancelled/u); expect(hostTurnRan).toBe(true);
   });
 
   it("preserves the exact umap-js 1.4.0 Apache tarball notice", async () => {

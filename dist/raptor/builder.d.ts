@@ -45,7 +45,7 @@ export type RaptorBuildResult = {
     readonly reused: number;
 } | {
     readonly state: "pending";
-    readonly reason: "invalid_input" | "incompatible_policy" | "authority_changed" | "summary_failed" | "scanner" | "embedding_failed" | "write_failed" | "publication_lost" | "cancelled";
+    readonly reason: "invalid_input" | "incompatible_policy" | "authority_changed" | "summary_failed" | "scanner" | "embedding_failed" | "write_failed" | "publication_lost" | "cancelled" | "clustering_failed";
 } | {
     readonly state: "empty";
     readonly reason: "no_eligible_leaves";

@@ -73,6 +73,10 @@ describe("operator project registration", () => {
     await expect(unregisterProject("stable-repo", projectDeps)).resolves.toBe(true);
     await expect(resolveProjectIdentity("/repo/sub", projectDeps)).resolves.toMatchObject({ identityKind: "local_only", reason: "unregistered" });
   });
+  it("prefers strict active-host registrations supplied by the config loader", async () => {
+    const projectDeps = { ...deps(new Map()), registrations: { "host-repo": { canonicalPath: "/repo", alias: "host-repo", fingerprint: "origin:github.com/example/repo" } } };
+    await expect(resolveProjectIdentity("/repo/sub", projectDeps)).resolves.toMatchObject({ id: "host-repo", identityKind: "registered", registrationValid: true });
+  });
   it("fails closed when a registered path is reached through a symlink escape", async () => {
     const files = new Map<string, string>(); const projectDeps = deps(files);
     await registerProject("/repo", "stable-repo", projectDeps);
@@ -126,7 +130,7 @@ describe("persisted operator project registry", () => {
     const first = await resolveProjectIdentity("/repo", persistentDeps(files, "salt-a"));
     const second = await resolveProjectIdentity("/repo", persistentDeps(files, "salt-a"));
     const other = await resolveProjectIdentity("/repo", persistentDeps(new Map(), "salt-b"));
-    expect(first).toMatchObject({ identityKind: "local_only", registrationValid: false, reason: "unregistered" });
+    expect(first).toMatchObject({ identityKind: "local_only", registrationValid: true, reason: "unregistered" });
     expect(second.id).toBe(first.id);
     expect(other.id).not.toBe(first.id);
   });

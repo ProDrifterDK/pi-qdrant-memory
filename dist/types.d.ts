@@ -10,7 +10,7 @@ export interface CollectionMetadataContract {
     schema: "pi-qdrant-memory-v2";
     schemaRevision: 1;
     dimension: number;
-    distance: "Cosine";
+    distance: "Dot";
     model: string;
 }
 export interface OutboxConfig {

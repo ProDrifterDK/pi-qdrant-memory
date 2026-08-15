@@ -10,12 +10,13 @@ export interface InitializeDestinationResult {
         name: "semantic";
         model: "bge-m3";
         dimension: 1024;
-        distance: "Cosine";
+        distance: "Dot";
     };
     capture: {
         enabled: boolean;
         episodeRetentionDays: RuntimeConfig["capture"]["episodeRetentionDays"];
     };
+    disclosure: "Loopback binding provides functional isolation, not cryptographic privacy.";
     initialized: boolean;
     collectionCreated: boolean;
     qdrantVersion?: string;
@@ -29,5 +30,16 @@ export interface InitializeDestinationDependencies {
     retryAttempts?: number;
     retryDelayMs?: number;
 }
+export interface InitializationDisclosure {
+    /** The operator selected a bounded retention period or `indefinite`. */
+    retention: RuntimeConfig["capture"]["episodeRetentionDays"];
+    /** The operator acknowledged the configured egress mode/destination set. */
+    egressMode: RuntimeConfig["privacy"]["egressMode"];
+    confirmed: boolean;
+}
+/** Validate the human disclosure gate before a CLI can enable capture. Runtime
+ * config loading already enforces explicit file retention/egress fields; this
+ * second gate prevents a shell invocation from silently enabling capture. */
+export declare function validateInitializationDisclosure(config: RuntimeConfig, disclosure: InitializationDisclosure | undefined): void;
 /** Destination initialization never consults ambient process credentials. */
 export declare function initializeDestination(config: RuntimeConfig, deps?: InitializeDestinationDependencies): Promise<InitializeDestinationResult>;

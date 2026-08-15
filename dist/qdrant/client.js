@@ -14,6 +14,7 @@ export function readPolicy(input) {
     const recordTypes = [...input.recordTypes];
     const projectId = input.projectId;
     const processingPolicyId = input.processingPolicyId;
+    const privacyEpoch = input.privacyEpoch;
     const now = input.now ?? Date.now();
     const skew = input.maxClockSkewMs ?? 0;
     if (ownerHost !== "pi" && ownerHost !== "prime")
@@ -22,7 +23,7 @@ export function readPolicy(input) {
         throw new TypeError("Read record type policy is invalid");
     if (!Number.isFinite(now) || !Number.isFinite(skew) || skew < 0)
         throw new TypeError("Read expiry policy is invalid");
-    if (projectId !== undefined && (typeof projectId !== "string" || projectId.length === 0) || processingPolicyId !== undefined && (typeof processingPolicyId !== "string" || processingPolicyId.length === 0))
+    if (projectId !== undefined && (typeof projectId !== "string" || projectId.length === 0) || processingPolicyId !== undefined && (typeof processingPolicyId !== "string" || processingPolicyId.length === 0) || privacyEpoch !== undefined && (!Number.isSafeInteger(privacyEpoch) || privacyEpoch < 0))
         throw new TypeError("Read scope policy is invalid");
     validatePurpose(purpose, recordTypes);
     const policy = { ownerHost, purpose, recordTypes, now, maxClockSkewMs: skew, requireStatus: "active", requireSecretScan: "passed" };
@@ -30,6 +31,8 @@ export function readPolicy(input) {
         policy.projectId = projectId;
     if (processingPolicyId !== undefined)
         policy.processingPolicyId = processingPolicyId;
+    if (privacyEpoch !== undefined)
+        policy.privacyEpoch = privacyEpoch;
     return policy;
 }
 export function physicalPointIdFor(recordType, logicalId) {

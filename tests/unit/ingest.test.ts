@@ -38,7 +38,7 @@ function restQdrantWriter(seed: BackendPoint[] = [], hooks: BackendHooks = {}, b
   const points = new Map<string, BackendPoint>(seed.map((point) => [point.id, point]));
   const fetchImpl: typeof fetch = async (input, init = {}) => {
     const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[]; points?: BackendPoint[]; update_mode?: string };
-    if (url.includes("/points/retrieve")) {
+    if (new URL(url).pathname.endsWith("/points") && init.method === "POST") {
       const ids = body?.ids ?? [];
       const found = ids.map((id) => points.get(id)).filter((point) => point !== undefined);
       const extra = hooks.retrieve === undefined ? undefined : await hooks.retrieve(ids, url);
@@ -118,7 +118,7 @@ function episode(current: ProcessingPolicy, overrides: Partial<EpisodeRecord> = 
     destinationId: current.destinationIds.qdrant, status: "active" as const, redactionStatus: "redacted" as const,
     secretScan: "passed" as const, text: "safe [token redacted]", ...overrides,
   };
-  const value = { ...pending, ...overrides } as EpisodeRecord;
+  const value = { ...pending, ...overrides, ...(overrides.vector === undefined ? {} : { vector: overrides.vector.map(Math.fround) }) } as EpisodeRecord;
   for (const key of ["text", "toolName", "toolArgs", "errorFingerprint", "producerId", "nodeId"] as const) if (value[key] === undefined) delete (value as Partial<EpisodeRecord>)[key];
   return { ...value, contentHash: canonicalRecordHash(value) } as EpisodeRecord;
 }
@@ -203,7 +203,7 @@ describe("Task 7 redacted outbox ingest over the Task 8 ingest bundle", () => {
   it("fails closed before control or egress when the bundle cannot serve the job host", async () => {
     const localPolicy = policy();
     const primeBackend = restQdrantWriter([{ id: COLLECTION_CONTROL_ID, payload: controlPayload(emptyControl()) }], {});
-    stubGlobalFetch(async (input, init = {}) => { const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[]; points?: BackendPoint[] }; if (url.includes("/points/retrieve")) { const ids = body?.ids ?? []; return json({ result: ids.map((id) => primeBackend.points.get(id)).filter((point) => point !== undefined), status: "ok" }); } if (url.includes("/points?") && init.method === "PUT") { for (const point of body?.points ?? []) primeBackend.points.set(point.id, { id: point.id, payload: point.payload }); return json({ result: { status: "acknowledged" }, status: "ok" }); } return json({ result: {}, status: "ok" }); });
+    stubGlobalFetch(async (input, init = {}) => { const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[]; points?: BackendPoint[] }; if (new URL(url).pathname.endsWith("/points") && init.method === "POST") { const ids = body?.ids ?? []; return json({ result: ids.map((id) => primeBackend.points.get(id)).filter((point) => point !== undefined), status: "ok" }); } if (url.includes("/points?") && init.method === "PUT") { for (const point of body?.points ?? []) primeBackend.points.set(point.id, { id: point.id, payload: point.payload }); return json({ result: { status: "acknowledged" }, status: "ok" }); } return json({ result: {}, status: "ok" }); });
     const primeBundle = createQdrantSafeBundle({ options: restQdrantWriter([], {}, "http://qdrant", "prime").options, destination: { ...qdrantDestination, id: "qdrant:prime" }, egressMode: "allowlist", coordinationPolicyHash: coordination.policyHash, coordinationPolicyEpoch: coordination.policyEpoch });
     const primeStore = primeBundle.store;
     const primeQdrant = bindQdrantDestination(primeBundle.qdrant, { ...qdrantDestination, id: "qdrant:prime" });
@@ -711,7 +711,7 @@ describe("Task 7 redacted outbox ingest over the Task 8 ingest bundle", () => {
     let controlReads = 0;
     const fetchImpl: typeof fetch = async (input, init = {}) => {
       const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[]; points?: Array<{ id: string; payload: Record<string, unknown> }> };
-      if (url.includes("/points/retrieve")) {
+      if (new URL(url).pathname.endsWith("/points") && init.method === "POST") {
         const ids = body?.ids ?? [];
         const extra = ids.includes(COLLECTION_CONTROL_ID) && (controlReads += 1) >= 2 ? [{ id: COLLECTION_CONTROL_ID, payload: controlPayload(emptyControl()) }] : [];
         return new Response(JSON.stringify({ result: [...ids.map((id) => points.get(id)).filter((p) => p !== undefined), ...extra], status: "ok" }), { headers: { "content-type": "application/json" } });

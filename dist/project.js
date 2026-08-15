@@ -41,7 +41,7 @@ function registryFilePath(deps) {
     return undefined;
 }
 function safeAlias(alias) {
-    if (typeof alias !== "string" || alias.length === 0 || alias.length > 256 || /[\u0000-\u001f]/u.test(alias) || /(?:api[-_]?key|token|secret|password)/iu.test(alias) || alias === "__proto__" || alias === "prototype" || alias === "constructor")
+    if (typeof alias !== "string" || alias.length === 0 || alias.length > 256 || !/^[A-Za-z0-9._-]+$/u.test(alias) || /(?:api[-_]?key|token|secret|password)/iu.test(alias) || alias === "__proto__" || alias === "prototype" || alias === "constructor")
         throw new TypeError("Project alias must be stable, bounded, non-secret, and safe");
     return alias;
 }
@@ -142,6 +142,12 @@ function normalizeBinding(value, key) {
     return { canonicalPath: normalize(item.canonicalPath), fingerprint: item.fingerprint, alias: item.alias };
 }
 async function loadRegistry(deps) {
+    if (deps.registrations !== undefined) {
+        const normalized = Object.create(null);
+        for (const [key, value] of Object.entries(deps.registrations))
+            normalized[key] = normalizeBinding(value, key);
+        return { version: 1, projects: { registrations: normalized }, raw: {} };
+    }
     const path = registryFilePath(deps);
     if (path === undefined || deps.readTextFile === undefined)
         return emptyRegistry();
@@ -193,9 +199,10 @@ async function saveRegistry(registry, deps) {
 }
 function localIdentity(path, fingerprint, salt, reason) {
     const id = sha256Hex(canonicalStringify({ installationSalt: salt, canonicalPath: path, vcsFingerprint: fingerprint }));
-    return { id, label: basename(path), identityKind: "local_only", canonicalPath: path, fingerprint, registrationValid: false, ...(reason === undefined ? {} : { reason }) };
+    return { id, label: basename(path), identityKind: "local_only", canonicalPath: path, fingerprint, registrationValid: reason === "unregistered", ...(reason === undefined ? {} : { reason }) };
 }
-export async function resolveProjectIdentity(cwd, deps = defaultDependencies) {
+export async function resolveProjectIdentity(cwd, overrides = {}) {
+    const deps = { ...defaultDependencies, ...overrides };
     const requested = resolve(cwd);
     let requestedCanonical = requested;
     try {

@@ -6,13 +6,13 @@ import { intersectPolicies, processingPolicyHash } from "../domain/policy.js";
 import { canonicalRecordHash, parseMemoryRecord } from "../domain/records.js";
 import { ProductionCoordinationStore, LeaseAuthority } from "../qdrant/write.js";
 import { redactAndScan } from "../security/redaction.js";
-import { buildClusterDag } from "./cluster.js";
+import { buildClusterDagOffThread } from "./cluster.js";
 import { buildManifest } from "./manifest.js";
 import { publicationIdentity } from "./publication.js";
 import { seedWords } from "./random.js";
 export const RAPTOR_ALGORITHM_REVISION = "raptor-umap140-diag-gmm-v1";
 export const RAPTOR_PROMPT_REVISION = "raptor-summary-v2";
-const MAX_LEAVES = 1024;
+const MAX_LEAVES = 65_536;
 const MAX_SUMMARY_CHARS = 16_000;
 function ownData(value, key) {
     if (nodeTypes.isProxy(value))
@@ -116,7 +116,16 @@ export function groupRaptorLeavesByPolicy(leaves, workerPolicy) {
     return Object.freeze({ groups: Object.freeze([...grouped.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, values]) => { const policy = intersectPolicies(values.map((leaf) => leaf.policy), worker); if (policy === null || policy.destinationIds.llm === undefined)
             throw new TypeError("RAPTOR group intersection changed"); return Object.freeze({ policy: Object.freeze(policy), leaves: Object.freeze([...values].sort((a, b) => a.id.localeCompare(b.id))) }); })), pendingIds: Object.freeze(pending.sort()) });
 }
-function exactAllSourceIntersection(leaves, worker) { return intersectPolicies(leaves.map((leaf) => leaf.policy), worker); }
+function exactAllSourceIntersection(leaves, worker) {
+    const policies = new Map();
+    for (const leaf of leaves) {
+        const prior = policies.get(leaf.policy.id);
+        if (prior !== undefined && !samePolicy(prior, leaf.policy))
+            return null;
+        policies.set(leaf.policy.id, leaf.policy);
+    }
+    return intersectPolicies([...policies.values()].sort((left, right) => left.id.localeCompare(right.id)), worker);
+}
 function strictSummary(value) {
     let parsed;
     try {
@@ -220,8 +229,18 @@ export async function buildRaptorGeneration(store, authority, input) {
         // or partial build stays unreachable, while a later lease can retry the
         // same logical generation without colliding on prior job/fence provenance.
         const generationId = sha256Hex(canonicalStringify({ domain: "raptor-generation-attempt-v1", generationCoreId, jobId: authority.jobId, fencingToken: authority.fencingToken }));
-        const clusteringLeaves = leaves.map((leaf) => Object.freeze({ ...leaf, tokens: Math.max(leaf.tokens, Math.ceil(Buffer.byteLength(leaf.text, "utf8") / 4) + 32) }));
-        const dag = buildClusterDag(clusteringLeaves, { seed: seedText, maxLevels: options.maxLevels, tokenBudget: options.summaryInputTokens, umapDimensions: options.umapDimensions, globalNeighbors: Math.max(2, Math.min(leaves.length - 1, Math.ceil(Math.sqrt(leaves.length)))), localNeighbors: options.localNeighbors, gmmMaxClusters: options.gmmMaxClusters, membershipThreshold: options.membershipThreshold });
+        // Summary records retain direct member IDs capped at the schema bound.
+        // Charge every leaf at least 1/1024 of the configured prompt budget so no
+        // learned or fallback cluster can cover more than 1024 leaves.
+        const membershipTokenFloor = Math.max(1, Math.ceil(options.summaryInputTokens / 1024));
+        const clusteringLeaves = leaves.map((leaf) => Object.freeze({ ...leaf, tokens: Math.max(leaf.tokens, Math.ceil(Buffer.byteLength(leaf.text, "utf8") / 4) + 32, membershipTokenFloor) }));
+        let dag;
+        try {
+            dag = await buildClusterDagOffThread(clusteringLeaves, { seed: seedText, maxLevels: options.maxLevels, tokenBudget: options.summaryInputTokens, umapDimensions: options.umapDimensions, globalNeighbors: Math.max(2, Math.min(leaves.length - 1, Math.ceil(Math.sqrt(leaves.length)))), localNeighbors: options.localNeighbors, gmmMaxClusters: options.gmmMaxClusters, membershipThreshold: options.membershipThreshold }, { ...(signal === undefined ? {} : { signal }), timeoutMs: 120_000 });
+        }
+        catch {
+            return { state: "pending", reason: signal?.aborted ? "cancelled" : "clustering_failed" };
+        }
         const nodeText = new Map(leaves.map((leaf) => [leaf.id, leaf.text]));
         const childrenByParent = new Map();
         for (const edge of dag.edges) {
@@ -237,7 +256,7 @@ export async function buildRaptorGeneration(store, authority, input) {
         for (const untrusted of (reuseCandidates === undefined ? [] : denseArray(reuseCandidates, "RAPTOR reuse candidates", MAX_LEAVES))) {
             try {
                 const candidate = parseMemoryRecord(untrusted, { ownerHost: host, vectorDimension: 1024 });
-                if (candidate.recordType !== "raptor_summary" || candidate.vector === undefined || candidate.vector.length !== 1024 || candidate.contentHash !== canonicalRecordHash(candidate) || candidate.ownerHost !== host || candidate.processingPolicyId !== policy.id || candidate.expiresAt !== policy.expiresAt || candidate.summary.length === 0)
+                if (candidate.recordType !== "raptor_summary" || candidate.vector === undefined || candidate.vector.length !== 1024 || candidate.contentHash !== canonicalRecordHash(candidate) || candidate.ownerHost !== host || candidate.generationId !== initialControl.activeGeneration || candidate.privacyEpoch !== authority.privacyEpoch || candidate.coordinationPolicyHash !== authority.coordinationPolicyHash || candidate.coordinationPolicyEpoch !== authority.coordinationPolicyEpoch || candidate.summary.length === 0)
                     continue;
                 const rescanned = redactAndScan({ text: candidate.summary, maxChars: MAX_SUMMARY_CHARS, homeDir, ...(scan === undefined ? {} : { scan }) });
                 if (rescanned.dropped || rescanned.text !== candidate.summary)
@@ -335,7 +354,7 @@ export async function buildRaptorGeneration(store, authority, input) {
         }
         const chunkPointIds = manifestNodes.map((node) => node.id);
         const rootKey = reusableKey({ memberIds: chunkPointIds, promptRevision: RAPTOR_PROMPT_REVISION, modelId, algorithm: "raptor-manifest-root-v1" });
-        manifestNodes.push(record({ recordType: "raptor_summary", id: generationId, ownerHost: host, schemaRevision: 1, createdAt: overallRange.temporalTo, privacyEpoch: authority.privacyEpoch, processingPolicyId: policy.id, expiresAt: policy.expiresAt, coordinationPolicyHash: authority.coordinationPolicyHash, coordinationPolicyEpoch: authority.coordinationPolicyEpoch, generationId, clusterId: manifest.root.id, membershipHash: recordMembershipHash(chunkPointIds), level: options.maxLevels + 1, memberIds: chunkPointIds, manifestHash: manifest.root.merkleRoot, summary: "[RAPTOR manifest root]", modelId, embeddingDimension: 1024, promptRevision: RAPTOR_PROMPT_REVISION, algorithm: "raptor-manifest-root-v1", seed, jobId: authority.jobId, fencingToken: authority.fencingToken, temporalFrom: overallRange.temporalFrom, temporalTo: overallRange.temporalTo, coveredProjects: overallRange.projects, algorithmParameters: Object.freeze({ kind: "manifest-root", membershipHash: manifest.root.membershipHash, dagRoots: dag.roots, reuseKey: rootKey }) }));
+        manifestNodes.push(record({ recordType: "raptor_summary", id: generationId, ownerHost: host, schemaRevision: 1, createdAt: overallRange.temporalTo, privacyEpoch: authority.privacyEpoch, processingPolicyId: policy.id, expiresAt: policy.expiresAt, coordinationPolicyHash: authority.coordinationPolicyHash, coordinationPolicyEpoch: authority.coordinationPolicyEpoch, generationId, clusterId: manifest.root.id, membershipHash: recordMembershipHash(chunkPointIds), level: options.maxLevels + 1, memberIds: chunkPointIds, manifestHash: manifest.root.merkleRoot, summary: "[RAPTOR manifest root]", modelId, embeddingDimension: 1024, promptRevision: RAPTOR_PROMPT_REVISION, algorithm: "raptor-manifest-root-v1", seed, jobId: authority.jobId, fencingToken: authority.fencingToken, temporalFrom: overallRange.temporalFrom, temporalTo: overallRange.temporalTo, coveredProjects: overallRange.projects, algorithmParameters: Object.freeze({ kind: "manifest-root", membershipHash: manifest.root.membershipHash, dagRootsHash: sha256Hex(canonicalStringify(dag.roots)), dagRootCount: dag.roots.length, reuseKey: rootKey }) }));
         try {
             for (const node of manifestNodes)
                 summaries.push(await store.writeRaptorSummary(authority, { record: node, destinationIds: destinations, evidenceIds }));

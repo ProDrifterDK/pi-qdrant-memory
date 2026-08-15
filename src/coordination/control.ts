@@ -76,7 +76,7 @@ export async function rotateCoordinationPolicy(store: ProductionCoordinationStor
 }
 
 /** Forget barrier on the same control point: privacy epoch +1, active generation cleared, barrier recorded. */
-export async function beginForgetBarrier(store: ProductionCoordinationStore, input: { now: number }): Promise<ControlRecord> {
+export async function beginForgetBarrier(store: ProductionCoordinationStore, input: { now: number; revokedDestinationIds?: readonly string[] }): Promise<ControlRecord> {
   if (!ProductionCoordinationStore.isValid(store)) throw new TypeError("Forget barrier requires a genuine production store");
   return store.beginForgetBarrier(input);
 }

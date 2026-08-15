@@ -164,12 +164,20 @@ catch {
         failResponse("Qdrant payload must be finite canonical JSON");
     failInput("Qdrant payload must be finite canonical JSON");
 } return value; }
-function normalizePoint(value) { if (!isRecord(value) || !validId(value.id))
+function normalizePoint(value, payloadOnly = false) { if (!isRecord(value) || !validId(value.id))
     failInput("Prepared point ID must be a UUID"); const payload = validatePayload(value.payload); const point = { id: value.id, payload }; if (value.vector !== undefined) {
-    if (!isRecord(value.vector) || Object.keys(value.vector).length !== 1 || !isFiniteVector(value.vector.semantic))
-        failInput("Prepared point must contain one finite semantic vector");
-    point.vector = { semantic: [...value.vector.semantic] };
-} return point; }
+    if (!isRecord(value.vector))
+        failInput("Prepared point vector is invalid");
+    const keys = Object.keys(value.vector);
+    if (keys.length === 0)
+        point.vector = {};
+    else if (keys.length === 1 && keys[0] === "semantic" && isFiniteVector(value.vector.semantic))
+        point.vector = { semantic: [...value.vector.semantic] };
+    else
+        failInput("Prepared point must contain one finite semantic vector or an empty payload-only map");
+}
+else if (payloadOnly)
+    point.vector = {}; return point; }
 function envelope(value) { if (!isRecord(value) || !("result" in value))
     failResponse("Qdrant JSON envelope is invalid"); if (value.status !== undefined && value.status !== "ok")
     failResponse("Qdrant envelope status is invalid"); return value.result; }
@@ -183,7 +191,7 @@ function validatePolicy(policy, configuredOwner) { if (!isRecord(policy) || poli
 }
 catch {
     failInput("Read policy purpose is invalid");
-} if (policy.projectId !== undefined && (typeof policy.projectId !== "string" || policy.projectId.length === 0) || policy.processingPolicyId !== undefined && (typeof policy.processingPolicyId !== "string" || policy.processingPolicyId.length === 0))
+} if (policy.projectId !== undefined && (typeof policy.projectId !== "string" || policy.projectId.length === 0) || policy.processingPolicyId !== undefined && (typeof policy.processingPolicyId !== "string" || policy.processingPolicyId.length === 0) || policy.privacyEpoch !== undefined && (!Number.isSafeInteger(policy.privacyEpoch) || policy.privacyEpoch < 0))
     failInput("Read policy scope is invalid"); }
 /** Coordination points are control-state, not memory; their envelope expiry is lease/claim state. */
 const COORDINATION_POINT_TYPES = new Set(["collection_control", "processing_policy", "job", "lease", "proposal", "coverage", "evidence_link", "tombstone", "collection_metadata"]);
@@ -203,13 +211,20 @@ function validatePayloadForPolicy(payload, policy) {
         failResponse("Qdrant point project policy mismatch");
     if (policy.processingPolicyId !== undefined && payload.processing_policy_id !== policy.processingPolicyId)
         failResponse("Qdrant processing policy mismatch");
+    if (policy.privacyEpoch !== undefined && payload.privacy_epoch !== policy.privacyEpoch)
+        failResponse("Qdrant privacy epoch mismatch");
 }
 function point(value, policy, includeVector) { if (!isRecord(value) || !validId(value.id))
     failResponse("Qdrant point ID is invalid"); const payload = validatePayload(value.payload, true); validatePayloadForPolicy(payload, policy); let vector; if (value.vector !== undefined) {
-    if (!isRecord(value.vector) || Object.keys(value.vector).length !== 1 || !isFiniteVector(value.vector.semantic))
+    if (!isRecord(value.vector))
+        failResponse("Qdrant named vector is invalid");
+    const keys = Object.keys(value.vector);
+    if (keys.length === 0)
+        return { id: value.id, payload };
+    if (keys.length !== 1 || keys[0] !== "semantic" || !isFiniteVector(value.vector.semantic))
         failResponse("Qdrant named vector is invalid");
     if (includeVector)
-        vector = { semantic: [...value.vector.semantic] };
+        vector = { semantic: value.vector.semantic.map(component => Math.fround(component)) };
 } return vector === undefined ? { id: value.id, payload } : { id: value.id, payload, vector }; }
 function responsePoints(value, policy, includeVector) { if (!Array.isArray(value))
     failResponse("Qdrant points result is invalid"); return value.map((item) => point(item, policy, includeVector)); }
@@ -218,10 +233,11 @@ function serverFilter(policy) { validatePolicy(policy, policy.ownerHost); const 
 else
     must.push({ key: "record_type", match: { any: [...policy.recordTypes] } }); if (policy.projectId !== undefined)
     must.push({ key: "project_id", match: { value: policy.projectId } }); if (policy.processingPolicyId !== undefined)
-    must.push({ key: "processing_policy_id", match: { value: policy.processingPolicyId } }); return { must, must_not: policy.purpose === "internal" || policy.purpose === "write_verification" ? [] : [{ key: "record_type", match: { value: "tombstone" } }], should: policy.purpose === "internal" && policy.recordTypes.every((type) => COORDINATION_POINT_TYPES.has(type)) ? [] : [{ is_null: { key: "expires_at" } }, { key: "expires_at", range: { gt: new Date(policy.now + policy.maxClockSkewMs).toISOString() } }] }; }
+    must.push({ key: "processing_policy_id", match: { value: policy.processingPolicyId } }); if (policy.privacyEpoch !== undefined)
+    must.push({ key: "privacy_epoch", match: { value: policy.privacyEpoch } }); return { must, must_not: policy.purpose === "internal" || policy.purpose === "write_verification" ? [] : [{ key: "record_type", match: { value: "tombstone" } }], should: policy.purpose === "internal" && policy.recordTypes.every((type) => COORDINATION_POINT_TYPES.has(type)) ? [] : [{ is_null: { key: "expires_at" } }, { key: "expires_at", range: { gt: new Date(policy.now + policy.maxClockSkewMs).toISOString() } }] }; }
 function responseCollection(value) { const result = envelope(value); if (!isRecord(result) || !isRecord(result.config) || !isRecord(result.config.params) || !isRecord(result.config.params.vectors))
-    failResponse("Collection configuration is invalid"); const vectors = result.config.params.vectors; if (!isRecord(vectors) || Object.keys(vectors).length !== 1 || !isRecord(vectors.semantic) || vectors.semantic.size !== 1024 || vectors.semantic.distance !== "Cosine")
-    failResponse("Collection must have exactly semantic 1024/Cosine vector"); let pointsCount = null; if (result.points_count !== undefined && result.points_count !== null) {
+    failResponse("Collection configuration is invalid"); const vectors = result.config.params.vectors; if (!isRecord(vectors) || Object.keys(vectors).length !== 1 || !isRecord(vectors.semantic) || vectors.semantic.size !== 1024 || vectors.semantic.distance !== "Dot")
+    failResponse("Collection must have exactly semantic 1024/Dot vector"); let pointsCount = null; if (result.points_count !== undefined && result.points_count !== null) {
     if (!Number.isSafeInteger(result.points_count) || Number(result.points_count) < 0)
         failResponse("Collection point count is invalid");
     pointsCount = result.points_count;
@@ -234,7 +250,7 @@ function responseCollection(value) { const result = envelope(value); if (!isReco
             failResponse("Collection payload schema entry is invalid");
         payloadSchema[field] = value;
     }
-} const status = typeof result.status === "string" ? result.status : undefined; return { ...(status === undefined ? {} : { status }), dimension: 1024, distance: "Cosine", vectors: { semantic: { size: 1024, distance: "Cosine" } }, pointsCount, ...(payloadSchema === undefined ? {} : { payloadSchema }), raw: value }; }
+} const status = typeof result.status === "string" ? result.status : undefined; return { ...(status === undefined ? {} : { status }), dimension: 1024, distance: "Dot", vectors: { semantic: { size: 1024, distance: "Dot" } }, pointsCount, ...(payloadSchema === undefined ? {} : { payloadSchema }), raw: value }; }
 /**
  * GLOBAL RULE: snapshot every untrusted QdrantClientOptions field EXACTLY ONCE
  * into a plain frozen object. An accessor-bearing caller object is read once;
@@ -327,7 +343,7 @@ class RestQdrantReadClient {
         failResponse("Health response is invalid"); return parsed; }
     async collectionInfo() { return responseCollection(await fetchJson(consistency(collectionPath(restState(this).options), restState(this).options.readConsistency), { method: "GET", headers: headers(restState(this).options.apiKey) }, requestOptions(restState(this).options, restState(this).fetchImpl))); }
     async retrieve(ids, policy, options = {}) { validatePolicy(policy, this.ownerHost); if (!Array.isArray(ids) || ids.length === 0 || ids.length > 1024 || ids.some((id) => !validId(id)))
-        failInput("Retrieve IDs are invalid"); const response = await fetchJson(consistency(collectionPath(restState(this).options, "/points/retrieve"), restState(this).options.readConsistency), { method: "POST", headers: headers(restState(this).options.apiKey, true), body: JSON.stringify({ ids, with_payload: true, with_vector: options.includeVector === true }) }, requestOptions(restState(this).options, restState(this).fetchImpl)); return responsePoints(envelope(response), policy, options.includeVector === true); }
+        failInput("Retrieve IDs are invalid"); const init = { method: "POST", headers: headers(restState(this).options.apiKey, true), body: JSON.stringify({ ids, with_payload: true, with_vector: options.includeVector === true }) }; const response = await fetchJson(consistency(collectionPath(restState(this).options, "/points"), restState(this).options.readConsistency), init, requestOptions(restState(this).options, restState(this).fetchImpl)); return responsePoints(envelope(response), policy, options.includeVector === true); }
     async scroll(input) { validatePolicy(input.policy, this.ownerHost); if (input.offset !== undefined && !validId(input.offset))
         failInput("Scroll offset is invalid"); const limit = input.limit ?? 256; if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1024)
         failInput("Scroll limit is invalid"); const response = await fetchJson(consistency(collectionPath(restState(this).options, "/points/scroll"), restState(this).options.readConsistency), { method: "POST", headers: headers(restState(this).options.apiKey, true), body: JSON.stringify({ offset: input.offset ?? null, limit, with_payload: true, with_vector: false, filter: serverFilter(input.policy) }) }, requestOptions(restState(this).options, restState(this).fetchImpl)); const result = envelope(response); if (!isRecord(result) || !Array.isArray(result.points))
@@ -360,7 +376,7 @@ class RestQdrantSessionWriter extends RestQdrantReadClient {
         failInput("Prepared points are invalid"); if (mode !== "insert_only" && mode !== "update_only")
         failInput("Upsert mode is invalid"); if (mode === "update_only" && precondition === undefined)
         failInput("Update-only precondition is required"); if (precondition !== undefined)
-        validatePrecondition(precondition, this.ownerHost); const normalized = points.map(normalizePoint); for (const point of normalized)
+        validatePrecondition(precondition, this.ownerHost); const normalized = points.map(point => normalizePoint(point, true)); for (const point of normalized)
         if (point.payload.owner_host !== this.ownerHost)
             failInput("Point owner does not match configured owner"); const body = { points: normalized, update_mode: mode }; if (precondition !== undefined)
         body.update_filter = wirePrecondition(precondition); const response = await fetchJson(pointWriteUrl(restState(this).options), { method: "PUT", headers: headers(restState(this).options.apiKey, true), body: JSON.stringify(body) }, requestOptions(restState(this).options, restState(this).fetchImpl)); updateEnvelope(response); }
@@ -442,7 +458,7 @@ function isProductionRestQdrantSessionWriter(value) {
 /** Truthful minimum capability required by insert/readback verification (lexical). */
 const CONTROL_PATCH_KEYS = new Set(["version", "processingPolicyId", "activeGeneration", "activeBaseGeneration", "privacyEpoch", "coordinationPolicyEpoch", "coordinationPolicyHash", "state", "scanCursor", "lastForgetBarrier", "revokedDestinationIds", "contentHash"]);
 function fail(message) { throw new TypeError(message); }
-const FIELD_NAMES = { recordType: "record_type", ownerHost: "owner_host", schemaRevision: "schema_revision", createdAt: "created_at", privacyEpoch: "privacy_epoch", processingPolicyId: "processing_policy_id", expiresAt: "expires_at", contentHash: "content_hash", sourceEntryId: "source_entry_id", projectId: "project_id", projectIdentityKind: "project_identity_kind", sessionId: "session_id", turnId: "turn_id", agentRole: "agent_role", eventKind: "event_kind", eventAt: "event_at", modelId: "model_id", embeddingDimension: "embedding_dimension", originProvider: "origin_provider", destinationId: "destination_id", redactionStatus: "redaction_status", secretScan: "secret_scan", toolName: "tool_name", toolArgs: "tool_args", errorFingerprint: "error_fingerprint", producerId: "producer_id", nodeId: "node_id", sessionSequence: "session_sequence", coordinationPolicyHash: "coordination_policy_hash", coordinationPolicyEpoch: "coordination_policy_epoch", contentId: "content_id", observationId: "observation_id", effectiveAt: "effective_at", sourceEpisodeIds: "source_episode_ids", manifestHash: "manifest_hash", primaryEvidenceEpisodeId: "primary_evidence_episode_id", effectiveOrder: "effective_order", stateKey: "state_key", category: "category", scope: "scope", subject: "subject", predicate: "predicate", confidence: "confidence", generationId: "generation_id", clusterId: "cluster_id", membershipHash: "membership_hash", level: "level", memberIds: "member_ids", summary: "summary", promptRevision: "prompt_revision", algorithm: "algorithm", seed: "seed", jobId: "job_id", fencingToken: "fencing_token", temporalFrom: "temporal_from", temporalTo: "temporal_to", coveredProjects: "covered_projects", algorithmParameters: "algorithm_parameters", activeGeneration: "active_generation", activeBaseGeneration: "active_base_generation", state: "state", scanCursor: "scan_cursor", lastForgetBarrier: "last_forget_barrier", policy: "policy", canonicalHash: "canonical_hash", policyId: "policy_id", policyHash: "policy_hash", policyEpoch: "policy_epoch", membership: "membership", leaseExpiresAt: "lease_expires_at", leaseOwner: "lease_owner", acceptedProposalId: "accepted_proposal_id", acceptedManifestHash: "accepted_manifest_hash", episodeId: "episode_id", extractorRevision: "extractor_revision", sourceId: "source_id", targetId: "target_id", provenanceId: "provenance_id", resolution: "resolution", conflictManifestHash: "conflict_manifest_hash", value: "value", revokedDestinationIds: "revoked_destination_ids", ownerId: "owner_id", proposalHash: "proposal_hash", content: "content" };
+const FIELD_NAMES = { recordType: "record_type", ownerHost: "owner_host", schemaRevision: "schema_revision", createdAt: "created_at", privacyEpoch: "privacy_epoch", processingPolicyId: "processing_policy_id", expiresAt: "expires_at", contentHash: "content_hash", sourceEntryId: "source_entry_id", projectId: "project_id", projectIdentityKind: "project_identity_kind", sessionId: "session_id", turnId: "turn_id", agentRole: "agent_role", eventKind: "event_kind", eventAt: "event_at", modelId: "model_id", embeddingDimension: "embedding_dimension", originProvider: "origin_provider", destinationId: "destination_id", redactionStatus: "redaction_status", secretScan: "secret_scan", toolName: "tool_name", toolArgs: "tool_args", errorFingerprint: "error_fingerprint", producerId: "producer_id", nodeId: "node_id", sessionSequence: "session_sequence", coordinationPolicyHash: "coordination_policy_hash", coordinationPolicyEpoch: "coordination_policy_epoch", contentId: "content_id", observationId: "observation_id", effectiveAt: "effective_at", sourceEpisodeIds: "source_episode_ids", manifestHash: "manifest_hash", primaryEvidenceEpisodeId: "primary_evidence_episode_id", effectiveOrder: "effective_order", stateKey: "state_key", category: "category", scope: "scope", subject: "subject", predicate: "predicate", confidence: "confidence", generationId: "generation_id", clusterId: "cluster_id", membershipHash: "membership_hash", level: "level", memberIds: "member_ids", summary: "summary", promptRevision: "prompt_revision", algorithm: "algorithm", seed: "seed", jobId: "job_id", fencingToken: "fencing_token", temporalFrom: "temporal_from", temporalTo: "temporal_to", coveredProjects: "covered_projects", algorithmParameters: "algorithm_parameters", activeGeneration: "active_generation", activeBaseGeneration: "active_base_generation", state: "state", scanCursor: "scan_cursor", lastForgetBarrier: "last_forget_barrier", policy: "policy", canonicalHash: "canonical_hash", policyId: "policy_id", policyHash: "policy_hash", policyEpoch: "policy_epoch", membership: "membership", leaseExpiresAt: "lease_expires_at", leaseOwner: "lease_owner", acceptedProposalId: "accepted_proposal_id", acceptedManifestHash: "accepted_manifest_hash", terminalOperation: "terminal_operation", episodeId: "episode_id", extractorRevision: "extractor_revision", sourceId: "source_id", targetId: "target_id", provenanceId: "provenance_id", resolution: "resolution", conflictManifestHash: "conflict_manifest_hash", value: "value", revokedDestinationIds: "revoked_destination_ids", ownerId: "owner_id", proposalHash: "proposal_hash", content: "content" };
 function mapKey(key) { return FIELD_NAMES[key] ?? key; }
 /** Serialize an already-owned parsed record. Never call parseMemoryRecord here:
  * callers that snapshot a getter-bearing record must not re-read it. */
@@ -799,10 +815,13 @@ async function casPoint(client, input) {
         if (next.acceptedProposalId !== p.expectedAcceptedProposalId || next.acceptedManifestHash !== p.expectedAcceptedManifestHash)
             fail("Typed CAS cannot alter an existing acceptance");
     }
-    // State/owner/fence transitions. Terminal completion is a single explicit
-    // accepted->completed transition and cannot be reached from leased,
-    // released, or an already-completed claim.
-    if (next.state === "completed" && (p.expectedState !== "accepted" || p.expectedAcceptedProposalId === null || p.expectedAcceptedManifestHash === null || next.ownerId !== p.expectedOwner || next.fencingToken !== p.expectedFencingToken || next.acceptedProposalId !== p.expectedAcceptedProposalId || next.acceptedManifestHash !== p.expectedAcceptedManifestHash))
+    // State/owner/fence transitions. Curation completion is the accepted->completed
+    // transition. RAPTOR has no proposal: its named completion operation may
+    // perform one leased->completed transition carrying the terminal marker.
+    const raptorTerminal = next.terminalOperation === "raptor";
+    if (raptorTerminal && (next.state !== "completed" || p.expectedState !== "leased" || p.expectedAcceptedProposalId !== null || p.expectedAcceptedManifestHash !== null || next.ownerId !== p.expectedOwner || next.fencingToken !== p.expectedFencingToken || next.acceptedProposalId !== null || next.acceptedManifestHash !== null))
+        fail("Typed CAS RAPTOR completion transition is invalid");
+    if (!raptorTerminal && next.state === "completed" && (p.expectedState !== "accepted" || p.expectedAcceptedProposalId === null || p.expectedAcceptedManifestHash === null || next.ownerId !== p.expectedOwner || next.fencingToken !== p.expectedFencingToken || next.acceptedProposalId !== p.expectedAcceptedProposalId || next.acceptedManifestHash !== p.expectedAcceptedManifestHash))
         fail("Typed CAS completion transition is invalid");
     if (p.expectedState === "completed")
         fail("Typed CAS cannot transition a completed lease");
@@ -1350,7 +1369,7 @@ export class ProductionCoordinationStore {
             scrollLeases: async (offset, limit = 256) => this.scrollLeases(offset, limit),
             scrollJobs: async (offset, limit = 256) => this.scrollJobs(offset, limit),
             readEpisode: async (episodeIdValue) => this.readEpisode(episodeIdValue),
-            readEpisodes: async (episodeIds) => this.readEpisodes(episodeIds),
+            readEpisodes: async (episodeIds, expectedPrivacyEpoch) => this.readEpisodes(episodeIds, expectedPrivacyEpoch),
             readCurated: async (recordType, id) => this.#readCurated(recordType, id),
             insertCurated: async (record) => engine.insertOnly(record),
             casCuratedCurrent: async (input) => engine.casCuratedCurrent(input),
@@ -1369,8 +1388,8 @@ export class ProductionCoordinationStore {
     }
     /** Opaque per-instance transport identity; compared by `===` in the ingest bundle. */
     get transport() { return this.#transportToken; }
-    internalPolicy(recordType) {
-        return readPolicy({ ownerHost: this.ownerHost, purpose: "internal", recordTypes: [recordType], maxClockSkewMs: this.maxClockSkewMs });
+    internalPolicy(recordType, privacyEpoch) {
+        return readPolicy({ ownerHost: this.ownerHost, purpose: "internal", recordTypes: [recordType], maxClockSkewMs: this.maxClockSkewMs, ...(privacyEpoch === undefined ? {} : { privacyEpoch }) });
     }
     async readOne(recordType, id) {
         try {
@@ -1450,6 +1469,22 @@ export class ProductionCoordinationStore {
             return parsed;
         });
     }
+    async scrollEpisodeIds(offset, limit = 256, expectedPrivacyEpoch) {
+        if (expectedPrivacyEpoch !== undefined && (!Number.isSafeInteger(expectedPrivacyEpoch) || expectedPrivacyEpoch < 0))
+            throw new TypeError("Episode privacy epoch is invalid");
+        const result = await this.#bound.scroll({ policy: this.internalPolicy("episode", expectedPrivacyEpoch), ...(offset === undefined ? {} : { offset }), limit });
+        const points = ownedPointsSnapshot(result.points);
+        const episodeIds = [];
+        const seen = new Set();
+        for (const point of points) {
+            const payload = point.payload;
+            if (point.vector !== undefined || seen.has(point.id) || payload.record_type !== "episode" || payload.id !== point.id || payload.owner_host !== this.ownerHost || expectedPrivacyEpoch !== undefined && payload.privacy_epoch !== expectedPrivacyEpoch || typeof payload.content_hash !== "string" || !/^[a-f0-9]{64}$/u.test(payload.content_hash))
+                throw new TypeError("Episode scroll readback is malformed or foreign");
+            seen.add(point.id);
+            episodeIds.push(point.id);
+        }
+        return { episodeIds, ...(result.nextOffset === undefined ? {} : { nextOffset: result.nextOffset }) };
+    }
     async scrollLeases(offset, limit = 256) {
         const result = await this.#bound.scroll({ policy: this.internalPolicy("lease"), ...(offset === undefined ? {} : { offset }), limit });
         const ownedPoints = ownedPointsSnapshot(result.points);
@@ -1478,11 +1513,11 @@ export class ProductionCoordinationStore {
         }
         return { jobs, ...(result.nextOffset === undefined ? {} : { nextOffset: result.nextOffset }) };
     }
-    async readEpisode(episodeIdValue) {
+    async readEpisode(episodeIdValue, expectedPrivacyEpoch) {
         try {
             // Vector-aware reads: the shared exact parser requires the named semantic
             // vector, exact wire payload and vector-bound contentHash.
-            const points = ownedPointsSnapshot(await this.#bound.retrieve([episodeIdValue], this.internalPolicy("episode"), { includeVector: true }));
+            const points = ownedPointsSnapshot(await this.#bound.retrieve([episodeIdValue], this.internalPolicy("episode", expectedPrivacyEpoch), { includeVector: true }));
             // Exact cardinality: extras/duplicates/aliases fail closed.
             const matches = points.filter((candidate) => candidate.id === episodeIdValue);
             if (points.length !== matches.length || matches.length > 1)
@@ -1491,7 +1526,7 @@ export class ProductionCoordinationStore {
             if (point === undefined)
                 return null;
             const parsed = parseBoundEpisodePoint(point, this.ownerHost);
-            return parsed !== null && parsed.ownerHost === this.ownerHost ? parsed : null;
+            return parsed !== null && parsed.ownerHost === this.ownerHost && (expectedPrivacyEpoch === undefined || parsed.privacyEpoch === expectedPrivacyEpoch) ? parsed : null;
         }
         catch {
             return null;
@@ -1538,6 +1573,38 @@ export class ProductionCoordinationStore {
             return null;
         return parsed;
     }
+    /** Page immutable RAPTOR records for one prior generation with exact vector-aware readback. */
+    async scrollRaptorSummaries(generationId, offset, limit = 256) {
+        if (!validBoundedText(generationId) || (offset !== undefined && !validBoundedText(offset)) || !Number.isSafeInteger(limit) || limit < 1 || limit > 256)
+            throw new TypeError("RAPTOR scroll input is invalid");
+        const result = await this.#bound.scroll({ policy: this.internalPolicy("raptor_summary"), ...(offset === undefined ? {} : { offset }), limit });
+        const page = ownedPointsSnapshot(result.points);
+        if (new Set(page.map((point) => point.id)).size !== page.length)
+            throw new TypeError("RAPTOR scroll contains duplicate points");
+        if (page.length === 0)
+            return { summaries: [], ...(result.nextOffset === undefined ? {} : { nextOffset: result.nextOffset }) };
+        const full = ownedPointsSnapshot(await this.#bound.retrieve(page.map((point) => point.id), this.internalPolicy("raptor_summary"), { includeVector: true }));
+        if (full.length !== page.length || new Set(full.map((point) => point.id)).size !== full.length)
+            throw new TypeError("RAPTOR scroll readback is incomplete or duplicated");
+        const byId = new Map(full.map((point) => [point.id, point]));
+        const summaries = [];
+        for (const outer of page) {
+            const point = byId.get(outer.id);
+            if (point === undefined || point.payload.record_type !== "raptor_summary")
+                throw new TypeError("RAPTOR scroll readback identity mismatch");
+            const semantic = point.vector?.semantic;
+            const parsed = recordFromPayload(point.payload, this.ownerHost, semantic);
+            if (parsed.recordType !== "raptor_summary" || physicalPointId("raptor_summary", parsed.id) !== point.id || parsed.contentHash !== canonicalRecordHash(parsed))
+                throw new TypeError("RAPTOR scroll record is malformed");
+            if (parsed.vector !== undefined && (!Array.isArray(semantic) || semantic.length !== 1024 || !semantic.every((value) => typeof value === "number" && Number.isFinite(value))))
+                throw new TypeError("RAPTOR scroll vector is malformed");
+            if (parsed.vector === undefined && point.vector !== undefined)
+                throw new TypeError("RAPTOR scroll vector is unexpected");
+            if (parsed.generationId === generationId)
+                summaries.push(parsed);
+        }
+        return { summaries, ...(result.nextOffset === undefined ? {} : { nextOffset: result.nextOffset }) };
+    }
     async readRaptorSummary(id) {
         try {
             if (!validBoundedText(id))
@@ -1564,10 +1631,12 @@ export class ProductionCoordinationStore {
             return null;
         }
     }
-    async readEpisodes(episodeIds) {
+    async readEpisodes(episodeIds, expectedPrivacyEpoch) {
+        if (expectedPrivacyEpoch !== undefined && (!Number.isSafeInteger(expectedPrivacyEpoch) || expectedPrivacyEpoch < 0))
+            throw new TypeError("Episode privacy epoch is invalid");
         if (!Array.isArray(episodeIds) || episodeIds.length === 0 || episodeIds.length > 1024 || episodeIds.some((id) => typeof id !== "string" || id.length === 0 || id.length > 512) || new Set(episodeIds).size !== episodeIds.length)
             throw new TypeError("Episode IDs are invalid");
-        const points = ownedPointsSnapshot(await this.#bound.retrieve([...episodeIds], this.internalPolicy("episode"), { includeVector: true }));
+        const points = ownedPointsSnapshot(await this.#bound.retrieve([...episodeIds], this.internalPolicy("episode", expectedPrivacyEpoch), { includeVector: true }));
         // Exact mapping: every returned episode must be one of the requested point
         // IDs; extras, duplicates, missing vectors, malformed payloads or hash
         // mismatches fail closed through the shared vector-aware parser.
@@ -1578,12 +1647,32 @@ export class ProductionCoordinationStore {
             if (!requested.has(point.id) || seen.has(point.id))
                 throw new TypeError("Episode readback contains extras or duplicates");
             const parsed = parseBoundEpisodePoint(point, this.ownerHost);
-            if (parsed === null || parsed.ownerHost !== this.ownerHost || parsed.id !== point.id)
+            if (parsed === null || parsed.ownerHost !== this.ownerHost || parsed.id !== point.id || expectedPrivacyEpoch !== undefined && parsed.privacyEpoch !== expectedPrivacyEpoch)
                 throw new TypeError("Episode readback point is malformed or identity mismatched");
             seen.add(point.id);
             episodes.push(parsed);
         }
         return episodes;
+    }
+    async readProcessingPolicies(policyIds) {
+        if (!Array.isArray(policyIds) || policyIds.length === 0 || policyIds.length > 1024 || policyIds.some((id) => typeof id !== "string" || !/^[a-f0-9]{64}$/u.test(id)) || new Set(policyIds).size !== policyIds.length)
+            throw new TypeError("Processing policy IDs are invalid");
+        const physicalIds = policyIds.map((id) => physicalPointId("processing_policy", id));
+        const points = ownedPointsSnapshot(await this.#bound.retrieve(physicalIds, this.internalPolicy("processing_policy")));
+        const requested = new Map(physicalIds.map((id, index) => [id, policyIds[index]]));
+        const policies = [];
+        const seen = new Set();
+        for (const point of points) {
+            const logicalId = requested.get(point.id);
+            if (logicalId === undefined || seen.has(point.id) || point.payload.record_type !== "processing_policy" || point.vector !== undefined)
+                throw new TypeError("Processing policy readback contains extras or duplicates");
+            const parsed = recordFromPayload(point.payload, this.ownerHost);
+            if (parsed.recordType !== "processing_policy" || parsed.id !== logicalId || physicalPointId("processing_policy", parsed.id) !== point.id || parsed.contentHash !== canonicalRecordHash(parsed))
+                throw new TypeError("Processing policy readback point is malformed or identity mismatched");
+            seen.add(point.id);
+            policies.push(parsed);
+        }
+        return policies;
     }
     async assertAcceptedAuthorityBase(authority) {
         if (!LeaseAuthority.isValid(authority) || !authority.matchesStore(this) || !authority.matchesScope(this.#authorityScope) || authority.state !== "accepted")
@@ -1602,7 +1691,7 @@ export class ProductionCoordinationStore {
             throw new TypeError("RAPTOR operation requires a genuine live lease authority");
         if (!Array.isArray(destinationIds) || destinationIds.length < 2 || destinationIds.length > 3 || destinationIds.some((id) => !validBoundedText(id, 256)) || new Set(destinationIds).size !== destinationIds.length)
             throw new TypeError("RAPTOR destination identity is invalid");
-        if (!Array.isArray(targetIds) || targetIds.length === 0 || targetIds.length > 1024 || targetIds.some((id) => !validBoundedText(id)) || new Set(targetIds).size !== targetIds.length)
+        if (!Array.isArray(targetIds) || targetIds.length === 0 || targetIds.length > 65_536 || targetIds.some((id) => !validBoundedText(id)) || new Set(targetIds).size !== targetIds.length)
             throw new TypeError("RAPTOR evidence targets are invalid");
         const control = await this.readControl();
         const job = await this.readJob(authority.jobId);
@@ -1612,12 +1701,14 @@ export class ProductionCoordinationStore {
         const now = authority.now();
         if (jobExpired(job, now, authority.maxClockSkewMs) || Date.parse(claim.expiresAt) <= now || control.state !== "active" || control.privacyEpoch !== authority.privacyEpoch || control.coordinationPolicyEpoch !== authority.coordinationPolicyEpoch || control.coordinationPolicyHash !== authority.coordinationPolicyHash || destinationIds.some((id) => control.revokedDestinationIds.includes(id)))
             throw new TypeError("RAPTOR authority is expired or revoked");
-        if (job.ownerHost !== this.ownerHost || job.id !== authority.jobId || job.policyId !== authority.processingPolicyId || job.policyHash !== authority.coordinationPolicyHash || job.policyEpoch !== authority.coordinationPolicyEpoch || job.privacyEpoch !== authority.privacyEpoch || targetIds.some((id) => !job.membership.includes(id)))
-            throw new TypeError("RAPTOR authority is not bound to the job membership");
-        const tombstones = await this.readTombstones(targetIds);
+        if (job.ownerHost !== this.ownerHost || job.id !== authority.jobId || job.policyId !== authority.processingPolicyId || job.policyHash !== authority.coordinationPolicyHash || job.policyEpoch !== authority.coordinationPolicyEpoch || job.privacyEpoch !== authority.privacyEpoch || job.membership.length !== targetIds.length || targetIds.some((id, index) => job.membership[index] !== id))
+            throw new TypeError("RAPTOR authority is not bound to the exact job membership");
+        const tombstones = [];
+        for (let index = 0; index < targetIds.length; index += 1024)
+            tombstones.push(...await this.readTombstones(targetIds.slice(index, index + 1024)));
         if (tombstones.length !== 0)
             throw new TypeError("RAPTOR evidence is tombstoned");
-        const digest = canonicalStringify({ control, job, claim, destinationIds: [...destinationIds].sort(), targetIds: [...targetIds].sort(), tombstones });
+        const digest = canonicalStringify({ control, job, claim, destinationIds: [...destinationIds].sort(), targetIds: [...targetIds], tombstones });
         return { job, control, claim, digest };
     }
     async assertCuratedRecordAgainstJob(record, job) {
@@ -1747,6 +1838,12 @@ export class ProductionCoordinationStore {
     }
     async completeJob(authority) {
         return completeJobOnProtocol(this.#protocol, this, this.#authorityScope, authority);
+    }
+    /** Complete a published RAPTOR job without manufacturing a curation
+     * proposal. The named operation proves the active generation and exact
+     * evidence barrier before a fenced lease may become terminal. */
+    async completeRaptorJob(authority, input) {
+        return completeRaptorJobOnProtocol(this.#protocol, this, this.#authorityScope, authority, input);
     }
     async writeProposal(authority, input) {
         return writeProposalOnProtocol(this.#protocol, this, this.#authorityScope, authority, input);
@@ -2488,6 +2585,37 @@ export function proposalHashFor(input) {
 }
 /** @internal Raw-protocol terminal job completion; all derived effects are
  * authoritatively derived from the accepted proposal and job membership. */
+async function completeRaptorJobOnProtocol(protocol, target, scope, authority, input) {
+    if (!LeaseAuthority.isValid(authority) || !authority.matchesStore(target) || !authority.matchesScope(scope) || authority.state !== "leased")
+        throw new TypeError("RAPTOR completion requires a genuine leased authority");
+    if (input === null || typeof input !== "object" || !validBoundedText(input.generationId) || !Array.isArray(input.evidenceIds) || input.evidenceIds.length === 0 || input.evidenceIds.length > 65_536 || input.evidenceIds.some(id => !validBoundedText(id)) || new Set(input.evidenceIds).size !== input.evidenceIds.length || !Array.isArray(input.destinationIds) || input.destinationIds.length < 2 || input.destinationIds.length > 3 || input.destinationIds.some(id => !validBoundedText(id, 256)) || new Set(input.destinationIds).size !== input.destinationIds.length)
+        throw new TypeError("RAPTOR completion proof is invalid");
+    const job = await protocol.readJob(authority.jobId);
+    const claim = await protocol.readLease(authority.jobId);
+    const control = await protocol.readControl();
+    if (job === null || claim === null || !authority.matchesClaim(claim) || claim.state !== "leased" || job.ownerHost !== target.ownerHost || job.policyId !== authority.processingPolicyId || job.policyHash !== authority.coordinationPolicyHash || job.policyEpoch !== authority.coordinationPolicyEpoch || job.privacyEpoch !== authority.privacyEpoch || job.membership.length !== input.evidenceIds.length || job.membership.some((id, index) => id !== input.evidenceIds[index]) || control.state !== "active" || control.activeGeneration !== input.generationId || control.coordinationPolicyEpoch !== authority.coordinationPolicyEpoch || control.coordinationPolicyHash !== authority.coordinationPolicyHash || control.privacyEpoch !== authority.privacyEpoch || input.destinationIds.some(id => control.revokedDestinationIds.includes(id)))
+        return false;
+    const now = authority.now();
+    if (jobExpired(job, now, authority.maxClockSkewMs) || Date.parse(claim.expiresAt) <= now)
+        return false;
+    // The barrier read is the authoritative pre-CAS evidence check; the lease
+    // CAS below necessarily changes the digest, so only the exact lease
+    // readback can prove terminal completion here.
+    await target.readRaptorBarrier(authority, { destinationIds: input.destinationIds, evidenceIds: input.evidenceIds });
+    const finalControl = await protocol.readControl();
+    const finalClaim = await protocol.readLease(authority.jobId);
+    const finalNow = authority.now();
+    if (finalControl.activeGeneration !== input.generationId || finalControl.coordinationPolicyEpoch !== control.coordinationPolicyEpoch || finalControl.coordinationPolicyHash !== control.coordinationPolicyHash || finalControl.privacyEpoch !== control.privacyEpoch || finalClaim === null || !authority.matchesClaim(finalClaim) || finalClaim.state !== "leased" || Date.parse(finalClaim.expiresAt) <= finalNow || jobExpired(job, finalNow, authority.maxClockSkewMs))
+        return false;
+    const next = hashed({ ...finalClaim, version: finalClaim.version + 1, state: "completed", terminalOperation: "raptor" });
+    const won = await protocol.casLease({ jobId: job.id, expectedVersion: finalClaim.version, expectedFencingToken: finalClaim.fencingToken, expectedPolicyEpoch: finalClaim.coordinationPolicyEpoch, expectedPolicyHash: finalClaim.coordinationPolicyHash, expectedPrivacyEpoch: finalClaim.privacyEpoch, expectedState: "leased", expectedOwner: finalClaim.ownerId, expectedAcceptedProposalId: null, expectedAcceptedManifestHash: null, expectedProcessingPolicyId: finalClaim.processingPolicyId, expectedCreatedAt: finalClaim.createdAt, expectedContentHash: finalClaim.contentHash, expiresAfter: finalNow, next });
+    if (!won)
+        return false;
+    const reread = await protocol.readLease(job.id);
+    return reread !== null && canonicalStringify(reread) === canonicalStringify(next);
+}
+/** @internal Raw-protocol terminal job completion; all derived effects are
+ * authoritatively derived from the accepted proposal and job membership. */
 async function completeJobOnProtocol(protocol, target, scope, authority) {
     const no = (_reason) => false;
     if (!LeaseAuthority.isValid(authority) || !authority.matchesStore(target) || !authority.matchesScope(scope) || authority.state !== "accepted")
@@ -2506,7 +2634,7 @@ async function completeJobOnProtocol(protocol, target, scope, authority) {
     const initialTombstones = await protocol.readTombstones(job.membership);
     if (initialControl.ownerHost !== target.ownerHost || initialControl.state !== "active" || initialControl.coordinationPolicyEpoch !== authority.coordinationPolicyEpoch || initialControl.coordinationPolicyHash !== authority.coordinationPolicyHash || initialControl.privacyEpoch !== authority.privacyEpoch || initialTombstones.length > 0)
         return no("check-4-barrier");
-    const episodes = await protocol.readEpisodes(job.membership);
+    const episodes = await protocol.readEpisodes(job.membership, job.privacyEpoch);
     if (episodes.length !== job.membership.length)
         return no("check-5");
     const episodeMap = new Map(episodes.map((episode) => [episode.id, episode]));
@@ -3166,7 +3294,7 @@ async function markCoverageOnProtocol(protocol, target, scope, authority, input)
     if (job === null)
         throw new TypeError("Coverage job is missing");
     await assertCoverageRecordBoundToJob(final, job, target.ownerHost);
-    const episodes = await protocol.readEpisodes([final.episodeId]);
+    const episodes = await protocol.readEpisodes([final.episodeId], job.privacyEpoch);
     if (episodes.length === 1) {
         if (episodes[0].id !== final.episodeId || episodes[0].ownerHost !== target.ownerHost || episodes[0].createdAt !== final.createdAt)
             throw new TypeError("Coverage timestamp is not bound to its canonical episode");
@@ -3497,8 +3625,12 @@ async function rotateCoordinationPolicyOnProtocol(protocol, scope, input) {
 /** @internal */
 async function beginForgetBarrierOnProtocol(protocol, scope, input) {
     const now = validClock("Forget barrier clock", input.now);
+    const requestedRevocations = input.revokedDestinationIds === undefined ? [] : [...input.revokedDestinationIds];
+    if (requestedRevocations.length > 256 || requestedRevocations.some((id) => !validBoundedText(id, 256) || SECRET.test(id)) || new Set(requestedRevocations).size !== requestedRevocations.length)
+        throw new TypeError("Forget barrier destination revocations are invalid");
     const current = await protocol.readControl();
+    const revokedDestinationIds = [...new Set([...current.revokedDestinationIds, ...requestedRevocations])].sort();
     const barrier = new Date(now).toISOString();
-    return casOrReread(protocol, current.version, nextControl(current, { privacyEpoch: current.privacyEpoch + 1, activeGeneration: null, lastForgetBarrier: barrier }), "Concurrent forget barrier lost the control CAS");
+    return casOrReread(protocol, current.version, nextControl(current, { privacyEpoch: current.privacyEpoch + 1, activeGeneration: null, lastForgetBarrier: barrier, revokedDestinationIds }), "Concurrent forget barrier lost the control CAS");
 }
 //# sourceMappingURL=write.js.map

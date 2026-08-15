@@ -64,6 +64,7 @@ export declare function rotateCoordinationPolicy(store: ProductionCoordinationSt
 /** Forget barrier on the same control point: privacy epoch +1, active generation cleared, barrier recorded. */
 export declare function beginForgetBarrier(store: ProductionCoordinationStore, input: {
     now: number;
+    revokedDestinationIds?: readonly string[];
 }): Promise<ControlRecord>;
 /** Exact stable RAPTOR checkpoint over control/job/lease/tombstones and bound destinations. */
 export declare function readRaptorBarrier(store: ProductionCoordinationStore, authority: LeaseAuthority, input: {

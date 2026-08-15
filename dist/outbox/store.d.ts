@@ -68,6 +68,8 @@ export declare function parseOutboxJob(value: unknown, expected?: {
     producerUuid?: string;
     homeDir?: string;
 }): OutboxJob;
+/** Resolve and persist the pseudonymous installation node identity without creating a producer. */
+export declare function resolveOutboxNodeId(input: Omit<CreateOutboxInput, "producerUuid" | "maxJobs" | "maxBytes" | "notifyFull">): Promise<string>;
 export declare class OutboxCapacityError extends Error {
     constructor();
 }

@@ -8,7 +8,12 @@ export const V2_COLLECTION_METADATA = {
   dense_vector: "semantic",
   embedding_model: "bge-m3",
   embedding_dimension: 1024,
-  distance: "Cosine",
+  // Qdrant 1.17 L2-normalizes Cosine vectors on write with CPU-dependent f32
+  // accumulation, so exact vector readback (and thus the vector-bound content
+  // hash) is impossible under Cosine. Every embedding is canonicalized at the
+  // single embedding boundary (L2-normalized, shortest-f32 components), where
+  // Dot on normalized vectors is exactly Cosine and round-trips byte-exact.
+  distance: "Dot",
 } as const;
 export const V2_CONTRACT_HASH = sha256Hex(canonicalStringify(V2_COLLECTION_METADATA));
 export type PayloadIndexSchema = "keyword" | "integer" | "datetime" | "text";
@@ -35,7 +40,7 @@ export interface CollectionMetadataPayload {
   dense_vector: typeof V2_COLLECTION_METADATA.dense_vector;
   embedding_model: typeof V2_COLLECTION_METADATA.embedding_model;
   embedding_dimension: 1024;
-  distance: "Cosine";
+  distance: "Dot";
   contract_hash: string;
   status: "active";
   secret_scan: "passed";
@@ -43,17 +48,17 @@ export interface CollectionMetadataPayload {
 export function collectionMetadataPayload(ownerHost: HostId, contractHash = V2_CONTRACT_HASH): CollectionMetadataPayload {
   if (ownerHost !== "pi" && ownerHost !== "prime") throw new TypeError("Metadata owner host is invalid");
   if (!/^[a-f0-9]{64}$/u.test(contractHash)) throw new TypeError("Metadata contract hash is invalid");
-  return { record_type: "collection_metadata", owner_host: ownerHost, schema: V2_COLLECTION_METADATA.schema, schema_revision: 1, dense_vector: "semantic", embedding_model: "bge-m3", embedding_dimension: 1024, distance: "Cosine", contract_hash: contractHash, status: "active", secret_scan: "passed" };
+  return { record_type: "collection_metadata", owner_host: ownerHost, schema: V2_COLLECTION_METADATA.schema, schema_revision: 1, dense_vector: "semantic", embedding_model: "bge-m3", embedding_dimension: 1024, distance: "Dot", contract_hash: contractHash, status: "active", secret_scan: "passed" };
 }
-export function collectionMetadataPoint(ownerHost: HostId, contractHash = V2_CONTRACT_HASH): { id: string; payload: CollectionMetadataPayload } { return { id: COLLECTION_METADATA_ID, payload: collectionMetadataPayload(ownerHost, contractHash) }; }
+export function collectionMetadataPoint(ownerHost: HostId, contractHash = V2_CONTRACT_HASH): { id: string; payload: CollectionMetadataPayload; vector: Record<string, never> } { return { id: COLLECTION_METADATA_ID, payload: collectionMetadataPayload(ownerHost, contractHash), vector: {} }; }
 
 /** Control payload is intentionally point-only; no Qdrant collection metadata bag is used. */
 export function controlPayload(control: ControlRecord): Record<string, unknown> {
   return { record_type: "collection_control", id: control.id, owner_host: control.ownerHost, schema_revision: control.schemaRevision, created_at: control.createdAt, privacy_epoch: control.privacyEpoch, processing_policy_id: control.processingPolicyId, expires_at: control.expiresAt, content_hash: control.contentHash, version: control.version, active_generation: control.activeGeneration, active_base_generation: control.activeBaseGeneration, coordination_policy_epoch: control.coordinationPolicyEpoch, coordination_policy_hash: control.coordinationPolicyHash, state: control.state, status: "active", secret_scan: "passed", scan_cursor: control.scanCursor, last_forget_barrier: control.lastForgetBarrier, revoked_destination_ids: [...control.revokedDestinationIds] };
 }
-export function collectionControlPoint(control: ControlRecord): { id: string; payload: Record<string, unknown> } {
+export function collectionControlPoint(control: ControlRecord): { id: string; payload: Record<string, unknown>; vector: Record<string, never> } {
   if (control.id !== COLLECTION_CONTROL_ID) throw new TypeError("Collection control ID is invalid");
-  return { id: COLLECTION_CONTROL_ID, payload: controlPayload(control) };
+  return { id: COLLECTION_CONTROL_ID, payload: controlPayload(control), vector: {} };
 }
 
 /** Strict bootstrap control validation shared by init, admin insertion and write helper. */
@@ -89,4 +94,4 @@ export function isCollectionMetadataPayload(value: unknown, ownerHost: HostId, c
   try { const expected = collectionMetadataPayload(ownerHost, contractHash); const keys = Object.keys(value).sort(); const expectedKeys = Object.keys(expected).sort();
     return keys.length === expectedKeys.length && keys.every((key, index) => key === expectedKeys[index] && canonicalStringify(value[key]) === canonicalStringify((expected as unknown as Record<string, unknown>)[key])); } catch { return false; }
 }
-export function collectionVectors(): { semantic: { size: 1024; distance: "Cosine" } } { return { semantic: { size: 1024, distance: "Cosine" } }; }
+export function collectionVectors(): { semantic: { size: 1024; distance: "Dot" } } { return { semantic: { size: 1024, distance: "Dot" } }; }

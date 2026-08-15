@@ -4,6 +4,18 @@ import { parseMemoryRecord } from "../domain/records.js";
 import { readPolicy } from "../qdrant/client.js";
 import { adminCollectionInfo, adminCreateCollection, adminCreatePayloadIndex, adminInsertInitialControlPoint, adminInsertMetadataPoint, adminRetrieve, adminServerInfo } from "./transport.js";
 import { COLLECTION_CONTROL_ID, COLLECTION_METADATA_ID, REQUIRED_INDEXES, V2_COLLECTION_METADATA, V2_CONTRACT_HASH, assertBootstrapControl, controlRecordFromPayload, isBootstrapControlPayload, isCollectionMetadataPayload } from "../qdrant/schema.js";
+import { validateCaptureActivation } from "../config.js";
+/** Validate the human disclosure gate before a CLI can enable capture. Runtime
+ * config loading already enforces explicit file retention/egress fields; this
+ * second gate prevents a shell invocation from silently enabling capture. */
+export function validateInitializationDisclosure(config, disclosure) {
+    try {
+        validateCaptureActivation(config, disclosure);
+    }
+    catch (error) {
+        throw new TypeError(error instanceof Error ? error.message : "Capture disclosure is invalid");
+    }
+}
 function defaultControl(config, now) { const instant = new Date(now()); if (!Number.isFinite(instant.getTime()))
     throw new TypeError("Initialization clock is invalid"); const base = { ownerHost: config.host, schemaRevision: 1, createdAt: instant.toISOString(), privacyEpoch: 0, processingPolicyId: V2_CONTRACT_HASH, expiresAt: null, recordType: "collection_control", id: COLLECTION_CONTROL_ID, version: 0, activeGeneration: null, activeBaseGeneration: null, coordinationPolicyEpoch: 0, coordinationPolicyHash: V2_CONTRACT_HASH, state: "active", scanCursor: null, lastForgetBarrier: null, revokedDestinationIds: [], contentHash: "pending" }; const copy = { ...base }; delete copy.contentHash; delete copy.createdAt; return { ...base, contentHash: sha256Hex(canonicalStringify(copy)) }; }
 function validateReplicaConfig(config) { const replication = config.qdrant.replicationFactor; const consistency = config.qdrant.writeConsistencyFactor; if (!Number.isSafeInteger(replication) || !Number.isSafeInteger(consistency) || replication < 1 || consistency < 1 || consistency > replication)
@@ -15,7 +27,7 @@ else if (consistency < Math.ceil((replication + 1) / 2))
     throw new TypeError("Qdrant write consistency is below the cluster majority"); }
 function notFound(error) { return error instanceof MemoryClientError && error.category === "http" && error.status === 404; }
 function conflict(error) { return error instanceof MemoryClientError && error.category === "http" && error.status === 409; }
-function result(config, initialized, created, version) { return { host: config.host, collection: config.qdrant.collection, ownerHost: config.host, schema: "pi-qdrant-memory-v2", schemaRevision: 1, vector: { name: "semantic", model: "bge-m3", dimension: 1024, distance: "Cosine" }, capture: { enabled: config.capture.enabled, episodeRetentionDays: config.capture.episodeRetentionDays }, initialized, collectionCreated: created, ...(version === undefined ? {} : { qdrantVersion: version }) }; }
+function result(config, initialized, created, version) { return { host: config.host, collection: config.qdrant.collection, ownerHost: config.host, schema: "pi-qdrant-memory-v2", schemaRevision: 1, vector: { name: "semantic", model: "bge-m3", dimension: 1024, distance: "Dot" }, capture: { enabled: config.capture.enabled, episodeRetentionDays: config.capture.episodeRetentionDays }, disclosure: "Loopback binding provides functional isolation, not cryptographic privacy.", initialized, collectionCreated: created, ...(version === undefined ? {} : { qdrantVersion: version }) }; }
 function validateIndexes(schema) { if (schema === undefined)
     throw new Error("Qdrant payload index schema is missing"); for (const [field, expected] of REQUIRED_INDEXES) {
     const value = schema[field];

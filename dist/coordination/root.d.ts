@@ -37,6 +37,8 @@ export type RootRaptorLifecycleInput = RaptorBuildInput & {
     readonly leaseMs: number;
     readonly maxClockSkewMs: number;
     readonly extractorRevision: string;
+    /** Existing durable admin RAPTOR job; normal lifecycle builds create one. */
+    readonly jobId?: string;
     readonly clock?: () => number;
 };
 /** The sole RAPTOR root entry point; the private root/lease capability never escapes. */

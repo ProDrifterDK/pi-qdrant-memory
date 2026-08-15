@@ -298,7 +298,7 @@ export async function materializeCuration(authority, input) {
     const membership = proposal.membership;
     // AUTHORITATIVE evidence readback: the store re-reads the membership
     // episodes (a caller can never forge direct-user evidence).
-    const storedEpisodes = await store.readEpisodes(membership);
+    const storedEpisodes = await store.readEpisodes(membership, authority.privacyEpoch).catch(() => []);
     if (storedEpisodes.length !== membership.length)
         throw new TypeError("Membership episodes are missing");
     const episodeById = new Map(storedEpisodes.map((episode) => [episode.id, episode]));

@@ -2,8 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { bindEmbeddingDestination, bindEmbeddingDocumentClient, createEmbeddingDestinationFactory, EmbeddingsClient, type BoundEmbeddingDestination } from "../../src/clients/embeddings.js";
 import { runRaptorFromLifecycle, type RootRaptorLifecycleInput } from "../../src/coordination/root.js";
-import { canonicalRecordHash, type ControlRecord } from "../../src/domain/records.js";
+import { canonicalRecordHash, type ControlRecord, type EpisodeRecord } from "../../src/domain/records.js";
 import { processingPolicyHash, type ProcessingPolicy } from "../../src/domain/policy.js";
+import { episodeId } from "../../src/domain/ids.js";
 import { COLLECTION_CONTROL_ID, controlPayload } from "../../src/qdrant/schema.js";
 import { createQdrantSafeBundle, recordPayload, type ProductionCoordinationStore } from "../../src/qdrant/write.js";
 import type { QdrantClientOptions } from "../../src/qdrant/client.js";
@@ -21,7 +22,7 @@ interface WirePoint { id: string; payload: Record<string, unknown>; vector?: { s
 interface WireCondition { key?: string; match?: { value?: unknown }; is_null?: { key: string }; range?: { gt?: string; lte?: string } }
 interface WireFilter { must?: WireCondition[] }
 function json(value: unknown): Response { return new Response(JSON.stringify(value), { headers: { "content-type": "application/json" } }); }
-function clonePoint(point: WirePoint): WirePoint { return { id: point.id, payload: { ...point.payload }, ...(point.vector === undefined ? {} : { vector: { semantic: [...point.vector.semantic] } }) }; }
+function clonePoint(point: WirePoint): WirePoint { return { id: point.id, payload: { ...point.payload }, ...(point.vector?.semantic === undefined ? {} : { vector: { semantic: [...point.vector.semantic] } }) }; }
 function filterMatches(point: WirePoint, filter: WireFilter | undefined): boolean {
   return (filter?.must ?? []).every((condition) => {
     if (condition.match !== undefined && condition.key !== undefined) return point.payload[condition.key] === condition.match.value;
@@ -54,7 +55,7 @@ function backend(): { points: Map<string, WirePoint>; options: QdrantClientOptio
     const url = String(input);
     if (url.includes("/embeddings")) { const hook = state.onEmbedding; state.onEmbedding = undefined; hook?.(); return json({ data: [{ embedding: Array.from({ length: 1024 }, () => 0.25) }] }); }
     const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[]; points?: WirePoint[]; update_mode?: "insert_only" | "update_only"; update_filter?: WireFilter };
-    if (url.includes("/points/retrieve")) return json({ result: (body?.ids ?? []).map((id) => points.get(id)).filter((point): point is WirePoint => point !== undefined).map(clonePoint), status: "ok" });
+    if (new URL(url).pathname.endsWith("/points") && init.method === "POST") return json({ result: (body?.ids ?? []).map((id) => points.get(id)).filter((point): point is WirePoint => point !== undefined).map(clonePoint), status: "ok" });
     if (url.includes("/points?") && init.method === "PUT") {
       for (const incoming of body?.points ?? []) {
         const prior = points.get(incoming.id);
@@ -71,16 +72,25 @@ function policy(revision = "raptor-lifecycle-policy-v1"): ProcessingPolicy {
   const pending: ProcessingPolicy = { id: "pending", ownerHost: OWNER, destinationIds: { qdrant: qdrantDestination.id, embedding: embeddingDestination.id, llm: llmDestination.id }, originProvider: "provider-local", allowCrossProviderReplay: false, expiresAt: null, residency: "local", dataUse: "memory", policyRevision: revision };
   return { ...pending, id: processingPolicyHash(pending) };
 }
+const stateForStore = new WeakMap<ProductionCoordinationStore, ReturnType<typeof backend>>();
+function seedDurableLeaves(state: ReturnType<typeof backend>, inputLeaves: RootRaptorLifecycleInput["leaves"], privacyEpoch = 0): void {
+  for (const leaf of inputLeaves) {
+    const pending: EpisodeRecord = { recordType: "episode", id: leaf.id, ownerHost: OWNER, schemaRevision: 1, createdAt: NOW, privacyEpoch, processingPolicyId: leaf.policy.id, expiresAt: null, contentHash: "pending", sourceEntryId: `entry-${leaf.id}`, host: OWNER, projectId: leaf.projectId, projectIdentityKind: "registered", sessionId: "session-raptor", turnId: `turn-${leaf.id}`, agentRole: "root", depth: 0, eventKind: "user", eventAt: leaf.eventAt, modelId: "capture-model", embeddingDimension: 1024, originProvider: leaf.policy.originProvider, destinationId: qdrantDestination.id, status: "active", redactionStatus: "unchanged", secretScan: "passed", text: leaf.text, vector: [...leaf.vector] };
+    const record = { ...pending, contentHash: canonicalRecordHash(pending) } as EpisodeRecord;
+    state.points.set(record.id, { id: record.id, payload: recordPayload(record), vector: { semantic: [...record.vector!] } });
+  }
+}
 function runtime(state: ReturnType<typeof backend>): { store: ProductionCoordinationStore; embedding: BoundEmbeddingDestination } {
-  const store = createQdrantSafeBundle({ options: state.options, destination: qdrantDestination, egressMode: "allowlist", coordinationPolicyHash: COORDINATION_HASH, coordinationPolicyEpoch: 1 }).store;
+  const store = createQdrantSafeBundle({ options: state.options, destination: qdrantDestination, egressMode: "allowlist", coordinationPolicyHash: COORDINATION_HASH, coordinationPolicyEpoch: 1 }).store; stateForStore.set(store, state);
   const client = new EmbeddingsClient({ baseUrl: "http://embed/v1", model: "bge-m3", dimension: 1024, queryPrefix: "query: ", timeoutMs: 1000 });
   const factory = createEmbeddingDestinationFactory({ endpoint: "http://embed/v1", destination: embeddingDestination, client: bindEmbeddingDocumentClient({ endpoint: "http://embed/v1", client }), egressMode: "allowlist", coordinationPolicyHash: COORDINATION_HASH, coordinationPolicyEpoch: 1 });
   return { store, embedding: bindEmbeddingDestination(factory, embeddingDestination) };
 }
 function leaves(count: number, sourcePolicy: ProcessingPolicy, prefix: string, long = false): RootRaptorLifecycleInput["leaves"] {
-  return Array.from({ length: count }, (_, index) => ({ id: `${prefix}-${String(index).padStart(3, "0")}`, text: long ? `safe memory ${"x".repeat(340)}` : `safe memory ${index}`, vector: Array.from({ length: 1024 }, () => index < count / 2 ? index * 0.05 : 8 + index * 0.05), tokens: long ? 120 : 16, projectId: "project-raptor", eventAt: NOW, policy: sourcePolicy }));
+  return Array.from({ length: count }, (_, index) => ({ id: episodeId(OWNER, "raptor-session", `${prefix}-${String(index).padStart(3, "0")}`), text: long ? `safe memory ${"x".repeat(340)}` : `safe memory ${index}`, vector: Array.from({ length: 1024 }, () => Math.fround(index < count / 2 ? index * 0.05 : 8 + index * 0.05)), tokens: long ? 120 : 16, projectId: "project-raptor", eventAt: NOW, policy: sourcePolicy }));
 }
 function options(input: { store: ProductionCoordinationStore; embedding: BoundEmbeddingDestination; leaves: RootRaptorLifecycleInput["leaves"]; sourcePolicy: ProcessingPolicy; complete: (input: { envelope: string; signal?: AbortSignal }) => Promise<string>; reuseCandidates?: RootRaptorLifecycleInput["reuseCandidates"] }): RootRaptorLifecycleInput {
+  const state = stateForStore.get(input.store); if (state === undefined) throw new Error("missing test backend"); seedDurableLeaves(state, input.leaves);
   return { host: OWNER, store: input.store, env: {}, nodeId: "raptor-node", leaseMs: 30_000, maxClockSkewMs: 0, extractorRevision: "raptor-extractor-v1", clock: () => NOW_MS, workerPolicy: input.sourcePolicy, leaves: input.leaves, llm: { destination: llmDestination, complete: input.complete }, embedding: input.embedding, modelId: "memory-model", homeDir: "/home/tester", seed: "s2", maxLevels: 5, summaryInputTokens: 512, umapDimensions: 2, localNeighbors: 2, gmmMaxClusters: 4, membershipThreshold: 0.1, ...(input.reuseCandidates === undefined ? {} : { reuseCandidates: input.reuseCandidates }) };
 }
 function raptorPoints(state: ReturnType<typeof backend>): WirePoint[] { return [...state.points.values()].filter((point) => point.payload.record_type === "raptor_summary"); }
@@ -98,6 +108,8 @@ describe("Task 10 nominal RAPTOR lifecycle and publication", () => {
     const second = await runRaptorFromLifecycle(SessionManager.inMemory(), input);
     expect(second.state).toBe("completed"); if (second.state !== "completed") throw new Error("retry did not complete");
     expect(activeGeneration(state)).toBe(second.generationId); expect([...partialIds].every((id) => state.points.has(id))).toBe(true);
+    const terminalLease = [...state.points.values()].find((point) => point.payload.record_type === "lease");
+    expect(terminalLease?.payload).toMatchObject({ state: "completed", terminal_operation: "raptor" });
     expect(prompts.some((prompt) => prompt.includes("safe level summary"))).toBe(true);
     expect(prompts.every((prompt) => !/(?<!sha256:)[a-f0-9]{64}/u.test(prompt))).toBe(true);
   });
@@ -107,9 +119,27 @@ describe("Task 10 nominal RAPTOR lifecycle and publication", () => {
     const firstInput = options({ ...bound, sourcePolicy, leaves: leaves(2, sourcePolicy, "reuse"), complete: async () => { calls += 1; return JSON.stringify({ summary: "password: swordfish" }); } });
     const first = await runRaptorFromLifecycle(SessionManager.inMemory(), firstInput); expect(first.state).toBe("completed"); if (first.state !== "completed") throw new Error("first build failed");
     const generated = first.summaries.filter((summary) => summary.vector !== undefined); expect(generated).toHaveLength(1); expect(generated[0]!.summary).toContain("[password redacted]"); expect(generated[0]!.vector).toHaveLength(1024);
-    calls = 0; const second = await runRaptorFromLifecycle(SessionManager.inMemory(), options({ ...bound, sourcePolicy, leaves: leaves(2, sourcePolicy, "reuse"), complete: async () => { calls += 1; return JSON.stringify({ summary: "should not run" }); }, reuseCandidates: first.summaries }));
+    const nextPolicy = policy("reuse-policy-next");
+    calls = 0; const second = await runRaptorFromLifecycle(SessionManager.inMemory(), options({ ...bound, sourcePolicy: nextPolicy, leaves: leaves(2, nextPolicy, "reuse"), complete: async () => { calls += 1; return JSON.stringify({ summary: "should not run" }); }, reuseCandidates: first.summaries }));
     expect(second.state).toBe("completed"); if (second.state !== "completed") throw new Error("reuse build failed"); expect(second.reused).toBe(1); expect(calls).toBe(0); expect(second.generationId).not.toBe(first.generationId);
   });
+
+  it("rejects prior-epoch durable leaves before RAPTOR model egress", async () => {
+    const state = backend(); const bound = runtime(state); const sourcePolicy = policy("old-privacy"); const inputLeaves = leaves(2, sourcePolicy, "old-privacy"); let calls = 0;
+    const input = options({ ...bound, sourcePolicy, leaves: inputLeaves, complete: async () => { calls += 1; return JSON.stringify({ summary: "must not run" }); } });
+    for (const leaf of inputLeaves) { const point = state.points.get(leaf.id)!; point.payload = { ...point.payload, privacy_epoch: 1 }; }
+    expect(await runRaptorFromLifecycle(SessionManager.inMemory(), input)).toEqual({ state: "pending", reason: "authority_changed" });
+    expect(calls).toBe(0); expect(raptorPoints(state)).toHaveLength(0); expect(activeGeneration(state)).toBeNull();
+  });
+
+  it("publishes a manifest covering 1025 durable leaves without truncation", async () => {
+    const state = backend(); const bound = runtime(state); const sourcePolicy = policy("large-corpus"); let calls = 0;
+    const large = Array.from({ length: 1025 }, (_, index) => ({ id: episodeId(OWNER, "raptor-session", `large-${String(index).padStart(4, "0")}`), text: `safe memory ${"x".repeat(1200)}`, vector: Array.from({ length: 1024 }, () => 0), tokens: 400, projectId: "project-raptor", eventAt: NOW, policy: sourcePolicy }));
+    const result = await runRaptorFromLifecycle(SessionManager.inMemory(), options({ ...bound, sourcePolicy, leaves: large, complete: async () => { calls += 1; return JSON.stringify({ summary: "must not run" }); } }));
+    expect(result.state).toBe("completed"); if (result.state !== "completed") throw new Error("large corpus build failed");
+    expect(result.manifest.chunks).toHaveLength(2); expect(result.manifest.chunks.flatMap((chunk) => chunk.memberIds)).toEqual(large.map((leaf) => leaf.id).sort()); expect(calls).toBe(0);
+    expect(activeGeneration(state)).toBe(result.generationId);
+  }, 15_000);
 
   it("rejects delayed LLM and embedding revocation races before any generation becomes visible", async () => {
     const llmState = backend(); const llmBound = runtime(llmState); const sourcePolicy = policy("llm-race"); let changed = false;

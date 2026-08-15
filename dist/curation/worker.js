@@ -365,7 +365,7 @@ export async function runCurationCore(worker, input) {
         return Object.freeze({ state: "pending", reason: "embedding-destination-revoked" });
     const now = worker.now();
     validateWorkerPolicies(workerPolicy, producerPolicies, host, now, maxClockSkewMs);
-    const episodes = await store.readEpisodes(membership);
+    const episodes = await store.readEpisodes(membership, control.privacyEpoch).catch(() => []);
     if (episodes.length !== membership.length)
         return Object.freeze({ state: "pending", reason: "membership-missing" });
     const episodeById = new Map(episodes.map((episode) => [episode.id, episode]));
@@ -624,7 +624,7 @@ export async function runCurationCore(worker, input) {
             const acceptedProviderValid = acceptedEnvelope.provenance.providerId === group.intersection.originProvider || group.intersection.allowCrossProviderReplay === true;
             if (acceptedDestinationId === undefined || !acceptedProviderValid || !provenanceMatches(acceptedEnvelope.provenance, { host, destinationId: acceptedDestinationId, policyId: acceptedJob.policyId, policyHash: acceptedJob.policyId, policyEpoch: claim.coordinationPolicyEpoch, promptRevision: CURATION_PROMPT_REVISION }) || acceptedProposal.createdAt !== acceptedEnvelope.provenance.invokedAt)
                 return await fail("accepted-output-provenance");
-            const acceptedEpisodes = await store.readEpisodes(acceptedProposal.membership);
+            const acceptedEpisodes = await store.readEpisodes(acceptedProposal.membership, acceptedJob.privacyEpoch).catch(() => []);
             if (acceptedEpisodes.length !== acceptedProposal.membership.length)
                 return await fail("accepted-membership-missing");
             const acceptedEpisodeById = new Map(acceptedEpisodes.map((episode) => [episode.id, episode]));
@@ -708,6 +708,7 @@ export async function runCurationCore(worker, input) {
             memoryContext: {
                 host, modelRegistry, memoryModel: modelSnapshot, policy: group.intersection, llmDestination,
                 llmDestinationBinding, policyEpoch: claim.coordinationPolicyEpoch, policyHash: group.intersection.id,
+                allowCrossProviderReplay: group.intersection.allowCrossProviderReplay,
             },
             promptRevision: prompt.promptRevision,
         });

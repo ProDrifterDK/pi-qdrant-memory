@@ -185,6 +185,8 @@ export interface LeaseRecord extends DerivedEnvelope {
     state: "leased" | "accepted" | "released" | "completed";
     acceptedProposalId: string | null;
     acceptedManifestHash: string | null;
+    /** Terminal operation marker for non-curation jobs that have no proposal. */
+    terminalOperation?: "raptor";
 }
 /** Immutable proposal output: bounded canonical membership + validated content. */
 export interface ProposalRecord extends DerivedEnvelope {

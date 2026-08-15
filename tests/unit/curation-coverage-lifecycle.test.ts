@@ -101,7 +101,7 @@ function backendWithControl(fault: Fault | undefined, seed: WirePoint[] = []): {
   const fetchImpl: typeof fetch = async (input, init = {}) => {
     const url = String(input);
     const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[]; points?: WirePoint[]; offset?: string | null; limit?: number; update_mode?: string; update_filter?: { must: Array<{ key: string; match?: { value?: unknown }; is_null?: { key: string }; range?: { gt?: string; lte?: string } }> } };
-    if (url.includes("/points/retrieve")) {
+    if (new URL(url).pathname.endsWith("/points") && init.method === "POST") {
       const requestedIds = body?.ids ?? [];
       const requestedCoverageCount = requestedIds.filter((id) => points.get(id)?.payload.record_type === "coverage").length;
       const completionCoverageRead = requestedCoverageCount > 1;
@@ -111,7 +111,7 @@ function backendWithControl(fault: Fault | undefined, seed: WirePoint[] = []): {
         if (stored === undefined) continue;
         const isCoverage = stored.payload.record_type === "coverage";
         if (isCoverage && completionCoverageRead && activeFault === "drop-coverage-read") continue;
-        const next: WirePoint = { id: stored.id, payload: { ...stored.payload }, ...(stored.vector === undefined ? {} : { vector: { semantic: [...stored.vector.semantic] } }) };
+        const next: WirePoint = { id: stored.id, payload: { ...stored.payload }, ...(stored.vector?.semantic === undefined ? {} : { vector: { semantic: [...stored.vector.semantic] } }) };
         if (isCoverage && completionCoverageRead && activeFault === "alter-coverage-read") {
           next.payload = { ...next.payload, episode_id: "00000000-0000-5000-8000-deadbeef0000" };
         }
@@ -136,7 +136,7 @@ function backendWithControl(fault: Fault | undefined, seed: WirePoint[] = []): {
         const isCoverage = p.payload.record_type === "coverage";
         if (isCoverage && activeFault === "drop-coverage-write") continue;
         if (body?.update_mode === "insert_only" && points.has(p.id)) continue;
-        points.set(p.id, { id: p.id, payload: { ...p.payload }, ...(p.vector === undefined ? {} : { vector: { semantic: [...p.vector.semantic] } }) });
+        points.set(p.id, { id: p.id, payload: { ...p.payload }, ...(p.vector?.semantic === undefined ? {} : { vector: { semantic: [...p.vector.semantic] } }) });
       }
       return json({ result: { status: "acknowledged" }, status: "ok" });
     }

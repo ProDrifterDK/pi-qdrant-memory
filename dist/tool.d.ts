@@ -20,7 +20,7 @@ export interface MemorySearchDetails {
 export declare const memorySearchParameters: Type.TObject<{
     query: Type.TString;
     limit: Type.TOptional<Type.TInteger>;
-    mode: Type.TOptional<Type.TUnion<Type.TLiteral<"all" | "raptor" | "current" | "historical" | "episodes" | "curated">[]>>;
+    mode: Type.TOptional<Type.TUnion<[Type.TLiteral<"all">, Type.TLiteral<"current">, Type.TLiteral<"historical">, Type.TLiteral<"episodes">, Type.TLiteral<"curated">, Type.TLiteral<"raptor">]>>;
     after: Type.TOptional<Type.TString>;
     before: Type.TOptional<Type.TString>;
 }>;

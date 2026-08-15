@@ -20,6 +20,7 @@ const ISO_DATE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 const MAX_TIME = Date.parse("2100-12-31T23:59:59.999Z");
 const PRODUCER_KEYS = ["version", "ownerHost", "nodeId", "producerUuid", "sharedFilesystem", "explicitNodeId", "machineAuditHash", "createdAt", "auditHash"];
 const STATE_KEYS = ["version", "state", "heartbeatAt", "closedAt", "auditHash"];
+const RECOVERY_KEYS = ["version", "kind", "producerUuid", "recoveredAt", "auditHash"];
 const NODE_KEYS = ["version", "nodeId", "machineAuditHash", "auditHash"];
 const CONTROL_KEYS = ["version", "jobId", "attempts", "nextAttemptAt", "lastCategory", "auditHash"];
 const EXPIRY_KEYS = ["version", "kind", "jobId", "payloadAuditHash", "policyId", "deadline", "expiredAt", "auditHash"];
@@ -129,6 +130,35 @@ function validateState(value) {
     if (!record(value) || !exactKeys(value, STATE_KEYS) || value.version !== 1 || (value.state !== "active" && value.state !== "closed") || !finiteTime(value.heartbeatAt) || (value.closedAt !== null && !finiteTime(value.closedAt)) || (value.state === "active" && value.closedAt !== null) || (value.state === "closed" && (value.closedAt === null || value.closedAt < value.heartbeatAt)) || value.auditHash !== hashWithout(value, "auditHash"))
         throw new Error("Adopted producer state is malformed");
     return value;
+}
+function validateRecoveryRotation(value, producerUuid) {
+    if (!record(value) || !exactKeys(value, RECOVERY_KEYS) || value.version !== 1 || value.kind !== "recovery_rotation" || value.producerUuid !== producerUuid || !finiteTime(value.recoveredAt) || value.auditHash !== hashWithout(value, "auditHash"))
+        throw new Error("Outbox recovery rotation is malformed");
+    return value;
+}
+function recoveryRotation(producerUuid, recoveredAt) {
+    const value = { version: 1, kind: "recovery_rotation", producerUuid, recoveredAt, auditHash: "" };
+    value.auditHash = hashWithout(value, "auditHash");
+    return value;
+}
+async function persistRecoveryRotation(fs, producer, at) {
+    if (!finiteTime(at))
+        throw new Error("Outbox recovery clock is invalid");
+    const file = join(producer.path, "recovery.json");
+    let recoveredAt = at;
+    try {
+        const previous = (await readExactCanonicalJson(fs, file, (value) => validateRecoveryRotation(value, producer.producerUuid))).recoveredAt;
+        recoveredAt = Math.max(recoveredAt, Math.min(MAX_TIME, previous + 1));
+    }
+    catch (error) {
+        if (!errno(error, "ENOENT"))
+            throw error;
+    }
+    const value = recoveryRotation(producer.producerUuid, recoveredAt);
+    await atomicWrite(fs, file, value);
+    const readback = await readExactCanonicalJson(fs, file, (candidate) => validateRecoveryRotation(candidate, producer.producerUuid));
+    if (canonicalStringify(readback) !== canonicalStringify(value))
+        throw new Error("Outbox recovery rotation readback failed");
 }
 function validateNode(value, identity) {
     if (!record(value) || !exactKeys(value, NODE_KEYS) || value.version !== 1 || value.nodeId !== identity.nodeId || value.machineAuditHash !== identity.machineAuditHash || value.auditHash !== hashWithout(value, "auditHash"))
@@ -1973,6 +2003,7 @@ export function createOutboxDelivery(input) {
             throw new Error("Adopted producer owner host does not match current producer");
         if (!producer.fenced)
             assertAdoptable(producer, adoptionNow);
+        await persistRecoveryRotation(fs, producer, adoptionNow);
         producer = await fenceProducer(fs, validatedRoot, producer);
         await recoverFencedAdmissions(fs, validatedRoot, producer, adoptionNow);
         await reconcileQuarantineCopies(producer);

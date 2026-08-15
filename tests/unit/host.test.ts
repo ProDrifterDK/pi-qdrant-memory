@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { detectHost, resolvePrimeRlmDepth, validateCollectionMetadata } from "../../src/host.js";
+import { detectHost, resolveHostAgentMarker, resolvePrimeRlmDepth, validateCollectionMetadata } from "../../src/host.js";
 
 describe("detectHost", () => {
   it("honors an explicit host override", () => {
@@ -80,7 +80,7 @@ describe("resolvePrimeRlmDepth", () => {
 
 
 describe("collection compatibility hooks", () => {
-  const metadata = { ownerHost: "pi" as const, schema: "pi-qdrant-memory-v2" as const, schemaRevision: 1 as const, dimension: 1024, distance: "Cosine" as const, model: "bge-m3" };
+  const metadata = { ownerHost: "pi" as const, schema: "pi-qdrant-memory-v2" as const, schemaRevision: 1 as const, dimension: 1024, distance: "Dot" as const, model: "bge-m3" };
   it("accepts the exact owner/schema/vector contract", () => expect(() => validateCollectionMetadata("pi", metadata, "bge-m3")).not.toThrow());
   it.each([
     [{ ...metadata, ownerHost: "prime" }, /owner host/i],
@@ -88,4 +88,32 @@ describe("collection compatibility hooks", () => {
     [{ ...metadata, dimension: 1536 }, /vector/i],
     [{ ...metadata, model: "other" }, /model/i],
   ])("rejects incompatible collection metadata", (value, message) => expect(() => validateCollectionMetadata("pi", value, "bge-m3")).toThrow(message));
+});
+
+
+describe("resolveHostAgentMarker", () => {
+  it.each([
+    ["pi", {}, {}, { role: "root", depth: 0, valid: true, rootWorkAllowed: true }],
+    ["pi", { parentSession: "parent-id" }, {}, { role: "child", depth: 1, valid: true, rootWorkAllowed: false }],
+    ["pi", {}, { PI_SUBAGENT_CHILD: "1" }, { role: "child", depth: 1, valid: true, rootWorkAllowed: false }],
+    ["pi", {}, { PI_SUBAGENT_DEPTH: "3" }, { role: "child", depth: 3, valid: true, rootWorkAllowed: false }],
+    ["prime", { rlmDepth: 0 }, {}, { role: "root", depth: 0, valid: true, rootWorkAllowed: true }],
+    ["prime", { rlmDepth: 2 }, {}, { role: "child", depth: 2, valid: true, rootWorkAllowed: false }],
+    ["prime", {}, { RLM_DEPTH: "4" }, { role: "child", depth: 4, valid: true, rootWorkAllowed: false }],
+  ] as const)("resolves %s persisted and wrapper markers fail-closed", (host, header, env, expected) => {
+    expect(resolveHostAgentMarker(host, header, env)).toMatchObject(expected);
+  });
+
+  it.each([
+    ["pi", { parentSession: "parent-id" }, { PI_SUBAGENT_CHILD: "0" }],
+    ["pi", { parentSession: 42 }, {}],
+    ["pi", {}, { PI_SUBAGENT_DEPTH: "invalid" }],
+    ["prime", { rlmDepth: 0 }, { RLM_DEPTH: "1" }],
+    ["prime", { rlmDepth: -1 }, {}],
+    ["prime", {}, { RLM_DEPTH: "1.5" }],
+  ] as const)("disables root work for contradictory or invalid %s metadata", (host, header, env) => {
+    const marker = resolveHostAgentMarker(host, header, env);
+    expect(marker).toMatchObject({ role: "child", valid: false, rootWorkAllowed: false });
+    expect(marker.depth).toBeGreaterThan(0);
+  });
 });

@@ -30,6 +30,7 @@ export interface QdrantReadPolicy {
     requireSecretScan: "passed";
     projectId?: string;
     processingPolicyId?: string;
+    privacyEpoch?: number;
 }
 export interface ReadOptions {
     includeVector?: boolean;
@@ -44,11 +45,11 @@ export interface QdrantPoint {
 export interface QdrantCollectionInfo {
     status?: string;
     dimension: 1024;
-    distance: "Cosine";
+    distance: "Dot";
     vectors: {
         semantic: {
             size: 1024;
-            distance: "Cosine";
+            distance: "Dot";
         };
     };
     pointsCount: number | null;
@@ -64,12 +65,13 @@ export interface QdrantSearchHit {
     score: number;
     payload: JsonRecord;
 }
+/** Qdrant 1.17 accepts an empty named-vector map for payload-only coordination points. */
 export interface PreparedPoint {
     id: PointId;
     payload: JsonRecord;
     vector?: {
         semantic: readonly number[];
-    };
+    } | Record<string, never>;
 }
 export type ControlCasPrecondition = {
     kind: "collection-control-cas";
@@ -162,6 +164,7 @@ export declare function readPolicy(input: {
     maxClockSkewMs?: number;
     projectId?: string;
     processingPolicyId?: string;
+    privacyEpoch?: number;
 }): QdrantReadPolicy;
 export type QdrantReadCapabilities = QdrantReadClient;
 export declare function physicalPointIdFor(recordType: string, logicalId: string): string;

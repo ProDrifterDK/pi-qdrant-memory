@@ -36,6 +36,8 @@ export interface ProjectDependencies {
   registryPath?: string;
   /** Explicit XDG registry path, useful for the human CLI and tests. */
   configPath?: string;
+  /** Active-host registrations already resolved by the strict config loader. */
+  registrations?: Readonly<Record<string, ProjectRegistryBinding>>;
   /** Private XDG state sidecar; never parsed as package configuration. */
   statePath?: string;
   homeDir?: string;
@@ -83,7 +85,7 @@ function registryFilePath(deps: ProjectDependencies): string | undefined {
   return undefined;
 }
 function safeAlias(alias: string): string {
-  if (typeof alias !== "string" || alias.length === 0 || alias.length > 256 || /[\u0000-\u001f]/u.test(alias) || /(?:api[-_]?key|token|secret|password)/iu.test(alias) || alias === "__proto__" || alias === "prototype" || alias === "constructor") throw new TypeError("Project alias must be stable, bounded, non-secret, and safe");
+  if (typeof alias !== "string" || alias.length === 0 || alias.length > 256 || !/^[A-Za-z0-9._-]+$/u.test(alias) || /(?:api[-_]?key|token|secret|password)/iu.test(alias) || alias === "__proto__" || alias === "prototype" || alias === "constructor") throw new TypeError("Project alias must be stable, bounded, non-secret, and safe");
   return alias;
 }
 function inside(root: string, candidate: string): boolean {
@@ -163,6 +165,11 @@ function normalizeBinding(value: unknown, key: string): ProjectRegistryBinding {
   return { canonicalPath: normalize(item.canonicalPath), fingerprint: item.fingerprint, alias: item.alias };
 }
 async function loadRegistry(deps: ProjectDependencies): Promise<RegistryFile> {
+  if (deps.registrations !== undefined) {
+    const normalized: Record<string, ProjectRegistryBinding> = Object.create(null) as Record<string, ProjectRegistryBinding>;
+    for (const [key, value] of Object.entries(deps.registrations)) normalized[key] = normalizeBinding(value, key);
+    return { version: 1, projects: { registrations: normalized }, raw: {} };
+  }
   const path = registryFilePath(deps);
   if (path === undefined || deps.readTextFile === undefined) return emptyRegistry();
   try {
@@ -201,10 +208,11 @@ async function saveRegistry(registry: RegistryFile, deps: ProjectDependencies): 
 }
 function localIdentity(path: string, fingerprint: string, salt: string, reason: ProjectIdentity["reason"]): ProjectIdentity {
   const id = sha256Hex(canonicalStringify({ installationSalt: salt, canonicalPath: path, vcsFingerprint: fingerprint }));
-  return { id, label: basename(path), identityKind: "local_only", canonicalPath: path, fingerprint, registrationValid: false, ...(reason === undefined ? {} : { reason }) };
+  return { id, label: basename(path), identityKind: "local_only", canonicalPath: path, fingerprint, registrationValid: reason === "unregistered", ...(reason === undefined ? {} : { reason }) };
 }
 
-export async function resolveProjectIdentity(cwd: string, deps: ProjectDependencies = defaultDependencies): Promise<ProjectIdentity> {
+export async function resolveProjectIdentity(cwd: string, overrides: Partial<ProjectDependencies> = {}): Promise<ProjectIdentity> {
+  const deps: ProjectDependencies = { ...defaultDependencies, ...overrides };
   const requested = resolve(cwd);
   let requestedCanonical = requested;
   try { requestedCanonical = await deps.canonicalize(requested); } catch { requestedCanonical = normalize(requested); }

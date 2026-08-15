@@ -60,7 +60,7 @@ function restQdrantWriter(seed: BackendPoint[] = []): { points: Map<string, Back
   const points = new Map<string, BackendPoint>(seed.map((point) => [point.id, point]));
   const fetchImpl: typeof fetch = async (input, init = {}) => {
     const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[]; points?: BackendPoint[]; update_mode?: string; update_filter?: { must: Array<{ key: string; match?: { value?: string | number | boolean }; is_null?: { key: string }; range?: { gt?: string; lte?: string } }> } };
-    if (url.includes("/points/retrieve")) { const ids = body?.ids ?? []; return json({ result: ids.map((id) => points.get(id)).filter((p) => p !== undefined), status: "ok" }); }
+    if (new URL(url).pathname.endsWith("/points") && init.method === "POST") { const ids = body?.ids ?? []; return json({ result: ids.map((id) => points.get(id)).filter((p) => p !== undefined), status: "ok" }); }
     if (url.includes("/points/scroll")) return json({ result: { points: [], next_page_offset: null }, status: "ok" });
     if (url.includes("/points?") && init.method === "PUT") {
       const point = body?.points?.[0];
@@ -166,6 +166,8 @@ describe("Task 9 curation prompt envelope", () => {
     expect(prompt.envelope).not.toContain(`Policy: ${prompt.policyProvenance.policyId} `);
     expect(prompt.policyProvenance.providerId).toBe("provider-local");
     expect(prompt.policyProvenance.destinationId).toBe("llm:local");
+    expect(prompt.envelope).not.toContain("destination llm:local");
+    expect(prompt.envelope).toMatch(/destination sha256:[0-9a-f]{64}/u);
     expect(prompt.promptRevision).toBe(CURATION_PROMPT_REVISION);
     // Exact bytes budgeted before egress.
     expect(prompt.envelopeBytes).toBe(Buffer.byteLength(prompt.envelope, "utf8"));
@@ -388,6 +390,14 @@ describe("Task 9 curation worker end-to-end", () => {
     expect(result.reason).toContain("direct user evidence");
     const lease = await readLease(bundle.store, result.jobId!);
     expect(lease?.state).toBe("released");
+  });
+
+  it("rejects a prior-epoch source before curation model egress", async () => {
+    const backend = backendWithControl(); const old = episode({ privacyEpoch: 1 }); await seedEpisode(backend, old);
+    const bundle = createQdrantSafeBundle({ options: backend.options, destination: qdrantDestination, egressMode: "allowlist", coordinationPolicyHash: coordination.policyHash, coordinationPolicyEpoch: coordination.policyEpoch });
+    let completions = 0; const result = await runCurationOnce(workerInput({ store: bundle.store, llm: { ...workerInput().llm, modelRegistry: { complete: async () => { completions += 1; throw new Error("must not complete"); } } } }));
+    expect(result).toMatchObject({ state: "pending" }); expect(completions).toBe(0);
+    expect([...backend.points.values()].some((point) => point.payload.record_type === "proposal" || point.payload.record_type === "curated_memory")).toBe(false);
   });
 
   it("splits explicit jobs by compatible policy groups; incompatible producers stay pending", async () => {

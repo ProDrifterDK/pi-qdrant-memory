@@ -372,7 +372,7 @@ export async function runCurationCore(worker: RootWorkerContext, input: Curation
   if (control.revokedDestinationIds.includes(embeddingDestination.id)) return Object.freeze({ state: "pending", reason: "embedding-destination-revoked" });
   const now = worker.now();
   validateWorkerPolicies(workerPolicy, producerPolicies, host, now, maxClockSkewMs);
-  const episodes = await store.readEpisodes(membership);
+  const episodes = await store.readEpisodes(membership, control.privacyEpoch).catch(() => []);
   if (episodes.length !== membership.length) return Object.freeze({ state: "pending", reason: "membership-missing" });
   const episodeById = new Map(episodes.map((episode) => [episode.id, episode]));
   const producerById = new Map(producerPolicies.map((policy) => [policy.id, policy]));
@@ -578,7 +578,7 @@ export async function runCurationCore(worker: RootWorkerContext, input: Curation
       const acceptedDestinationId = group.intersection.destinationIds.llm;
       const acceptedProviderValid = acceptedEnvelope.provenance.providerId === group.intersection.originProvider || group.intersection.allowCrossProviderReplay === true;
       if (acceptedDestinationId === undefined || !acceptedProviderValid || !provenanceMatches(acceptedEnvelope.provenance, { host, destinationId: acceptedDestinationId, policyId: acceptedJob.policyId, policyHash: acceptedJob.policyId, policyEpoch: claim.coordinationPolicyEpoch, promptRevision: CURATION_PROMPT_REVISION }) || acceptedProposal.createdAt !== acceptedEnvelope.provenance.invokedAt) return await fail("accepted-output-provenance");
-      const acceptedEpisodes = await store.readEpisodes(acceptedProposal.membership);
+      const acceptedEpisodes = await store.readEpisodes(acceptedProposal.membership, acceptedJob.privacyEpoch).catch(() => []);
       if (acceptedEpisodes.length !== acceptedProposal.membership.length) return await fail("accepted-membership-missing");
       const acceptedEpisodeById = new Map(acceptedEpisodes.map((episode) => [episode.id, episode]));
       if (acceptedJob.membership.length === 0 || acceptedEpisodeById.get(acceptedJob.membership[0]!)?.createdAt !== acceptedJob.createdAt) return await fail("accepted-job-created-at");
@@ -644,6 +644,7 @@ export async function runCurationCore(worker: RootWorkerContext, input: Curation
       memoryContext: {
         host, modelRegistry, memoryModel: modelSnapshot, policy: group.intersection, llmDestination,
         llmDestinationBinding, policyEpoch: claim.coordinationPolicyEpoch, policyHash: group.intersection.id,
+        allowCrossProviderReplay: group.intersection.allowCrossProviderReplay,
       },
       promptRevision: prompt.promptRevision,
     });

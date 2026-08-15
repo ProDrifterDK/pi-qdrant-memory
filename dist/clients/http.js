@@ -49,7 +49,7 @@ export async function fetchOk(url, init, options) {
     try {
         let response;
         try {
-            response = await fetchImpl(url, { ...init, signal: controller.signal });
+            response = await fetchImpl(url, { ...init, redirect: "error", signal: controller.signal });
         }
         catch {
             if (abortReason === "timeout") {

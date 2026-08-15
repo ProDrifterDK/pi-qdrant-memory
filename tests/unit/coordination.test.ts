@@ -141,7 +141,7 @@ function restPoints(): Map<string, { id: string; payload: Record<string, unknown
 function restFetch(points: Map<string, { id: string; payload: Record<string, unknown> }>, intercept?: (ids: readonly string[]) => { id: string; payload: Record<string, unknown> }[] | undefined): typeof fetch {
   return async (input, init = {}) => {
     const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { points?: Array<{ id: string; payload: Record<string, unknown> }>; update_mode?: string; ids?: string[] };
-    if (url.includes("/points/retrieve")) {
+    if (new URL(url).pathname.endsWith("/points") && init.method === "POST") {
       const ids = body?.ids ?? [];
       const extra = intercept?.(ids);
       const found = ids.map((id) => points.get(id)).filter((point) => point !== undefined);
@@ -212,7 +212,7 @@ function proposalRecord(jobIdValue: string, overrides: Partial<ProposalRecord> =
 }
 function episode(overrides: Partial<EpisodeRecord> = {}): EpisodeRecord {
   const base = { ownerHost: OWNER, schemaRevision: 1 as const, createdAt: NOW, privacyEpoch: 0, processingPolicyId: "policy-1", expiresAt: null, recordType: "episode" as const, id: EPISODE_UUID, contentHash: "pending", sourceEntryId: "entry-1", host: OWNER, projectId: "project-1", projectIdentityKind: "registered" as const, sessionId: "session-1", turnId: "turn-1", agentRole: "root" as const, depth: 0, eventKind: "user" as const, eventAt: NOW, modelId: "model-1", embeddingDimension: 1024, originProvider: "provider-1", destinationId: "qdrant:pi", status: "active" as const, redactionStatus: "unchanged" as const, secretScan: "passed" as const, text: "safe" };
-  const value = { ...base, ...overrides };
+  const value = { ...base, ...overrides, ...(overrides.vector === undefined ? {} : { vector: overrides.vector.map(Math.fround) }) };
   return { ...value, contentHash: canonicalRecordHash(value) } as EpisodeRecord;
 }
 function coverageRecord(jobIdValue: string, episodeIdValue: string, overrides: Partial<CoverageRecord> = {}): CoverageRecord {
@@ -227,7 +227,7 @@ function casBackend(seed: Array<{ id: string; payload: Record<string, unknown>; 
   const points = new Map<string, { id: string; payload: Record<string, unknown>; vector?: { semantic: number[] } }>(seed.map((point) => [point.id, point]));
   const fetchImpl: typeof fetch = async (input, init = {}) => {
     const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[]; points?: Array<{ id: string; payload: Record<string, unknown>; vector?: { semantic: number[] } }>; update_mode?: string; update_filter?: { must: Array<{ key: string; match?: { value?: unknown }; is_null?: { key: string }; range?: { lte?: string; gt?: string } }> } };
-    if (url.includes("/points/retrieve")) { const ids = body?.ids ?? []; const extra = hooks.extra === undefined ? undefined : await hooks.extra(ids); return new Response(JSON.stringify({ result: [...ids.map((id) => points.get(id)).filter((point) => point !== undefined), ...(extra ?? [])], status: "ok" }), { headers: { "content-type": "application/json" } }); }
+    if (new URL(url).pathname.endsWith("/points") && init.method === "POST") { const ids = body?.ids ?? []; const extra = hooks.extra === undefined ? undefined : await hooks.extra(ids); return new Response(JSON.stringify({ result: [...ids.map((id) => points.get(id)).filter((point) => point !== undefined), ...(extra ?? [])], status: "ok" }), { headers: { "content-type": "application/json" } }); }
     if (url.includes("/points/scroll")) return new Response(JSON.stringify({ result: { points: [...points.values()].filter((point) => point.payload.record_type === "lease").sort((a, b) => (a.id < b.id ? -1 : 1)).slice(0, 256), next_page_offset: null }, status: "ok" }), { headers: { "content-type": "application/json" } });
     if (url.includes("/points?") && init.method === "PUT") {
       const point = body?.points?.[0];
@@ -2060,7 +2060,7 @@ describe("Task 8 coordination protocol", () => {
     let gateRelease: (() => void) | undefined;
     const fetchImpl: typeof fetch = async (input, init = {}) => {
       const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { points?: Array<{ id: string; payload: Record<string, unknown> }>; update_mode?: string; update_filter?: unknown };
-      if (url.includes("/points/retrieve")) { const ids = (body as { ids?: string[] }).ids ?? []; return new Response(JSON.stringify({ result: ids.map((id) => stored.get(id)).filter((point) => point !== undefined), status: "ok" }), { headers: { "content-type": "application/json" } }); }
+      if (new URL(url).pathname.endsWith("/points") && init.method === "POST") { const ids = (body as { ids?: string[] }).ids ?? []; return new Response(JSON.stringify({ result: ids.map((id) => stored.get(id)).filter((point) => point !== undefined), status: "ok" }), { headers: { "content-type": "application/json" } }); }
       if (url.includes("/points?") && init.method === "PUT") {
         // Delayed race: a concurrent write lands BEFORE this upsert's filter is evaluated.
         if (raceGate !== undefined) { raceGate(); raceGate = undefined; await new Promise<void>((resolve) => { gateRelease = resolve; }); }
@@ -2112,7 +2112,7 @@ describe("Task 8 coordination protocol", () => {
     const writeCalls: Array<{ mode: string; filter?: unknown }> = [];
     const fetchImpl: typeof fetch = async (input, init = {}) => {
       const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { points?: Array<{ id: string; payload: Record<string, unknown> }>; update_mode?: string; update_filter?: unknown };
-      if (url.includes("/points/retrieve")) { const ids = (body as { ids?: string[] }).ids ?? []; return new Response(JSON.stringify({ result: ids.map((id) => points.get(id)).filter((point) => point !== undefined), status: "ok" }), { headers: { "content-type": "application/json" } }); }
+      if (new URL(url).pathname.endsWith("/points") && init.method === "POST") { const ids = (body as { ids?: string[] }).ids ?? []; return new Response(JSON.stringify({ result: ids.map((id) => points.get(id)).filter((point) => point !== undefined), status: "ok" }), { headers: { "content-type": "application/json" } }); }
       if (url.includes("/points?") && init.method === "PUT") { writeCalls.push({ mode: String(body?.update_mode), filter: body?.update_filter }); const point = body?.points?.[0]; if (point !== undefined) points.set(point.id, { id: point.id, payload: point.payload }); return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { headers: { "content-type": "application/json" } }); }
       return new Response(JSON.stringify({ result: {}, status: "ok" }), { headers: { "content-type": "application/json" } });
     };

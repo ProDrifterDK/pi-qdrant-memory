@@ -438,25 +438,11 @@ async function quarantineMalformed(fs, source, quarantineDir, random, now, input
     await fs.rm(source, { force: true });
     await syncDirectory(fs, resolve(source, ".."));
 }
-export class OutboxCapacityError extends Error {
-    constructor() { super("Outbox capacity reached; new capture was not accepted"); this.name = "OutboxCapacityError"; }
-}
-class OutboxAdmissionBusyError extends Error {
-    constructor() { super("Outbox admission is busy"); this.name = "OutboxAdmissionBusyError"; }
-}
-export async function createOutbox(input) {
+async function prepareOutboxIdentity(input) {
     assertHost(input.host);
     if (typeof input.homeDir !== "string" || !isAbsolute(input.homeDir))
         throw new TypeError("Outbox home directory must be absolute");
-    const maxJobs = input.maxJobs ?? 10_000;
-    const maxBytes = input.maxBytes ?? 268_435_456;
     const sharedFilesystem = input.sharedFilesystem ?? false;
-    if (!Number.isSafeInteger(maxJobs) || maxJobs < 1 || maxJobs > 100_000)
-        throw new TypeError("outbox.maxJobs must be between 1 and 100000");
-    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1_048_576 || maxBytes > 1_073_741_824)
-        throw new TypeError("outbox.maxBytes must be between 1 MiB and 1 GiB");
-    if (input.producerUuid !== undefined)
-        assertProducerUuid(input.producerUuid);
     if (input.nodeId !== undefined)
         assertPseudonymousNodeId(input.nodeId);
     if (sharedFilesystem && input.nodeId === undefined)
@@ -505,6 +491,32 @@ export async function createOutbox(input) {
             throw error;
         validateNode(await readSecureJson(fs, nodeFile), expectedNode);
     }
+    return Object.freeze({ fs, random, clock, setupNow, sharedFilesystem, root, reservationsDir, nodeId, nodePath, machineAuditHash });
+}
+/** Resolve and persist the pseudonymous installation node identity without creating a producer. */
+export async function resolveOutboxNodeId(input) {
+    return (await prepareOutboxIdentity(input)).nodeId;
+}
+export class OutboxCapacityError extends Error {
+    constructor() { super("Outbox capacity reached; new capture was not accepted"); this.name = "OutboxCapacityError"; }
+}
+class OutboxAdmissionBusyError extends Error {
+    constructor() { super("Outbox admission is busy"); this.name = "OutboxAdmissionBusyError"; }
+}
+export async function createOutbox(input) {
+    assertHost(input.host);
+    if (typeof input.homeDir !== "string" || !isAbsolute(input.homeDir))
+        throw new TypeError("Outbox home directory must be absolute");
+    const maxJobs = input.maxJobs ?? 10_000;
+    const maxBytes = input.maxBytes ?? 268_435_456;
+    if (!Number.isSafeInteger(maxJobs) || maxJobs < 1 || maxJobs > 100_000)
+        throw new TypeError("outbox.maxJobs must be between 1 and 100000");
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1_048_576 || maxBytes > 1_073_741_824)
+        throw new TypeError("outbox.maxBytes must be between 1 MiB and 1 GiB");
+    if (input.producerUuid !== undefined)
+        assertProducerUuid(input.producerUuid);
+    const prepared = await prepareOutboxIdentity(input);
+    const { fs, random, clock, setupNow, sharedFilesystem, root, reservationsDir, nodeId, nodePath, machineAuditHash } = prepared;
     const producerUuid = input.producerUuid ?? randomUuid(random);
     assertProducerUuid(producerUuid);
     const producerPath = join(nodePath, producerUuid);

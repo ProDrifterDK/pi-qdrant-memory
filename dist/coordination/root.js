@@ -7,7 +7,7 @@ import { runCurationCore } from "../curation/worker.js";
 import { buildRaptorGeneration } from "../raptor/builder.js";
 import { intersectPolicies } from "../domain/policy.js";
 import { createJob } from "./jobs.js";
-import { claimLease, releaseLease } from "./leases.js";
+import { claimLease } from "./leases.js";
 const ROOT_WORKER_ISSUER = Symbol("pi-qdrant-memory-v2.root-worker-issuer");
 const SESSION_MANAGER_PROTOTYPE = SessionManager.prototype;
 const SESSION_MANAGER_METHODS = Object.freeze({
@@ -364,13 +364,20 @@ export async function runRaptorFromLifecycle(sessionManager, input) {
     let leaves;
     let workerPolicy;
     try {
-        leaves = ownedDenseArray(input.leaves, "RAPTOR lifecycle leaves");
+        leaves = ownedDenseArray(input.leaves, "RAPTOR lifecycle leaves", 65_536);
         workerPolicy = ownedCanonicalSnapshot(input.workerPolicy, "RAPTOR lifecycle worker policy");
     }
     catch {
         return Object.freeze({ state: "child" });
     }
-    const policy = intersectPolicies(leaves.map((leaf) => leaf.policy), workerPolicy);
+    const producerPolicies = new Map();
+    for (const leaf of leaves) {
+        const prior = producerPolicies.get(leaf.policy.id);
+        if (prior !== undefined && canonicalStringify(prior) !== canonicalStringify(leaf.policy))
+            return Object.freeze({ state: "pending", reason: "incompatible_policy" });
+        producerPolicies.set(leaf.policy.id, leaf.policy);
+    }
+    const policy = intersectPolicies([...producerPolicies.values()].sort((left, right) => left.id.localeCompare(right.id)), workerPolicy);
     if (policy === null || policy.destinationIds.llm === undefined)
         return Object.freeze({ state: "pending", reason: "incompatible_policy" });
     const membership = Object.freeze(leaves.map((leaf) => leaf.id).sort());
@@ -387,16 +394,40 @@ export async function runRaptorFromLifecycle(sessionManager, input) {
     const control = await store.readControl();
     if (control.state !== "active")
         return Object.freeze({ state: "pending", reason: "authority_changed" });
+    const storedEpisodes = [];
+    try {
+        for (let index = 0; index < membership.length; index += 1024)
+            storedEpisodes.push(...await store.readEpisodes(membership.slice(index, index + 1024), control.privacyEpoch));
+    }
+    catch {
+        return Object.freeze({ state: "pending", reason: "authority_changed" });
+    }
+    const storedById = new Map(storedEpisodes.map((episode) => [episode.id, episode]));
+    const controlAfterSources = await store.readControl();
+    if (storedById.size !== membership.length || membership.some((id) => storedById.get(id)?.privacyEpoch !== control.privacyEpoch) || controlAfterSources.contentHash !== control.contentHash)
+        return Object.freeze({ state: "pending", reason: "authority_changed" });
     const createdAt = leaves.map((leaf) => leaf.eventAt).sort()[0];
-    const job = await createJob(store, { ownerHost: host, membership, policyIntersectionId: policy.id, policyHash: control.coordinationPolicyHash, policyEpoch: control.coordinationPolicyEpoch, extractorRevision: input.extractorRevision, privacyEpoch: control.privacyEpoch, createdAt, expiresAt: policy.expiresAt });
+    const job = input.jobId === undefined
+        ? await createJob(store, { ownerHost: host, membership, policyIntersectionId: policy.id, policyHash: control.coordinationPolicyHash, policyEpoch: control.coordinationPolicyEpoch, extractorRevision: input.extractorRevision, privacyEpoch: control.privacyEpoch, createdAt, expiresAt: policy.expiresAt })
+        : await (async () => {
+            const existing = await store.readJob(input.jobId);
+            if (existing === null || existing.ownerHost !== host || canonicalStringify(existing.membership) !== canonicalStringify(membership) || existing.policyId !== policy.id || existing.policyHash !== control.coordinationPolicyHash || existing.policyEpoch !== control.coordinationPolicyEpoch || existing.extractorRevision !== input.extractorRevision || existing.privacyEpoch !== control.privacyEpoch || existing.expiresAt !== policy.expiresAt || existing.createdAt !== createdAt)
+                throw new TypeError("RAPTOR durable job identity is invalid");
+            return existing;
+        })();
     const authority = await claimLease(store, worker, { jobId: job.id, policyEpoch: control.coordinationPolicyEpoch, policyHash: control.coordinationPolicyHash, privacyEpoch: control.privacyEpoch });
     if (authority === null)
         return Object.freeze({ state: "pending", reason: "authority_changed" });
     const buildInput = { host, workerPolicy, leaves, llm: input.llm, embedding: input.embedding, modelId: input.modelId, homeDir: input.homeDir, seed: input.seed, maxLevels: input.maxLevels, summaryInputTokens: input.summaryInputTokens, umapDimensions: input.umapDimensions, localNeighbors: input.localNeighbors, gmmMaxClusters: input.gmmMaxClusters, membershipThreshold: input.membershipThreshold, ...(input.global === undefined ? {} : { global: input.global }), ...(input.scan === undefined ? {} : { scan: input.scan }), ...(input.signal === undefined ? {} : { signal: input.signal }), ...(input.reuseCandidates === undefined ? {} : { reuseCandidates: input.reuseCandidates }) };
     const result = await buildRaptorGeneration(store, authority, buildInput);
-    // The RAPTOR job has no proposal/coverage terminal; after atomic generation
-    // publication the lease is explicitly released as completed work metadata.
-    await releaseLease(store, authority).catch(() => false);
+    // RAPTOR has no curation proposal. Once the builder has published the
+    // generation, use the named fenced terminal transition instead of releasing
+    // a successful job as if it were merely retryable work.
+    if (result.state === "completed") {
+        const completed = await store.completeRaptorJob(authority, { generationId: result.generationId, evidenceIds: membership, destinationIds: [policy.destinationIds.qdrant, policy.destinationIds.embedding, policy.destinationIds.llm] });
+        if (!completed)
+            return Object.freeze({ state: "pending", reason: "authority_changed" });
+    }
     return result;
 }
 Object.freeze(runRaptorFromLifecycle);

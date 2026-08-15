@@ -361,16 +361,22 @@ async function quarantineMalformed(fs: OutboxFileSystem, source: string, quarant
   await fs.rm(source, { force: true }); await syncDirectory(fs, resolve(source, ".."));
 }
 
-export class OutboxCapacityError extends Error { constructor() { super("Outbox capacity reached; new capture was not accepted"); this.name = "OutboxCapacityError"; } }
-class OutboxAdmissionBusyError extends Error { constructor() { super("Outbox admission is busy"); this.name = "OutboxAdmissionBusyError"; } }
-
-export async function createOutbox(input: CreateOutboxInput): Promise<Outbox> {
+interface PreparedOutboxIdentity {
+  readonly fs: OutboxFileSystem;
+  readonly random: (size: number) => Uint8Array;
+  readonly clock: () => number;
+  readonly setupNow: number;
+  readonly sharedFilesystem: boolean;
+  readonly root: string;
+  readonly reservationsDir: string;
+  readonly nodeId: string;
+  readonly nodePath: string;
+  readonly machineAuditHash: string;
+}
+async function prepareOutboxIdentity(input: CreateOutboxInput): Promise<PreparedOutboxIdentity> {
   assertHost(input.host);
   if (typeof input.homeDir !== "string" || !isAbsolute(input.homeDir)) throw new TypeError("Outbox home directory must be absolute");
-  const maxJobs = input.maxJobs ?? 10_000; const maxBytes = input.maxBytes ?? 268_435_456; const sharedFilesystem = input.sharedFilesystem ?? false;
-  if (!Number.isSafeInteger(maxJobs) || maxJobs < 1 || maxJobs > 100_000) throw new TypeError("outbox.maxJobs must be between 1 and 100000");
-  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1_048_576 || maxBytes > 1_073_741_824) throw new TypeError("outbox.maxBytes must be between 1 MiB and 1 GiB");
-  if (input.producerUuid !== undefined) assertProducerUuid(input.producerUuid);
+  const sharedFilesystem = input.sharedFilesystem ?? false;
   if (input.nodeId !== undefined) assertPseudonymousNodeId(input.nodeId);
   if (sharedFilesystem && input.nodeId === undefined) throw new Error("An explicit unique node ID is required for a shared filesystem");
   const fs = { ...nodeFs, ...(input.fs ?? {}) } as OutboxFileSystem;
@@ -398,6 +404,26 @@ export async function createOutbox(input: CreateOutboxInput): Promise<Outbox> {
   const expectedNode = nodeIdentity(nodeId, machineAuditHash); const nodeFile = join(nodePath, "node.json");
   try { await exclusiveWrite(fs, nodeFile, expectedNode, random); }
   catch (error) { if (!errno(error, "EEXIST")) throw error; validateNode(await readSecureJson(fs, nodeFile), expectedNode); }
+  return Object.freeze({ fs, random, clock, setupNow, sharedFilesystem, root, reservationsDir, nodeId, nodePath, machineAuditHash });
+}
+
+/** Resolve and persist the pseudonymous installation node identity without creating a producer. */
+export async function resolveOutboxNodeId(input: Omit<CreateOutboxInput, "producerUuid" | "maxJobs" | "maxBytes" | "notifyFull">): Promise<string> {
+  return (await prepareOutboxIdentity(input)).nodeId;
+}
+
+export class OutboxCapacityError extends Error { constructor() { super("Outbox capacity reached; new capture was not accepted"); this.name = "OutboxCapacityError"; } }
+class OutboxAdmissionBusyError extends Error { constructor() { super("Outbox admission is busy"); this.name = "OutboxAdmissionBusyError"; } }
+
+export async function createOutbox(input: CreateOutboxInput): Promise<Outbox> {
+  assertHost(input.host);
+  if (typeof input.homeDir !== "string" || !isAbsolute(input.homeDir)) throw new TypeError("Outbox home directory must be absolute");
+  const maxJobs = input.maxJobs ?? 10_000; const maxBytes = input.maxBytes ?? 268_435_456;
+  if (!Number.isSafeInteger(maxJobs) || maxJobs < 1 || maxJobs > 100_000) throw new TypeError("outbox.maxJobs must be between 1 and 100000");
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1_048_576 || maxBytes > 1_073_741_824) throw new TypeError("outbox.maxBytes must be between 1 MiB and 1 GiB");
+  if (input.producerUuid !== undefined) assertProducerUuid(input.producerUuid);
+  const prepared = await prepareOutboxIdentity(input);
+  const { fs, random, clock, setupNow, sharedFilesystem, root, reservationsDir, nodeId, nodePath, machineAuditHash } = prepared;
   const producerUuid = input.producerUuid ?? randomUuid(random); assertProducerUuid(producerUuid);
   const producerPath = join(nodePath, producerUuid); assertInside(root, producerPath);
   if (!(await noSymlinks(fs, producerPath))) throw new Error("Producer path is unsafe");

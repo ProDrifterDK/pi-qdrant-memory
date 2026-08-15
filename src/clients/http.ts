@@ -70,7 +70,7 @@ export async function fetchOk(
   try {
     let response: Response;
     try {
-      response = await fetchImpl(url, { ...init, signal: controller.signal });
+      response = await fetchImpl(url, { ...init, redirect: "error", signal: controller.signal });
     } catch {
       if (abortReason === "timeout") {
         throw new MemoryClientError("timeout", "Request timed out");

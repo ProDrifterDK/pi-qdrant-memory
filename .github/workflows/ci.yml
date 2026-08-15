@@ -30,11 +30,11 @@ jobs:
       - run: npm run build
       - run: git diff --exit-code -- dist
 
-  compat-pi:
-    name: Pi 0.84.1 actual-host compatibility
+  compat-isolated:
+    name: Qdrant 1.17.1 and exact Pi/Prime host smokes
     needs: verify
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -44,37 +44,4 @@ jobs:
       - run: npm install --global npm@11.12.1
       - run: test "$(npm --version)" = "11.12.1"
       - run: npm ci --include=dev
-      - run: npm run build
-      - name: Install and verify exact Pi host
-        shell: bash
-        run: |
-          set -euo pipefail
-          PI_HOST="$RUNNER_TEMP/pi-host"
-          mkdir -p "$PI_HOST"
-          npm install --prefix "$PI_HOST" --no-save @earendil-works/pi-coding-agent@0.84.1
-          test "$(node -e 'console.log(require(process.argv[1]).version)' "$PI_HOST/node_modules/@earendil-works/pi-coding-agent/package.json")" = "0.84.1"
-
-  compat-prime:
-    name: Prime a18809e actual-host compatibility
-    needs: verify
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-      - run: npm install --global npm@11.12.1
-      - run: test "$(npm --version)" = "11.12.1"
-      - run: npm ci --include=dev
-      - run: npm run build
-      - name: Verify pinned Prime revision
-        shell: bash
-        run: |
-          set -euo pipefail
-          PRIME_HOST="$RUNNER_TEMP/prime-agent"
-          PRIME_COMMIT="a18809e00ea30638584d87b3afea7285a9d7296c"
-          git clone https://github.com/PrimeIntellect-ai/prime-agent.git "$PRIME_HOST"
-          git -C "$PRIME_HOST" checkout --detach "$PRIME_COMMIT"
-          test "$(git -C "$PRIME_HOST" rev-parse HEAD)" = "$PRIME_COMMIT"
+      - run: bash tests/compat/run-isolated-smokes.sh

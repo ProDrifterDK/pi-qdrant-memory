@@ -23,6 +23,8 @@ export interface ProjectDependencies {
     registryPath?: string;
     /** Explicit XDG registry path, useful for the human CLI and tests. */
     configPath?: string;
+    /** Active-host registrations already resolved by the strict config loader. */
+    registrations?: Readonly<Record<string, ProjectRegistryBinding>>;
     /** Private XDG state sidecar; never parsed as package configuration. */
     statePath?: string;
     homeDir?: string;
@@ -33,7 +35,7 @@ export interface ProjectDependencies {
 }
 declare function fingerprintFromOrigin(origin: string): string;
 export { fingerprintFromOrigin };
-export declare function resolveProjectIdentity(cwd: string, deps?: ProjectDependencies): Promise<ProjectIdentity>;
+export declare function resolveProjectIdentity(cwd: string, overrides?: Partial<ProjectDependencies>): Promise<ProjectIdentity>;
 export interface ProjectRegisterInput {
     path: string;
     alias: string;

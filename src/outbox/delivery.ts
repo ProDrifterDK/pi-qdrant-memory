@@ -44,6 +44,7 @@ interface ProducerIdentity {
   explicitNodeId: boolean; machineAuditHash: string; createdAt: string; auditHash: string;
 }
 interface ProducerState { version: 1; state: "active" | "closed"; heartbeatAt: number; closedAt: number | null; auditHash: string; }
+interface RecoveryRotation { version: 1; kind: "recovery_rotation"; producerUuid: string; recoveredAt: number; auditHash: string; }
 interface RetryControl { version: 1; jobId: string; attempts: number; nextAttemptAt: number; lastCategory: string; auditHash: string; }
 interface ExpiryAudit { version: 1; kind: "expired"; jobId: string; payloadAuditHash: string; policyId: string; deadline: string; expiredAt: string; auditHash: string; }
 interface DeliveredAudit { version: 1; kind: "delivered"; status: "delivered"; jobId: string; payloadAuditHash: string; deliveredAt: string; auditHash: string; }
@@ -59,6 +60,7 @@ const ISO_DATE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 const MAX_TIME = Date.parse("2100-12-31T23:59:59.999Z");
 const PRODUCER_KEYS = ["version", "ownerHost", "nodeId", "producerUuid", "sharedFilesystem", "explicitNodeId", "machineAuditHash", "createdAt", "auditHash"] as const;
 const STATE_KEYS = ["version", "state", "heartbeatAt", "closedAt", "auditHash"] as const;
+const RECOVERY_KEYS = ["version", "kind", "producerUuid", "recoveredAt", "auditHash"] as const;
 const NODE_KEYS = ["version", "nodeId", "machineAuditHash", "auditHash"] as const;
 const CONTROL_KEYS = ["version", "jobId", "attempts", "nextAttemptAt", "lastCategory", "auditHash"] as const;
 const EXPIRY_KEYS = ["version", "kind", "jobId", "payloadAuditHash", "policyId", "deadline", "expiredAt", "auditHash"] as const;
@@ -108,6 +110,23 @@ function validateProducer(value: unknown, nodeId: string, producerUuid: string):
 function validateState(value: unknown): ProducerState {
   if (!record(value) || !exactKeys(value, STATE_KEYS) || value.version !== 1 || (value.state !== "active" && value.state !== "closed") || !finiteTime(value.heartbeatAt) || (value.closedAt !== null && !finiteTime(value.closedAt)) || (value.state === "active" && value.closedAt !== null) || (value.state === "closed" && (value.closedAt === null || value.closedAt < value.heartbeatAt)) || value.auditHash !== hashWithout(value, "auditHash")) throw new Error("Adopted producer state is malformed");
   return value as unknown as ProducerState;
+}
+function validateRecoveryRotation(value: unknown, producerUuid: string): RecoveryRotation {
+  if (!record(value) || !exactKeys(value, RECOVERY_KEYS) || value.version !== 1 || value.kind !== "recovery_rotation" || value.producerUuid !== producerUuid || !finiteTime(value.recoveredAt) || value.auditHash !== hashWithout(value, "auditHash")) throw new Error("Outbox recovery rotation is malformed");
+  return value as unknown as RecoveryRotation;
+}
+function recoveryRotation(producerUuid: string, recoveredAt: number): RecoveryRotation {
+  const value: RecoveryRotation = { version: 1, kind: "recovery_rotation", producerUuid, recoveredAt, auditHash: "" };
+  value.auditHash = hashWithout(value as unknown as PlainRecord, "auditHash"); return value;
+}
+async function persistRecoveryRotation(fs: OutboxFileSystem, producer: ProducerFiles, at: number): Promise<void> {
+  if (!finiteTime(at)) throw new Error("Outbox recovery clock is invalid");
+  const file = join(producer.path, "recovery.json"); let recoveredAt = at;
+  try { const previous = (await readExactCanonicalJson(fs, file, (value) => validateRecoveryRotation(value, producer.producerUuid))).recoveredAt; recoveredAt = Math.max(recoveredAt, Math.min(MAX_TIME, previous + 1)); }
+  catch (error) { if (!errno(error, "ENOENT")) throw error; }
+  const value = recoveryRotation(producer.producerUuid, recoveredAt); await atomicWrite(fs, file, value);
+  const readback = await readExactCanonicalJson(fs, file, (candidate) => validateRecoveryRotation(candidate, producer.producerUuid));
+  if (canonicalStringify(readback) !== canonicalStringify(value)) throw new Error("Outbox recovery rotation readback failed");
 }
 function validateNode(value: unknown, identity: ProducerIdentity): void {
   if (!record(value) || !exactKeys(value, NODE_KEYS) || value.version !== 1 || value.nodeId !== identity.nodeId || value.machineAuditHash !== identity.machineAuditHash || value.auditHash !== hashWithout(value, "auditHash")) throw new Error("Adopted node identity is malformed or mismatched");
@@ -524,7 +543,7 @@ export function createOutboxDelivery(input: DeliveryInput): OutboxDelivery {
     if (!producerInactive(producer.state, now, heartbeatTimeoutMs, input.maxClockSkewMs)) throw new Error("Producer is still active and cannot be adopted");
   }
   async function adopt(path: string): Promise<void> {
-    const validatedRoot = await root(); const adoptionNow = clock(); const current = await producerFiles(fs, validatedRoot, input.producerPath, true); let producer = await producerFiles(fs, validatedRoot, path, true); if (producer.identity.ownerHost !== current.identity.ownerHost) throw new Error("Adopted producer owner host does not match current producer"); if (!producer.fenced) assertAdoptable(producer, adoptionNow); producer = await fenceProducer(fs, validatedRoot, producer); await recoverFencedAdmissions(fs, validatedRoot, producer, adoptionNow);
+    const validatedRoot = await root(); const adoptionNow = clock(); const current = await producerFiles(fs, validatedRoot, input.producerPath, true); let producer = await producerFiles(fs, validatedRoot, path, true); if (producer.identity.ownerHost !== current.identity.ownerHost) throw new Error("Adopted producer owner host does not match current producer"); if (!producer.fenced) assertAdoptable(producer, adoptionNow); await persistRecoveryRotation(fs, producer, adoptionNow); producer = await fenceProducer(fs, validatedRoot, producer); await recoverFencedAdmissions(fs, validatedRoot, producer, adoptionNow);
     await reconcileQuarantineCopies(producer); await quarantineExpiryPass(validatedRoot, producer); await reconcileDelivered(validatedRoot, producer); await cleanupOrphanTerminalSidecars(fs, producer); await expiryPass(validatedRoot, producer);
     const refreshedCurrent = await producerFiles(fs, validatedRoot, input.producerPath); const refreshed = await producerFiles(fs, validatedRoot, producer.path); if (!refreshed.fenced || refreshed.identity.ownerHost !== refreshedCurrent.identity.ownerHost || refreshedCurrent.identity.ownerHost !== current.identity.ownerHost) throw new Error("Adopted producer owner host or fence changed"); await cleanupOfflineReservations(fs, validatedRoot, refreshed); adopted.add(refreshed.path);
   }

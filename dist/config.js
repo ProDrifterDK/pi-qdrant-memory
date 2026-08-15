@@ -405,6 +405,14 @@ function effectiveQdrantForHost(file, host) {
     const enabled = booleanValue(`${host}.enabled`, hostRoot.enabled, booleanValue("enabled", file.enabled, true));
     return { url, collection, enabled };
 }
+export function validateCaptureActivation(config, disclosure) {
+    if (!config.capture.enabled)
+        return;
+    if (disclosure === undefined || disclosure.confirmed !== true)
+        throw new Error("capture activation requires explicit human confirmation");
+    if (disclosure.retention !== config.capture.episodeRetentionDays || disclosure.egressMode !== config.privacy.egressMode)
+        throw new Error("capture disclosure does not match configured retention/egress");
+}
 export function configPath(deps) {
     const configHome = deps.xdgConfigHome !== undefined && deps.xdgConfigHome !== ""
         ? deps.xdgConfigHome

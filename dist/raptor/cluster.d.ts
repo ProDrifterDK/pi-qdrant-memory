@@ -31,6 +31,10 @@ export interface ClusterDagOptions {
     readonly gmmMaxClusters?: number;
     readonly membershipThreshold?: number;
 }
+export interface ClusterDagExecutionOptions {
+    readonly signal?: AbortSignal;
+    readonly timeoutMs: number;
+}
 /** Stable ID-sorted, token-greedy fallback. Oversized singletons remain flat. */
 export declare function stableTokenPartition<T extends {
     readonly id: string;
@@ -38,4 +42,10 @@ export declare function stableTokenPartition<T extends {
 }>(input: readonly T[], tokenBudget: number): readonly (readonly T[])[];
 /** Build a deterministic soft-membership DAG. Every edge is exactly level+1. */
 export declare function buildClusterDag(input: readonly ClusterLeaf[], inputOptions: ClusterDagOptions): ClusterDag;
+/**
+ * Execute the CPU-bound UMAP/GMM kernel outside the host event loop. Input
+ * flattening yields cooperatively and the worker is terminated on the exact
+ * abort/deadline boundary, leaving the prior generation active and retryable.
+ */
+export declare function buildClusterDagOffThread(input: readonly ClusterLeaf[], inputOptions: ClusterDagOptions, execution: ClusterDagExecutionOptions): Promise<ClusterDag>;
 export declare function evidenceClosure(dag: ClusterDag, rootIds?: readonly string[]): readonly string[];

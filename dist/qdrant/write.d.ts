@@ -116,6 +116,10 @@ export declare class ProductionCoordinationStore {
     readProposal(id: string): Promise<ProposalRecord | null>;
     readTombstones(targetIds: readonly string[]): Promise<TombstoneRecord[]>;
     readCoverage(coverageIds: readonly string[]): Promise<CoverageRecord[]>;
+    scrollEpisodeIds(offset: string | undefined, limit?: number, expectedPrivacyEpoch?: number): Promise<{
+        episodeIds: string[];
+        nextOffset?: string;
+    }>;
     scrollLeases(offset?: string, limit?: number): Promise<{
         leases: LeaseRecord[];
         nextOffset?: string;
@@ -125,9 +129,15 @@ export declare class ProductionCoordinationStore {
         jobs: JobRecord[];
         nextOffset?: string;
     }>;
-    readEpisode(episodeIdValue: string): Promise<EpisodeRecord | null>;
+    readEpisode(episodeIdValue: string, expectedPrivacyEpoch?: number): Promise<EpisodeRecord | null>;
+    /** Page immutable RAPTOR records for one prior generation with exact vector-aware readback. */
+    scrollRaptorSummaries(generationId: string, offset?: string, limit?: number): Promise<{
+        summaries: RaptorSummaryRecord[];
+        nextOffset?: string;
+    }>;
     readRaptorSummary(id: string): Promise<RaptorSummaryRecord | null>;
-    readEpisodes(episodeIds: readonly string[]): Promise<EpisodeRecord[]>;
+    readEpisodes(episodeIds: readonly string[], expectedPrivacyEpoch?: number): Promise<EpisodeRecord[]>;
+    readProcessingPolicies(policyIds: readonly string[]): Promise<ProcessingPolicyRecord[]>;
     private assertAcceptedAuthorityBase;
     private assertRaptorAuthority;
     private assertCuratedRecordAgainstJob;
@@ -140,6 +150,14 @@ export declare class ProductionCoordinationStore {
     }): Promise<LeaseAuthority | null>;
     createJob(input: CreateJobInput): Promise<JobRecord>;
     completeJob(authority: LeaseAuthority): Promise<boolean>;
+    /** Complete a published RAPTOR job without manufacturing a curation
+     * proposal. The named operation proves the active generation and exact
+     * evidence barrier before a fenced lease may become terminal. */
+    completeRaptorJob(authority: LeaseAuthority, input: {
+        generationId: string;
+        evidenceIds: readonly string[];
+        destinationIds: readonly string[];
+    }): Promise<boolean>;
     writeProposal(authority: LeaseAuthority, input: WriteProposalInput): Promise<ProposalRecord>;
     markCoverage(authority: LeaseAuthority, input: MarkCoverageInput): Promise<CoverageRecord>;
     readObservation(authority: LeaseAuthority, id: string): Promise<CuratedMemoryRecord | null>;
@@ -207,6 +225,7 @@ export declare class ProductionCoordinationStore {
     }): Promise<ControlRecord>;
     beginForgetBarrier(input: {
         now: number;
+        revokedDestinationIds?: readonly string[];
     }): Promise<ControlRecord>;
 }
 /** Production seam: validated OPTIONS in, ONLY the safe store out (never accepts/returns a raw writer/session). */

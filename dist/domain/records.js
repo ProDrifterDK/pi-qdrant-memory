@@ -34,7 +34,7 @@ const RECORD_KEYS = {
     collection_control: new Set([...COMMON_KEYS, "version", "activeGeneration", "activeBaseGeneration", "privacyEpoch", "coordinationPolicyEpoch", "coordinationPolicyHash", "state", "scanCursor", "lastForgetBarrier", "revokedDestinationIds"]),
     processing_policy: new Set([...COMMON_KEYS, "policy", "canonicalHash"]),
     job: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "policyId", "policyHash", "policyEpoch", "membership", "extractorRevision"]),
-    lease: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "jobId", "ownerId", "version", "fencingToken", "state", "acceptedProposalId", "acceptedManifestHash"]),
+    lease: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "jobId", "ownerId", "version", "fencingToken", "state", "acceptedProposalId", "acceptedManifestHash", "terminalOperation"]),
     proposal: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "jobId", "ownerId", "proposalHash", "manifestHash", "fencingToken", "membership", "content"]),
     coverage: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "episodeId", "extractorRevision"]),
     evidence_link: new Set([...COMMON_KEYS, ...DERIVED_KEYS, "sourceId", "targetId", "jobId", "extractorRevision"]),
@@ -64,7 +64,7 @@ function expiry(value) { if (value !== null)
     isoDate("expiresAt", value); }
 function host(name, value) { if (value !== "pi" && value !== "prime")
     fail(`${name} is invalid`); }
-function ids(name, value) { if (!Array.isArray(value) || value.length === 0 || value.length > MAX_ARRAY)
+function ids(name, value, max = MAX_ARRAY) { if (!Array.isArray(value) || value.length === 0 || value.length > max)
     fail(`${name} must be bounded IDs`); value.forEach((item) => text(name, item, MAX_ID_CHARS, true)); }
 function strictlySorted(name, value) { for (let index = 1; index < value.length; index += 1)
     if (value[index - 1] >= value[index])
@@ -385,7 +385,7 @@ function validate(value, context) {
             integer("policyEpoch", value.policyEpoch);
             if (value.policyEpoch !== value.coordinationPolicyEpoch)
                 fail("job policy epoch mismatch");
-            ids("membership", value.membership);
+            ids("membership", value.membership, 65_536);
             strictlySorted("job membership", value.membership);
             text("extractorRevision", value.extractorRevision, MAX_ID_CHARS, true);
             const jobOwner = value.ownerHost;
@@ -418,9 +418,13 @@ function validate(value, context) {
                 text("acceptedManifestHash", value.acceptedManifestHash, MAX_ID_CHARS, false);
             if ((value.acceptedProposalId === null) !== (value.acceptedManifestHash === null))
                 fail("lease acceptance fields must move together");
+            if (value.terminalOperation !== undefined && value.terminalOperation !== "raptor")
+                fail("lease terminal operation is invalid");
+            if (value.terminalOperation !== undefined && (value.state !== "completed" || value.acceptedProposalId !== null))
+                fail("lease terminal operation is not bound to a terminal unaccepted claim");
             if (value.state === "leased" && value.acceptedProposalId !== null)
                 fail("leased claim cannot carry acceptance");
-            if ((value.state === "accepted" || value.state === "completed") && value.acceptedProposalId === null)
+            if ((value.state === "accepted" || value.state === "completed") && value.acceptedProposalId === null && value.terminalOperation !== "raptor")
                 fail("accepted/completed claim requires proposal and manifest");
             try {
                 if (value.id !== leasePointId(value.jobId))

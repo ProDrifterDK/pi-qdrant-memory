@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { fetchJson, MemoryClientError } from "../../src/clients/http.js";
-import { EmbeddingsClient } from "../../src/clients/embeddings.js";
+import { EmbeddingsClient, canonicalizeEmbeddingVector } from "../../src/clients/embeddings.js";
 
 function errorDetails(error: unknown): { category: string; status?: number; text: string } {
   expect(error).toBeInstanceOf(MemoryClientError);
@@ -31,6 +31,15 @@ describe("abortable HTTP client", () => {
     expect(details.text).not.toContain(authorization);
     expect(details.text).not.toContain("secret response body");
     expect(details.text).not.toContain("secret-url-token");
+  });
+
+  it("refuses redirects so credentials and POST bodies cannot cross origins", async () => {
+    const fetchImpl = vi.fn(async (_url: string, init?: RequestInit) => {
+      expect(init?.redirect).toBe("error");
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+    await expect(fetchJson("http://service.test/data", { method: "POST", redirect: "follow", body: "safe" }, { timeoutMs: 2500, fetchImpl })).resolves.toEqual({ ok: true });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("redacts URL, query, headers, body, and response body for HTTP failures", async () => {
@@ -196,7 +205,7 @@ describe("EmbeddingsClient", () => {
       timeoutMs: 2500,
       fetchImpl,
     });
-    await expect(client.embedQuery("alpha")).resolves.toEqual([0.1, 0.2, 0.3]);
+    await expect(client.embedQuery("alpha")).resolves.toEqual([0.26726123690605164, 0.5345224738121033, 0.8017837405204773]);
   });
 
   it.each([
@@ -204,6 +213,7 @@ describe("EmbeddingsClient", () => {
     [[0.1, Number.NaN, 0.3], "finite"],
     [[0.1, Number.POSITIVE_INFINITY, 0.3], "finite"],
     [[0.1, "0.2", 0.3], "finite"],
+    [[0, 0, 0], "zero norm"],
   ])("rejects invalid embedding vectors (%s)", async (embedding, _reason) => {
     const client = new EmbeddingsClient({
       baseUrl: "http://embed/v1",
@@ -215,5 +225,11 @@ describe("EmbeddingsClient", () => {
     });
     const error = await client.embedQuery("alpha").catch((value: unknown) => value);
     expect(errorDetails(error).category).toBe("invalid-response");
+  });
+
+  it("normalizes extreme finite values and rounds every component to float32", () => {
+    const result = canonicalizeEmbeddingVector([Number.MAX_VALUE, Number.MAX_VALUE, 1], 3);
+    expect(result).toEqual([0.7071067690849304, 0.7071067690849304, 0]);
+    expect(result.every(component => Object.is(component, Math.fround(component)))).toBe(true);
   });
 });

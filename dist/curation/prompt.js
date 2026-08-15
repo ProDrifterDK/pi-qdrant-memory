@@ -159,8 +159,8 @@ function episodeLine(input, index) {
         `role:${escapeField(episode.agentRole)}`,
         `depth:${episode.depth}`,
     ];
-    const sessionId = safeMetadataId("sessionId", episode.sessionId, 512);
-    const turnId = safeMetadataId("turnId", episode.turnId, 512);
+    const sessionId = safeMetadataId("sessionId", episode.sessionId, 512, true);
+    const turnId = safeMetadataId("turnId", episode.turnId, 512, true);
     if (sessionId !== undefined)
         lines.push(`session:${escapeField(sessionId)}`);
     if (turnId !== undefined)
@@ -205,7 +205,11 @@ export function buildCurationPrompt(input) {
     const provider = ownedCanonicalSnapshot(ownData(input, "provider"), "Curation prompt provider");
     const providerId = safeMetadataId("providerId", provider.providerId, 256);
     const modelId = safeMetadataId("modelId", provider.modelId, 256);
-    const destinationId = safeMetadataId("destinationId", provider.destinationId, 256);
+    const destinationId = boundedId("destinationId", provider.destinationId, 256);
+    // Destination identities are content-addressed policy metadata. Render only
+    // their labelled digest in the untrusted prompt while retaining the exact
+    // identifier in the trusted provenance returned to the worker.
+    const safeDestinationId = safeMetadataId("destinationId", destinationId, 256, true);
     const promptRevisionValue = ownData(input, "promptRevision", false);
     const promptRevision = promptRevisionValue === undefined ? CURATION_PROMPT_REVISION : promptRevisionValue;
     const safePromptRevision = safeMetadataId("promptRevision", promptRevision, 256);
@@ -250,7 +254,7 @@ export function buildCurationPrompt(input) {
     const envelope = [
         "Memory curation request. Extract durable, structured, factual memory items from the untrusted episode data below.",
         `Policy: ${escapeField(safePolicyId)} (epoch ${policyEpoch}, hash ${escapeField(safePolicyHash)})`,
-        `Provider: ${escapeField(providerId)} model ${escapeField(modelId)} destination ${escapeField(destinationId)}`,
+        `Provider: ${escapeField(providerId)} model ${escapeField(modelId)} destination ${escapeField(safeDestinationId)}`,
         `Prompt revision: ${escapeField(safePromptRevision)}`,
         "Reply with ONE strict JSON object only: {\"items\":[{category,scope,subject,predicate,value,evidence:[episode ids],confidence?}]}.",
         "Categories: preference, correction, convention, fact, failure, learning. Scopes: project, session, host, global.",

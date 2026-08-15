@@ -301,7 +301,7 @@ export async function materializeCuration(authority: LeaseAuthority, input: Mate
   const membership = proposal.membership;
   // AUTHORITATIVE evidence readback: the store re-reads the membership
   // episodes (a caller can never forge direct-user evidence).
-  const storedEpisodes = await store.readEpisodes(membership);
+  const storedEpisodes = await store.readEpisodes(membership, authority.privacyEpoch).catch(() => []);
   if (storedEpisodes.length !== membership.length) throw new TypeError("Membership episodes are missing");
   const episodeById = new Map(storedEpisodes.map((episode) => [episode.id, episode]));
   if (job.membership.length === 0 || episodeById.get(job.membership[0]!)?.createdAt !== job.createdAt) throw new TypeError("Accepted job createdAt is not bound to its canonical episode");

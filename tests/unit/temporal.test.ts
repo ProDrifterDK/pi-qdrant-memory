@@ -82,7 +82,7 @@ function backendWithControl(fault?: Fault, coverageGate?: { onFirst: () => void;
       ids?: string[]; points?: WirePoint[]; update_mode?: string;
       update_filter?: { must: Array<{ key: string; match?: { value?: unknown; any?: unknown[] }; is_null?: { key: string }; range?: { gt?: string; lte?: string } }> };
     };
-    if (url.includes("/points/retrieve")) {
+    if (new URL(url).pathname.endsWith("/points") && init.method === "POST") {
       const result: WirePoint[] = [];
       for (const id of body?.ids ?? []) {
         const stored = points.get(id);
@@ -125,7 +125,7 @@ function backendWithControl(fault?: Fault, coverageGate?: { onFirst: () => void;
           await coverageGate.wait;
         }
         if (body?.update_mode === "insert_only" && points.has(incoming.id)) continue;
-        points.set(incoming.id, { id: incoming.id, payload: { ...incoming.payload }, ...(incoming.vector === undefined ? {} : { vector: { semantic: [...incoming.vector.semantic] } }) });
+        points.set(incoming.id, { id: incoming.id, payload: { ...incoming.payload }, ...(incoming.vector?.semantic === undefined ? {} : { vector: { semantic: [...incoming.vector.semantic] } }) });
         if (incoming.payload.record_type === "coverage") onCoverage?.();
       }
       return json({ result: { status: "acknowledged" }, status: "ok" });

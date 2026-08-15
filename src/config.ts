@@ -391,6 +391,20 @@ function effectiveQdrantForHost(file: JsonRecord, host: HostId): { url: string; 
   return { url, collection, enabled };
 }
 
+/** Human disclosure values used by the admin init gate. This helper is
+ * intentionally independent of CLI parsing so RuntimeConfig remains the only
+ * runtime shape and no confirmation value enters worker/extension state. */
+export interface CaptureActivationDisclosure {
+  retention: RuntimeConfig["capture"]["episodeRetentionDays"];
+  egressMode: RuntimeConfig["privacy"]["egressMode"];
+  confirmed: boolean;
+}
+export function validateCaptureActivation(config: RuntimeConfig, disclosure: CaptureActivationDisclosure | undefined): void {
+  if (!config.capture.enabled) return;
+  if (disclosure === undefined || disclosure.confirmed !== true) throw new Error("capture activation requires explicit human confirmation");
+  if (disclosure.retention !== config.capture.episodeRetentionDays || disclosure.egressMode !== config.privacy.egressMode) throw new Error("capture disclosure does not match configured retention/egress");
+}
+
 export function configPath(deps: Pick<ConfigLoadDependencies, "homeDir" | "xdgConfigHome">): string {
   const configHome = deps.xdgConfigHome !== undefined && deps.xdgConfigHome !== ""
     ? deps.xdgConfigHome

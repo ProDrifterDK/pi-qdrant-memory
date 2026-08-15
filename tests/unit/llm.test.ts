@@ -134,6 +134,18 @@ describe("completeMemory reflected portable LLM bridge", () => {
     expect(JSON.stringify(allowed)).not.toMatch(/safe input|authorization/i);
   });
 
+  it("requires both producer policy and processing context to authorize cross-provider replay", async () => {
+    const selected = model({ provider: "provider-b", id: "model-b" }); const complete = vi.fn(async () => message("safe"));
+    const deniedPolicy = policy("pi", { destinationIds: { qdrant: "qdrant:pi", embedding: "embed:pi", llm: "llm:provider-b" }, originProvider: "provider-a", allowCrossProviderReplay: false });
+    const denied = await completeMemory(input(selected, { memoryContext: memoryContext(selected, { policy: deniedPolicy, allowCrossProviderReplay: true, modelRegistry: { complete } }) }));
+    expect(pendingReason(denied)).toBe("cross_provider_disabled"); expect(complete).not.toHaveBeenCalled();
+    const allowedPolicy = policy("pi", { destinationIds: { qdrant: "qdrant:pi", embedding: "embed:pi", llm: "llm:provider-b" }, originProvider: "provider-a", allowCrossProviderReplay: true });
+    const deniedContext = await completeMemory(input(selected, { memoryContext: memoryContext(selected, { policy: allowedPolicy, allowCrossProviderReplay: false, modelRegistry: { complete } }) }));
+    expect(pendingReason(deniedContext)).toBe("cross_provider_disabled"); expect(complete).not.toHaveBeenCalled();
+    const allowed = await completeMemory(input(selected, { memoryContext: memoryContext(selected, { policy: allowedPolicy, allowCrossProviderReplay: true, modelRegistry: { complete } }) }));
+    expect(allowed).toMatchObject({ state: "completed", provenance: { providerId: "provider-b", modelId: "model-b" } }); expect(complete).toHaveBeenCalledTimes(1);
+  });
+
   it("links registry cancellation and timeout to the host signal and cleans resources", async () => {
     vi.useFakeTimers();
     const host = new AbortController();

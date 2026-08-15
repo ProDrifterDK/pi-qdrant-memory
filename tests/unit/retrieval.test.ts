@@ -77,7 +77,8 @@ describe("reciprocal rank fusion", () => {
 
 
 const NOW = "2026-08-13T15:00:00.000Z";
-const VECTOR = Array.from({ length: 1024 }, () => 0.01);
+const VECTOR = Array.from({ length: 1024 }, () => Math.fround(0.01));
+const NORMALIZED_VECTOR = Array.from({ length: 1024 }, () => 0.03125);
 function canonical<T extends MemoryRecord>(record: T): T { return { ...record, contentHash: canonicalRecordHash(record) }; }
 function policy(): ProcessingPolicy {
   const base = { id: "pending", ownerHost: "prime" as const, destinationIds: { qdrant: "q-local", embedding: "embed:local", llm: "provider/model" }, originProvider: "provider", allowCrossProviderReplay: false, expiresAt: null, residency: "local", dataUse: "memory", policyRevision: "r1" };
@@ -107,7 +108,7 @@ function readerFixture(): { reader: MemoryReadStore; calls: { exact: ReturnType<
     readPolicies: vi.fn(async () => [value.policyRecord]),
     readTombstones: tombstones,
     health: vi.fn(async () => undefined),
-    collectionInfo: vi.fn(async () => ({ dimension: 1024, distance: "Cosine" })),
+    collectionInfo: vi.fn(async () => ({ dimension: 1024, distance: "Dot" })),
   };
   return { reader, calls: { exact, tombstones } };
 }
@@ -238,6 +239,24 @@ describe("MemoryRetriever guarded exact lane", () => {
     } finally { vi.unstubAllGlobals(); }
   });
 
+  it("does not embed when an exact candidate producer policy denies the embedding destination", async () => {
+    const values = fixtures(); const base = readerFixture();
+    const deniedBase = { ...values.activePolicy, id: "pending", destinationIds: { ...values.activePolicy.destinationIds, embedding: "embed:denied" } }; const deniedPolicy = { ...deniedBase, id: processingPolicyHash(deniedBase) };
+    const deniedRecord = canonical<ProcessingPolicyRecord>({ ...values.policyRecord, id: deniedPolicy.id, processingPolicyId: deniedPolicy.id, policy: deniedPolicy, canonicalHash: deniedPolicy.id, contentHash: "pending" });
+    const deniedEpisode = canonical<EpisodeRecord>({ ...values.episode, processingPolicyId: deniedPolicy.id, contentHash: "pending" });
+    vi.mocked(base.calls.exact).mockResolvedValue([{ record: deniedEpisode, score: 1 }]);
+    const policies = new Map([[values.policyRecord.id, values.policyRecord], [deniedRecord.id, deniedRecord]]); vi.mocked(base.reader.readPolicies).mockImplementation(async (ids) => ids.map((id) => policies.get(id)!).filter((value) => value !== undefined));
+    const transport = vi.fn(async () => new Response(JSON.stringify({ data: [{ embedding: VECTOR }] }), { status: 200 })); vi.stubGlobal("fetch", transport);
+    try {
+      const client = new EmbeddingsClient({ baseUrl: "http://127.0.0.1:8080/v1", model: "bge-m3", dimension: 1024, queryPrefix: "search_query: ", timeoutMs: 2500 });
+      const validated = bindEmbeddingDocumentClient({ endpoint: "http://127.0.0.1:8080/v1", client }); const destination = { id: "embed:local", residency: "local", dataUse: "memory" };
+      const embedding = bindEmbeddingDestination(createEmbeddingDestinationFactory({ endpoint: "http://127.0.0.1:8080/v1", destination, client: validated, egressMode: "allowlist", coordinationPolicyHash: values.control.coordinationPolicyHash, coordinationPolicyEpoch: values.control.coordinationPolicyEpoch }), destination);
+      const retriever = new MemoryRetriever({ reader: base.reader, config: { topK: 5, candidatesPerLane: 20, minScore: 0.35, projectBoost: 0, contextBudgetChars: 1200, toolResultBudgetChars: 8000, hardContextCharBudget: 16000, timeoutMs: 2500, rootScope: "project", childSearch: true }, embedding, embeddingDestination: destination, maxClockSkewMs: 300_000, now: () => Date.parse(NOW) });
+      const result = await retriever.search({ query: "alpha", host: "prime", project: { id: "project-1", label: "repo", identityKind: "registered" }, isChild: false, modelDestination: { id: "provider/model", residency: "local", dataUse: "memory" }, mode: "episodes" });
+      expect(result.hits).toEqual([expect.objectContaining({ id: deniedEpisode.id, lane: "exact" })]); expect(transport).not.toHaveBeenCalled(); expect(base.reader.search).not.toHaveBeenCalled();
+    } finally { vi.unstubAllGlobals(); }
+  });
+
   it("uses one genuine bound embedding and a guarded dense episode lane", async () => {
     const values = fixtures(); const base = readerFixture();
     vi.mocked(base.calls.exact).mockResolvedValue([]);
@@ -252,7 +271,7 @@ describe("MemoryRetriever guarded exact lane", () => {
       const result = await retriever.search({ query: "alpha", host: "prime", project: { id: "project-1", label: "repo", identityKind: "registered" }, isChild: false, modelDestination: { id: "provider/model", residency: "local", dataUse: "memory" }, mode: "episodes" });
       expect(result.hits).toEqual([expect.objectContaining({ lane: "episodes", id: values.episode.id })]);
       expect(transport).toHaveBeenCalledTimes(1);
-      expect(base.reader.search).toHaveBeenCalledWith(expect.objectContaining({ lane: "episodes", vector: VECTOR, filter: expect.objectContaining({ must: expect.arrayContaining([{ key: "project_id", match: { value: "project-1" } }]) }) }));
+      expect(base.reader.search).toHaveBeenCalledWith(expect.objectContaining({ lane: "episodes", vector: NORMALIZED_VECTOR, filter: expect.objectContaining({ must: expect.arrayContaining([{ key: "project_id", match: { value: "project-1" } }]) }) }));
     } finally { vi.unstubAllGlobals(); }
   });
 

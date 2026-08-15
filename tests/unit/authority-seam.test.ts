@@ -56,7 +56,7 @@ describe("Task 8 authority seam (round 23): no reachable raw surface", () => {
     const { createQdrantSafeBundle, bindQdrantDestination } = await import(distUrl("qdrant/write.js"));
     const fetchImpl: typeof fetch = async (input, init = {}) => {
       const url = String(input);
-      if (url.includes("/points/retrieve")) return new Response(JSON.stringify({ result: [], status: "ok" }), { headers: { "content-type": "application/json" } });
+      if (new URL(url).pathname.endsWith("/points") && init.method === "POST") return new Response(JSON.stringify({ result: [], status: "ok" }), { headers: { "content-type": "application/json" } });
       if (url.includes("/points?") && init.method === "PUT") return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { headers: { "content-type": "application/json" } });
       return new Response(JSON.stringify({ result: {}, status: "ok" }), { headers: { "content-type": "application/json" } });
     };
@@ -125,7 +125,7 @@ describe("Task 8 authority seam (round 23): no reachable raw surface", () => {
     expect(() => createQdrantDestinationFactory({ options, destination: { id: "qdrant:pi", residency: "local", dataUse: "memory" }, egressMode: "allowlist", coordinationPolicyHash: "policy-hash", coordinationPolicyEpoch: 1 })).toThrow(/production-bound|injected/i);
     expect(() => createQdrantSafeBundle({ options, destination: { id: "qdrant:pi", residency: "local", dataUse: "memory" }, egressMode: "allowlist", coordinationPolicyHash: "policy-hash", coordinationPolicyEpoch: 1 })).toThrow(/production-bound|injected/i);
     // With a GENUINE lexical session (global fetch stubbed BEFORE creation) everything works.
-    const fetchImpl2: typeof fetch = async (input, init = {}) => { const url = String(input); if (url.includes("/points/retrieve")) return new Response(JSON.stringify({ result: [], status: "ok" }), { headers: { "content-type": "application/json" } }); if (url.includes("/points?") && init.method === "PUT") return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { headers: { "content-type": "application/json" } }); return new Response(JSON.stringify({ result: {}, status: "ok" }), { headers: { "content-type": "application/json" } }); };
+    const fetchImpl2: typeof fetch = async (input, init = {}) => { const url = String(input); if (new URL(url).pathname.endsWith("/points") && init.method === "POST") return new Response(JSON.stringify({ result: [], status: "ok" }), { headers: { "content-type": "application/json" } }); if (url.includes("/points?") && init.method === "PUT") return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { headers: { "content-type": "application/json" } }); return new Response(JSON.stringify({ result: {}, status: "ok" }), { headers: { "content-type": "application/json" } }); };
     vi.stubGlobal("fetch", fetchImpl2);
     const store = createQdrantCoordinationStore({ baseUrl: "http://qdrant", collection: "pi_memory", ownerHost: "pi", apiKey: "k", timeoutMs: 1000, maxClockSkewMs: 0, readConsistency: "majority" });
     expect(ProductionCoordinationStore.isValid(store)).toBe(true);
@@ -158,7 +158,7 @@ describe("Task 8 authority seam (round 23): no reachable raw surface", () => {
 
   it("the safe bundle binds store + destination to the exact transport; production src has no dynamic imports", async () => {
     const options: QdrantClientOptions = { baseUrl: "http://qdrant", collection: "pi_memory", ownerHost: "pi", apiKey: "k", timeoutMs: 1000, maxClockSkewMs: 0, readConsistency: "majority" };
-    const fetchImpl: typeof fetch = async (input, init = {}) => { const url = String(input); if (url.includes("/points/retrieve")) return new Response(JSON.stringify({ result: [], status: "ok" }), { headers: { "content-type": "application/json" } }); if (url.includes("/points?") && init.method === "PUT") return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { headers: { "content-type": "application/json" } }); return new Response(JSON.stringify({ result: {}, status: "ok" }), { headers: { "content-type": "application/json" } }); };
+    const fetchImpl: typeof fetch = async (input, init = {}) => { const url = String(input); if (new URL(url).pathname.endsWith("/points") && init.method === "POST") return new Response(JSON.stringify({ result: [], status: "ok" }), { headers: { "content-type": "application/json" } }); if (url.includes("/points?") && init.method === "PUT") return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { headers: { "content-type": "application/json" } }); return new Response(JSON.stringify({ result: {}, status: "ok" }), { headers: { "content-type": "application/json" } }); };
     vi.stubGlobal("fetch", fetchImpl);
     const bundle = createQdrantSafeBundle({ options, destination: { id: "qdrant:pi", residency: "local", dataUse: "memory" }, egressMode: "allowlist", coordinationPolicyHash: "policy-hash", coordinationPolicyEpoch: 1 });
     const bound = bindQdrantDestination(bundle.qdrant, { id: "qdrant:pi", residency: "local", dataUse: "memory" });
@@ -288,7 +288,7 @@ declare module "@earendil-works/pi-coding-agent" { export class SessionManager {
       readConsistency: "majority",
       get fetchImpl() { fetchReads += 1; return fetchReads === 1 ? undefined : fakeLater; },
     } as QdrantClientOptions;
-    const genuineFetch: typeof fetch = async (input, init = {}) => { const url = String(input); if (url.includes("/points/retrieve")) return new Response(JSON.stringify({ result: [], status: "ok" }), { headers: { "content-type": "application/json" } }); if (url.includes("/points?") && init.method === "PUT") return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { headers: { "content-type": "application/json" } }); return new Response(JSON.stringify({ result: {}, status: "ok" }), { headers: { "content-type": "application/json" } }); };
+    const genuineFetch: typeof fetch = async (input, init = {}) => { const url = String(input); if (new URL(url).pathname.endsWith("/points") && init.method === "POST") return new Response(JSON.stringify({ result: [], status: "ok" }), { headers: { "content-type": "application/json" } }); if (url.includes("/points?") && init.method === "PUT") return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { headers: { "content-type": "application/json" } }); return new Response(JSON.stringify({ result: {}, status: "ok" }), { headers: { "content-type": "application/json" } }); };
     vi.stubGlobal("fetch", genuineFetch);
     const store = createQdrantCoordinationStore(swapOptions);
     expect(ProductionCoordinationStore.isValid(store)).toBe(true);
@@ -320,7 +320,7 @@ declare module "@earendil-works/pi-coding-agent" { export class SessionManager {
     const factory = {
       get bind() { bindReads += 1; return bindReads === 1 ? realBind : () => ({ id: "forged" }); },
     } as unknown as ReturnType<typeof createQdrantSafeBundle>["qdrant"];
-    const fetchImpl: typeof fetch = async (input, init = {}) => { const url = String(input); if (url.includes("/points/retrieve")) return new Response(JSON.stringify({ result: [], status: "ok" }), { headers: { "content-type": "application/json" } }); if (url.includes("/points?") && init.method === "PUT") return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { headers: { "content-type": "application/json" } }); return new Response(JSON.stringify({ result: {}, status: "ok" }), { headers: { "content-type": "application/json" } }); };
+    const fetchImpl: typeof fetch = async (input, init = {}) => { const url = String(input); if (new URL(url).pathname.endsWith("/points") && init.method === "POST") return new Response(JSON.stringify({ result: [], status: "ok" }), { headers: { "content-type": "application/json" } }); if (url.includes("/points?") && init.method === "PUT") return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { headers: { "content-type": "application/json" } }); return new Response(JSON.stringify({ result: {}, status: "ok" }), { headers: { "content-type": "application/json" } }); };
     vi.stubGlobal("fetch", fetchImpl);
     const bound = bindQdrantDestination(factory, swapDestination);
     expect(idReads).toBe(1);
@@ -330,7 +330,7 @@ declare module "@earendil-works/pi-coding-agent" { export class SessionManager {
   });
 
   it("GLOBAL RULE: ingest runtime snapshots store/qdrant/embedding EXACTLY ONCE; a proxy swap genuine->fake cannot mint", async () => {
-    const fetchImpl: typeof fetch = async (input, init = {}) => { const url = String(input); if (url.includes("/points/retrieve")) return new Response(JSON.stringify({ result: [], status: "ok" }), { headers: { "content-type": "application/json" } }); if (url.includes("/points?") && init.method === "PUT") return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { headers: { "content-type": "application/json" } }); return new Response(JSON.stringify({ result: {}, status: "ok" }), { headers: { "content-type": "application/json" } }); };
+    const fetchImpl: typeof fetch = async (input, init = {}) => { const url = String(input); if (new URL(url).pathname.endsWith("/points") && init.method === "POST") return new Response(JSON.stringify({ result: [], status: "ok" }), { headers: { "content-type": "application/json" } }); if (url.includes("/points?") && init.method === "PUT") return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { headers: { "content-type": "application/json" } }); return new Response(JSON.stringify({ result: {}, status: "ok" }), { headers: { "content-type": "application/json" } }); };
     vi.stubGlobal("fetch", fetchImpl);
     const bundle = createQdrantSafeBundle({ options: { baseUrl: "http://qdrant", collection: "pi_memory", ownerHost: "pi", apiKey: "k", timeoutMs: 1000, maxClockSkewMs: 0, readConsistency: "majority" }, destination: { id: "qdrant:pi", residency: "local", dataUse: "memory" }, egressMode: "allowlist", coordinationPolicyHash: "policy-hash", coordinationPolicyEpoch: 1 });
     const qdrantBound = bindQdrantDestination(bundle.qdrant, { id: "qdrant:pi", residency: "local", dataUse: "memory" });
@@ -376,7 +376,7 @@ declare module "@earendil-works/pi-coding-agent" { export class SessionManager {
     let batchReads = 0;
     let offsetReads = 0;
     const { createQdrantCoordinationStore: createStore2 } = await import("../../src/qdrant/write.js");
-    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => { const url = String(input); if (url.includes("/points/retrieve")) return new Response(JSON.stringify({ result: [], status: "ok" }), { headers: { "content-type": "application/json" } }); if (url.includes("/points?") && init?.method === "PUT") return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { headers: { "content-type": "application/json" } }); return new Response(JSON.stringify({ result: {}, status: "ok" }), { headers: { "content-type": "application/json" } }); });
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => { const url = String(input); if (new URL(url).pathname.endsWith("/points") && init.method === "POST") return new Response(JSON.stringify({ result: [], status: "ok" }), { headers: { "content-type": "application/json" } }); if (url.includes("/points?") && init?.method === "PUT") return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { headers: { "content-type": "application/json" } }); return new Response(JSON.stringify({ result: {}, status: "ok" }), { headers: { "content-type": "application/json" } }); });
     const store2 = createStore2({ baseUrl: "http://qdrant", collection: "pi_memory", ownerHost: "pi", apiKey: "k", timeoutMs: 1000, maxClockSkewMs: 0, readConsistency: "majority" });
     const { reconcileCoverage } = await import("../../src/coordination/reconcile.js");
     const swapBatch = { get batchSize() { batchReads += 1; return 64; } } as never;

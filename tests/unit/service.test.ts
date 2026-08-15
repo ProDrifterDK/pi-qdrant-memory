@@ -104,7 +104,7 @@ function makeService(input: {
   const warnings = input.warnings ?? [];
   const qdrant = input.qdrant ?? {
     health: vi.fn(async () => undefined),
-    collectionInfo: vi.fn(async () => ({ dimension: runtimeConfig.embeddings.dimension, distance: "Cosine" })),
+    collectionInfo: vi.fn(async () => ({ dimension: runtimeConfig.embeddings.dimension, distance: "Dot" })),
   };
   const embeddingHealth = input.embeddingHealth ?? vi.fn(async () => undefined);
   const service = new MemoryService({
@@ -131,6 +131,15 @@ describe("MemoryService recall lifecycle", () => {
     await service.search({ query: " alpha ", limit: 3, mode: "historical", after: "2026-08-13T14:30:00.000Z", before: "2026-08-13T15:00:00.000Z" }, context());
     expect(search).toHaveBeenCalledWith({ query: "alpha", host: "prime", project: { id: "project-id", label: "project", identityKind: "registered" }, isChild: true, modelDestination: { id: "provider/model", residency: "approved", dataUse: "memory" }, limit: 3, mode: "historical", after: "2026-08-13T14:30:00.000Z", before: "2026-08-13T15:00:00.000Z" });
     expect(warnings).toEqual([]);
+  });
+
+  it("keeps explicit project-only child search available for a valid local-only identity", async () => {
+    const search = vi.fn(async ({ query }: { query: string }) => ({ query, hits: [hit] }));
+    const runtimeConfig = config();
+    const project = { id: "local-project", label: "project", identityKind: "local_only" } as const;
+    const service = new MemoryService({ host: "prime", config: runtimeConfig, retriever: { search }, projectResolver: async () => project, cache: new RecallCache({ maxEntries: 4, ttlMs: 1000 }), warningSink: () => undefined, modelDestination: () => ({ id: "provider/model", residency: "local", dataUse: "memory" }), isChild: () => true });
+    await expect(service.search({ query: "alpha", limit: 3, mode: "all" }, context())).resolves.toEqual({ query: "alpha", hits: [hit] });
+    expect(search).toHaveBeenCalledWith({ query: "alpha", host: "prime", project, isChild: true, modelDestination: { id: "provider/model", residency: "local", dataUse: "memory" }, limit: 3, mode: "all" });
   });
 
   it("never calls retrieval when the active model has no trusted destination binding", async () => {
@@ -286,9 +295,9 @@ describe("MemoryService recall lifecycle", () => {
 });
 
 describe("MemoryService health", () => {
-  it("uses a fixed non-sensitive probe and validates dimension and Cosine distance", async () => {
+  it("uses a fixed non-sensitive probe and validates dimension and Dot distance", async () => {
     const health = vi.fn(async () => undefined);
-    const collectionInfo = vi.fn(async () => ({ dimension: 1024, distance: "cosine" }));
+    const collectionInfo = vi.fn(async () => ({ dimension: 1024, distance: "dot" }));
     const embeddingHealth = vi.fn(async () => undefined);
     const { service, warnings } = makeService({
       qdrant: { health, collectionInfo },

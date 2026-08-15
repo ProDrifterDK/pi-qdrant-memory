@@ -1,3 +1,4 @@
+import { resolveAgentMarker } from "./capture/episode.js";
 const hostFromExplicit = (explicit) => {
     if (explicit === "prime" || explicit === "pi")
         return explicit;
@@ -56,13 +57,21 @@ export function resolvePrimeRlmDepth(header, env) {
         return parseEnvironmentDepth(env.RLM_DEPTH);
     return 0;
 }
+/**
+ * Resolve the exact host lifecycle marker through the hardened capture parser.
+ * Invalid or contradictory metadata is always represented as an ineligible
+ * child, so callers cannot accidentally turn ambiguity into root authority.
+ */
+export function resolveHostAgentMarker(host, header, env) {
+    return resolveAgentMarker({ host, header, env });
+}
 /** Fail-closed compatibility hook used before a host accepts a destination. */
 export function validateCollectionMetadata(expectedHost, metadata, expectedModel, expectedDimension = 1024) {
     if (metadata.ownerHost !== expectedHost)
         throw new Error("Collection owner host mismatch");
     if (metadata.schema !== "pi-qdrant-memory-v2" || metadata.schemaRevision !== 1)
         throw new Error("Collection schema mismatch");
-    if (metadata.dimension !== expectedDimension || metadata.distance !== "Cosine")
+    if (metadata.dimension !== expectedDimension || metadata.distance !== "Dot")
         throw new Error("Collection vector metadata mismatch");
     if (expectedModel !== undefined && metadata.model !== expectedModel)
         throw new Error("Collection model mismatch");

@@ -43,6 +43,17 @@ function boundedId(value, fallback, homeDir = "/") {
         return safe.text;
     return sha256Hex(`stable-id:${safe.text}`).slice(0, 32);
 }
+function structuredEnvelopeId(value, pattern, fallback, homeDir) {
+    return typeof value === "string" && pattern.test(value) ? value : boundedId(value, fallback, homeDir);
+}
+function capturedProjectId(value, homeDir = "/") {
+    // Registered local-only identities are already pseudonymous SHA-256 values
+    // produced by the trusted project resolver; rescanning their entropy would
+    // collapse every valid registration to the literal fallback.
+    if (typeof value === "string" && /^[a-f0-9]{64}$/u.test(value))
+        return value;
+    return boundedId(value, "local_only", homeDir);
+}
 function timestampMillis(value) {
     if (value instanceof Date)
         return Number.isFinite(value.getTime()) ? value.getTime() : undefined;
@@ -374,9 +385,9 @@ function episodeMaterial(entry, input, marker, fallbackAt) {
     const fieldWasRedacted = textField.status !== "unchanged" || argsField.status !== "unchanged" || (entry.toolName !== undefined && safeToolName !== entry.toolName);
     const record = {
         recordType: "episode", id, ownerHost: input.host, schemaRevision: 1, createdAt: stableCreatedAt, privacyEpoch: input.privacyEpoch ?? 0,
-        processingPolicyId: boundedId(input.policyId, "capture-policy", homeDir), expiresAt: input.expiresAt ?? null, contentHash: "pending", sourceEntryId, host: input.host,
-        projectId: boundedId(input.projectId, "local_only", homeDir), projectIdentityKind: input.projectIdentityKind ?? "local_only", sessionId, turnId: boundedId(entry.turnId, sourceEntryId, homeDir), agentRole: marker.role, depth: marker.depth,
-        eventKind: entry.eventKind, eventAt, modelId: boundedId(input.modelId, "unknown", homeDir), embeddingDimension: 1024, originProvider: boundedId(input.originProvider, "unknown", homeDir), destinationId: boundedId(input.destinationId, "capture:local", homeDir), status: "active", redactionStatus: fieldWasRedacted ? "redacted" : "unchanged", secretScan: "passed",
+        processingPolicyId: structuredEnvelopeId(input.policyId, /^[a-f0-9]{64}$/u, "capture-policy", homeDir), expiresAt: input.expiresAt ?? null, contentHash: "pending", sourceEntryId, host: input.host,
+        projectId: capturedProjectId(input.projectId, homeDir), projectIdentityKind: input.projectIdentityKind ?? "local_only", sessionId, turnId: boundedId(entry.turnId, sourceEntryId, homeDir), agentRole: marker.role, depth: marker.depth,
+        eventKind: entry.eventKind, eventAt, modelId: boundedId(input.modelId, "unknown", homeDir), embeddingDimension: 1024, originProvider: boundedId(input.originProvider, "unknown", homeDir), destinationId: structuredEnvelopeId(input.destinationId, /^local:[a-f0-9]{32}$/u, "capture:local", homeDir), status: "active", redactionStatus: fieldWasRedacted ? "redacted" : "unchanged", secretScan: "passed",
     };
     if (text !== undefined)
         record.text = text;
@@ -388,9 +399,9 @@ function episodeMaterial(entry, input, marker, fallbackAt) {
     if (fingerprint !== undefined)
         record.errorFingerprint = fingerprint;
     if (input.producerId !== undefined)
-        record.producerId = boundedId(input.producerId, "producer", homeDir);
+        record.producerId = structuredEnvelopeId(input.producerId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u, "producer", homeDir);
     if (input.nodeId !== undefined)
-        record.nodeId = boundedId(input.nodeId, "node", homeDir);
+        record.nodeId = structuredEnvelopeId(input.nodeId, /^node-[a-f0-9]{32}$/u, "node", homeDir);
     if (entry.sessionSequence !== undefined && Number.isSafeInteger(entry.sessionSequence) && entry.sessionSequence >= 0)
         record.sessionSequence = entry.sessionSequence;
     const semantic = episodeSemanticProjection(record);

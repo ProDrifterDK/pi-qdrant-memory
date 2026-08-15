@@ -3,6 +3,36 @@ import { bindConfiguredDestination, canonicalEgressEndpoint } from "../security/
 import { types as nodeTypes } from "node:util";
 function isRecord(value) { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function invalidResponse(message) { return new MemoryClientError("invalid-response", message); }
+/** Qdrant Dot collections preserve float32 components byte-for-byte. Normalize
+ * once at the embedding boundary so Dot scores retain Cosine semantics while
+ * vector-bound record hashes survive real Qdrant 1.17.1 round trips. */
+export function canonicalizeEmbeddingVector(value, dimension) {
+    if (!Number.isSafeInteger(dimension) || dimension < 1 || !Array.isArray(value) || value.length !== dimension || !value.every(component => typeof component === "number" && Number.isFinite(component)))
+        throw invalidResponse("Embedding vector has invalid components");
+    let scale = 0;
+    let sum = 1;
+    for (const component of value) {
+        const absolute = Math.abs(component);
+        if (absolute === 0)
+            continue;
+        if (scale < absolute) {
+            const ratio = scale / absolute;
+            sum = 1 + sum * ratio * ratio;
+            scale = absolute;
+        }
+        else {
+            const ratio = absolute / scale;
+            sum += ratio * ratio;
+        }
+    }
+    if (scale === 0 || !Number.isFinite(sum))
+        throw invalidResponse("Embedding vector has zero or invalid norm");
+    const scaledNorm = Math.sqrt(sum);
+    const canonical = value.map(component => Math.fround((component / scale) / scaledNorm));
+    if (canonical.every(component => component === 0))
+        throw invalidResponse("Embedding vector collapsed during canonicalization");
+    return canonical;
+}
 /** Module-private unexported issuer: real embedding clients are branded at construction. */
 const EMBEDDINGS_CLIENT_ISSUER = Symbol("pi-qdrant-memory-v2.embeddings-client-issuer");
 const EMBEDDINGS_STATE = new WeakMap();
@@ -73,9 +103,7 @@ export class EmbeddingsClient {
             throw invalidResponse("Embedding response has no embedding vector");
         if (first.embedding.length !== EMBEDDINGS_STATE.get(this).options.dimension)
             throw invalidResponse("Embedding vector has an unexpected dimension");
-        if (!first.embedding.every((value) => typeof value === "number" && Number.isFinite(value)))
-            throw invalidResponse("Embedding vector contains an invalid component");
-        return first.embedding;
+        return canonicalizeEmbeddingVector(first.embedding, EMBEDDINGS_STATE.get(this).options.dimension);
     }
     async embedQuery(query, signal) { return this.request(`${EMBEDDINGS_STATE.get(this).options.queryPrefix}${query}`, EMBEDDINGS_STATE.get(this).options.model, signal); }
     /** Task 7 document embeddings deliberately omit queryPrefix and accept BGE-M3 only. */

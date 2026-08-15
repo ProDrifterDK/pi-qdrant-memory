@@ -160,6 +160,11 @@ describe("Task 4 persisted capture", () => {
     entries.push(msg("after-allowed", "user", "usable"));
     const allowed = await capturePersistedEntries({ sessionId: "allowed", lifecycle: "agent_end", activationDir: "/not-used", host: "pi", getEntries, projectId: "allowed", projectAllowlist: ["allowed"] });
     expect(allowed.map((entry) => entry.sourceEntryId)).toEqual(["after-allowed"]);
+    const registeredId = "a".repeat(64);
+    await activateCapture({ sessionId: "registered", host: "pi", getEntries, readActivation: async (key) => state.get(key), writeActivation: async (key, value) => { state.set(key, value); }, now: () => 3 });
+    entries.push(msg("after-registered", "user", "usable"));
+    const registered = await capturePersistedEntries({ sessionId: "registered", lifecycle: "agent_end", activationDir: "/not-used", host: "pi", getEntries, projectId: registeredId, projectIdentityKind: "registered" });
+    expect(registered.at(-1)).toMatchObject({ projectId: registeredId, projectIdentityKind: "registered" });
     const sources = ["src/capture/episode.ts", "src/capture/select.ts", "src/capture/scanner.ts", "src/security/redaction.ts"].map((file) => readFile(file, "utf8"));
     expect((await Promise.all(sources)).join("\n")).not.toMatch(/console\.(?:log|warn|error)|process\.stderr/u);
   });
@@ -214,6 +219,15 @@ describe("Task 4 persisted capture", () => {
     await activateCapture(deps); entries.push(msg(token, "user", "safe"));
     const records = await capturePersistedEntries({ ...deps, lifecycle: "agent_end", activationDir: "/unused", producerId: token, nodeId: token });
     const serialized = JSON.stringify(records); expect(serialized).not.toContain(token); expect(serialized).not.toContain(sha256Hex(token));
+  });
+
+  it("preserves validated pseudonymous outbox envelope identifiers", async () => {
+    const state = new Map<string, string>(); const entries: Entry[] = [msg("before-envelope", "user", "old")];
+    const deps = { sessionId: "envelope-session", host: "pi" as const, getEntries: () => entries.slice(), readActivation: async (key: string) => state.get(key), writeActivation: async (key: string, value: string) => { state.set(key, value); }, now: () => 1 };
+    await activateCapture(deps); entries.push(msg("envelope-entry", "user", "safe envelope material"));
+    const envelope = { policyId: "a".repeat(64), destinationId: `local:${"b".repeat(32)}`, producerId: "12345678-1234-4123-8123-123456789abc", nodeId: `node-${"c".repeat(32)}` };
+    const records = await capturePersistedEntries({ ...deps, ...envelope, lifecycle: "agent_end", activationDir: "/unused" });
+    expect(records).toHaveLength(1); expect(records[0]).toMatchObject({ processingPolicyId: envelope.policyId, destinationId: envelope.destinationId, producerId: envelope.producerId, nodeId: envelope.nodeId });
   });
 
   it("keeps message-id collisions distinct when unsafe IDs fall back to source entries", async () => {

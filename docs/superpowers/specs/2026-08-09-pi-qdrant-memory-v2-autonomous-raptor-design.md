@@ -194,7 +194,7 @@ Cada colección contiene metadata verificada en startup:
   "dense_vector": "semantic",
   "embedding_model": "bge-m3",
   "embedding_dimension": 1024,
-  "distance": "Cosine"
+  "distance": "Dot"
 }
 ```
 
@@ -202,7 +202,7 @@ Cada colección contiene metadata verificada en startup:
 
 ### 7.3 Vectores e índices
 
-La colección usa un vector dense nombrado `semantic`, 1024/Cosine por defecto. Los puntos de control pueden omitirlo; Qdrant permite omitir named vectors por punto.
+La colección usa un vector dense nombrado `semantic`, 1024/Dot. Cada embedding se valida en la frontera, se normaliza por norma L2 y se canoniza a componentes float32; Dot sobre vectores normalizados conserva la semántica de Cosine y permite hashes/readback estables frente a Qdrant 1.17. Los puntos payload-only llevan explícitamente `vector: {}` porque Qdrant 1.17 requiere el campo de named vectors aunque no haya vector semántico.
 
 Payload indexes mínimos:
 

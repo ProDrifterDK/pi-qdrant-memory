@@ -29,7 +29,7 @@ function config(): RuntimeConfig {
 
 describe("destination-only v2 admin shell", () => {
   it("returns immutable destination contract details without a network call", async () => {
-    await expect(initializeDestination(config())).resolves.toMatchObject({ host: "pi", ownerHost: "pi", collection: "pi_memory", schema: "pi-qdrant-memory-v2", schemaRevision: 1, vector: { name: "semantic", model: "bge-m3", dimension: 1024, distance: "Cosine" }, initialized: false });
+    await expect(initializeDestination(config())).resolves.toMatchObject({ host: "pi", ownerHost: "pi", collection: "pi_memory", schema: "pi-qdrant-memory-v2", schemaRevision: 1, vector: { name: "semantic", model: "bge-m3", dimension: 1024, distance: "Dot" }, initialized: false });
   });
 
   it("reports destination and policy state without a second collection", async () => {
@@ -48,7 +48,7 @@ describe("Qdrant 1.17 initialization and runtime status probes", () => {
   function collectionResponse(): unknown {
     const payload_schema: Record<string, unknown> = {};
     for (const [field, data_type] of REQUIRED_INDEXES) payload_schema[field] = { data_type };
-    return { result: { status: "green", points_count: 2, config: { params: { vectors: { semantic: { size: 1024, distance: "Cosine" } } } }, payload_schema }, status: "ok" };
+    return { result: { status: "green", points_count: 2, config: { params: { vectors: { semantic: { size: 1024, distance: "Dot" } } } }, payload_schema }, status: "ok" };
   }
   it("initializes metadata/control with the human key and rereads immutable points", async () => {
     const calls: Array<{ url: string; method: string; body?: Record<string, unknown>; headers: Headers }> = [];
@@ -56,7 +56,7 @@ describe("Qdrant 1.17 initialization and runtime status probes", () => {
       const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as Record<string, unknown>;
       calls.push({ url, method: init.method ?? "GET", ...(body === undefined ? {} : { body }), headers: new Headers(init.headers) });
       if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 });
-      if (url.includes("/points/retrieve")) {
+      if (new URL(url).pathname.endsWith("/points") && init.method === "POST") {
         const ids = (body?.ids ?? []) as string[];
         return new Response(JSON.stringify({ result: ids[0] === COLLECTION_METADATA_ID ? [{ id: COLLECTION_METADATA_ID, payload: collectionMetadataPayload("pi") }] : [{ id: COLLECTION_CONTROL_ID, payload: controlPayload(existingControl) }], status: "ok" }), { status: 200 });
       }
@@ -77,7 +77,7 @@ describe("Qdrant 1.17 initialization and runtime status probes", () => {
     const fetchImpl: typeof fetch = async (input, init = {}) => {
       calls.push({ url: String(input), headers: new Headers(init.headers) });
       if (String(input).endsWith("/healthz")) return new Response(JSON.stringify({ result: { status: "ok" }, status: "ok" }), { status: 200 });
-      if (String(input).includes("/points/retrieve")) return new Response(JSON.stringify({ result: [{ id: COLLECTION_METADATA_ID, payload: collectionMetadataPayload("pi") }], status: "ok" }), { status: 200 });
+      if (new URL(String(input)).pathname.endsWith("/points")) return new Response(JSON.stringify({ result: [{ id: COLLECTION_METADATA_ID, payload: collectionMetadataPayload("pi") }], status: "ok" }), { status: 200 });
       return new Response(JSON.stringify(collectionResponse()), { status: 200 });
     };
     const result = await memoryStatus(config(), { fetchImpl });
@@ -92,7 +92,7 @@ describe("Qdrant 1.17 initialization and runtime status probes", () => {
       const url = String(input); const method = init.method ?? "GET"; const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as Record<string, unknown>; calls.push({ url, method, ...(body === undefined ? {} : { body }) });
       if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 });
       if (url.includes("/collections/pi_memory") && method === "GET" && !url.includes("/points")) { if (!collection) return new Response("missing", { status: 404 }); return new Response(JSON.stringify(collectionResponse()), { status: 200 }); }
-      if (url.includes("/collections/pi_memory/points/retrieve")) { const ids = (body?.ids ?? []) as string[]; if (ids[0] === COLLECTION_METADATA_ID && !metadata) return new Response(JSON.stringify({ result: [] }), { status: 200 }); return new Response(JSON.stringify({ result: [{ id: ids[0], payload: ids[0] === COLLECTION_METADATA_ID ? collectionMetadataPayload("pi") : storedControl ?? controlPayload(existingControl) }] }), { status: 200 }); }
+      if (new URL(url).pathname.startsWith("/collections/pi_memory/points") && init.method === "POST") { const ids = (body?.ids ?? []) as string[]; if (ids[0] === COLLECTION_METADATA_ID && !metadata) return new Response(JSON.stringify({ result: [] }), { status: 200 }); return new Response(JSON.stringify({ result: [{ id: ids[0], payload: ids[0] === COLLECTION_METADATA_ID ? collectionMetadataPayload("pi") : storedControl ?? controlPayload(existingControl) }] }), { status: 200 }); }
       if (url.endsWith("/collections/pi_memory") && method === "PUT") { collection = true; return new Response(JSON.stringify({ result: true, status: "ok" }), { status: 200 }); }
       if (url.includes("/points?") && method === "PUT") { const points = (body?.points ?? []) as Array<{ payload?: Record<string, unknown> }>; if (points[0]?.payload?.record_type === "collection_metadata") metadata = true; if (points[0]?.payload?.record_type === "collection_control") { control = true; storedControl = points[0]?.payload; } return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 }); }
       return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 });
@@ -108,7 +108,7 @@ describe("Qdrant 1.17 initialization and runtime status probes", () => {
     const fetchImpl: typeof fetch = async (input, init = {}) => {
       const url = String(input); const method = init.method ?? "GET"; calls.push({ url, method });
       if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 });
-      if (url.includes("/points/retrieve")) { const payload = kind === "missing" ? [] : [{ id: COLLECTION_METADATA_ID, payload: collectionMetadataPayload("prime") }]; return new Response(JSON.stringify({ result: payload }), { status: 200 }); }
+      if (new URL(url).pathname.endsWith("/points") && init.method === "POST") { const payload = kind === "missing" ? [] : [{ id: COLLECTION_METADATA_ID, payload: collectionMetadataPayload("prime") }]; return new Response(JSON.stringify({ result: payload }), { status: 200 }); }
       if (url.includes("/collections/pi_memory") && method === "GET") return new Response(JSON.stringify(collectionResponse()), { status: 200 });
       return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 });
     };
@@ -119,7 +119,7 @@ describe("Qdrant 1.17 initialization and runtime status probes", () => {
 
   it.each(["bad-date", "empty-policy", "extra-field"])("rejects malformed pre-existing bootstrap control (%s) before indexes", async (kind) => {
     const calls: string[] = []; const bad: Record<string, unknown> = controlPayload(existingControl); if (kind === "bad-date") bad.created_at = "not-an-iso-date"; if (kind === "empty-policy") bad.processing_policy_id = ""; if (kind === "extra-field") bad.unexpected = true;
-    const fetchImpl: typeof fetch = async (input, init = {}) => { const url = String(input); calls.push(`${init.method ?? "GET"} ${url}`); if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 }); if (url.includes("/points/retrieve")) { const body = JSON.parse(String(init.body)) as { ids: string[] }; return new Response(JSON.stringify({ result: [{ id: body.ids[0], payload: body.ids[0] === COLLECTION_METADATA_ID ? collectionMetadataPayload("pi") : bad }] }), { status: 200 }); } if (url.includes("/collections/pi_memory") && init.method === "GET") return new Response(JSON.stringify(collectionResponse()), { status: 200 }); return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 }); };
+    const fetchImpl: typeof fetch = async (input, init = {}) => { const url = String(input); calls.push(`${init.method ?? "GET"} ${url}`); if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 }); if (new URL(url).pathname.endsWith("/points") && init.method === "POST") { const body = JSON.parse(String(init.body)) as { ids: string[] }; return new Response(JSON.stringify({ result: [{ id: body.ids[0], payload: body.ids[0] === COLLECTION_METADATA_ID ? collectionMetadataPayload("pi") : bad }] }), { status: 200 }); } if (url.includes("/collections/pi_memory") && init.method === "GET") return new Response(JSON.stringify(collectionResponse()), { status: 200 }); return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 }); };
     await expect(initializeDestination(config(), { adminApiKey: "human-admin", fetchImpl })).rejects.toThrow(/control|metadata/i); expect(calls.some((call) => call.includes("/index?"))).toBe(false);
   });
 
@@ -128,7 +128,7 @@ describe("Qdrant 1.17 initialization and runtime status probes", () => {
     const fetchImpl: typeof fetch = async (input, init = {}) => {
       const url = String(input); calls.push(`${init.method ?? "GET"} ${url}`);
       if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 });
-      if (url.includes("/collections/pi_memory/points/retrieve")) { const body = JSON.parse(String(init.body)) as { ids: string[] }; if (body.ids[0] === COLLECTION_METADATA_ID) { metadataReads += 1; return new Response(JSON.stringify({ result: metadataReads === 1 ? [] : [{ id: COLLECTION_METADATA_ID, payload: collectionMetadataPayload("pi") }] }), { status: 200 }); } controlReads += 1; return new Response(JSON.stringify({ result: controlReads === 1 ? [] : [{ id: COLLECTION_CONTROL_ID, payload: controlPayload(existingControl) }] }), { status: 200 }); }
+      if (new URL(url).pathname.startsWith("/collections/pi_memory/points") && init.method === "POST") { const body = JSON.parse(String(init.body)) as { ids: string[] }; if (body.ids[0] === COLLECTION_METADATA_ID) { metadataReads += 1; return new Response(JSON.stringify({ result: metadataReads === 1 ? [] : [{ id: COLLECTION_METADATA_ID, payload: collectionMetadataPayload("pi") }] }), { status: 200 }); } controlReads += 1; return new Response(JSON.stringify({ result: controlReads === 1 ? [] : [{ id: COLLECTION_CONTROL_ID, payload: controlPayload(existingControl) }] }), { status: 200 }); }
       if (url.includes("/collections/pi_memory") && init.method === "GET") { readCount += 1; if (readCount === 1) return new Response("missing", { status: 404 }); return new Response(JSON.stringify(collectionResponse()), { status: 200 }); }
       if (url.endsWith("/collections/pi_memory") && init.method === "PUT") return new Response("conflict", { status: 409 });
       return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 });
@@ -155,7 +155,7 @@ describe("Qdrant 1.17 initialization and runtime status probes", () => {
     const aliasFetch: typeof fetch = async (input, init = {}) => {
       const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[] };
       if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 });
-      if (url.includes("/points/retrieve")) return new Response(JSON.stringify({ result: (body?.ids ?? [])[0] === COLLECTION_METADATA_ID ? [foreignMetadata] : [{ id: COLLECTION_CONTROL_ID, payload: controlPayload(existingControl) }] }), { status: 200 });
+      if (new URL(url).pathname.endsWith("/points") && init.method === "POST") return new Response(JSON.stringify({ result: (body?.ids ?? [])[0] === COLLECTION_METADATA_ID ? [foreignMetadata] : [{ id: COLLECTION_CONTROL_ID, payload: controlPayload(existingControl) }] }), { status: 200 });
       if (url.includes("/collections/pi_memory") && init.method === "GET") return new Response(JSON.stringify(collectionResponse()), { status: 200 });
       return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 });
     };
@@ -164,7 +164,7 @@ describe("Qdrant 1.17 initialization and runtime status probes", () => {
     const controlAliasFetch: typeof fetch = async (input, init = {}) => {
       const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[] };
       if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 });
-      if (url.includes("/points/retrieve")) return new Response(JSON.stringify({ result: (body?.ids ?? [])[0] === COLLECTION_METADATA_ID ? [intendedMetadata] : [{ id: "00000000-0000-5000-8000-000000000098", payload: controlPayload(existingControl) }] }), { status: 200 });
+      if (new URL(url).pathname.endsWith("/points") && init.method === "POST") return new Response(JSON.stringify({ result: (body?.ids ?? [])[0] === COLLECTION_METADATA_ID ? [intendedMetadata] : [{ id: "00000000-0000-5000-8000-000000000098", payload: controlPayload(existingControl) }] }), { status: 200 });
       if (url.includes("/collections/pi_memory") && init.method === "GET") return new Response(JSON.stringify(collectionResponse()), { status: 200 });
       return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 });
     };
@@ -174,7 +174,7 @@ describe("Qdrant 1.17 initialization and runtime status probes", () => {
       const ambiguousFetch: typeof fetch = async (input, init = {}) => {
         const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[] };
         if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 });
-        if (url.includes("/points/retrieve")) return new Response(JSON.stringify({ result: (body?.ids ?? [])[0] === COLLECTION_METADATA_ID ? result : [{ id: COLLECTION_CONTROL_ID, payload: controlPayload(existingControl) }] }), { status: 200 });
+        if (new URL(url).pathname.endsWith("/points") && init.method === "POST") return new Response(JSON.stringify({ result: (body?.ids ?? [])[0] === COLLECTION_METADATA_ID ? result : [{ id: COLLECTION_CONTROL_ID, payload: controlPayload(existingControl) }] }), { status: 200 });
         if (url.includes("/collections/pi_memory") && init.method === "GET") return new Response(JSON.stringify(collectionResponse()), { status: 200 });
         return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 });
       };
@@ -186,7 +186,7 @@ describe("Qdrant 1.17 initialization and runtime status probes", () => {
       const url = String(input); const method = init.method ?? "GET"; const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[]; points?: Array<{ payload?: Record<string, unknown> }> };
       if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 });
       if (url.includes("/collections/pi_memory") && method === "GET" && !url.includes("/points")) { if (!createdCollection) return new Response("missing", { status: 404 }); return new Response(JSON.stringify(collectionResponse()), { status: 200 }); }
-      if (url.includes("/points/retrieve")) { const ids = (body?.ids ?? []) as string[]; if (ids[0] === COLLECTION_METADATA_ID) return new Response(JSON.stringify({ result: metadata ? [{ id: COLLECTION_METADATA_ID, payload: collectionMetadataPayload("pi") }] : [] }), { status: 200 }); return new Response(JSON.stringify({ result: [{ id: COLLECTION_CONTROL_ID, payload: controlPayload(existingControl) }, { id: COLLECTION_CONTROL_ID, payload: controlPayload(existingControl) }] }), { status: 200 }); }
+      if (new URL(url).pathname.endsWith("/points") && init.method === "POST") { const ids = (body?.ids ?? []) as string[]; if (ids[0] === COLLECTION_METADATA_ID) return new Response(JSON.stringify({ result: metadata ? [{ id: COLLECTION_METADATA_ID, payload: collectionMetadataPayload("pi") }] : [] }), { status: 200 }); return new Response(JSON.stringify({ result: [{ id: COLLECTION_CONTROL_ID, payload: controlPayload(existingControl) }, { id: COLLECTION_CONTROL_ID, payload: controlPayload(existingControl) }] }), { status: 200 }); }
       if (url.endsWith("/collections/pi_memory") && method === "PUT") { createdCollection = true; return new Response(JSON.stringify({ result: true, status: "ok" }), { status: 200 }); }
       if (url.includes("/points?") && method === "PUT") { const points = (body?.points ?? []) as Array<{ payload?: Record<string, unknown> }>; if (points[0]?.payload?.record_type === "collection_metadata") metadata = true; return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 }); }
       return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 });
@@ -214,7 +214,7 @@ describe("Qdrant 1.17 initialization and runtime status probes", () => {
     const fetchImpl: typeof fetch = async (input, init = {}) => {
       const url = String(input); const method = init.method ?? "GET"; const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as Record<string, unknown>; calls.push({ url, method, ...(body === undefined ? {} : { body }) });
       if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 });
-      if (url.includes("/points/retrieve")) { const ids = (body?.ids ?? []) as string[]; return new Response(JSON.stringify({ result: [{ id: ids[0], payload: ids[0] === COLLECTION_METADATA_ID ? collectionMetadataPayload("pi") : controlPayload(evolved) }] }), { status: 200 }); }
+      if (new URL(url).pathname.endsWith("/points") && init.method === "POST") { const ids = (body?.ids ?? []) as string[]; return new Response(JSON.stringify({ result: [{ id: ids[0], payload: ids[0] === COLLECTION_METADATA_ID ? collectionMetadataPayload("pi") : controlPayload(evolved) }] }), { status: 200 }); }
       if (url.includes("/collections/pi_memory") && method === "GET") return new Response(JSON.stringify(collectionResponse()), { status: 200 });
       return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 });
     };
@@ -226,7 +226,7 @@ describe("Qdrant 1.17 initialization and runtime status probes", () => {
     const badFetch: typeof fetch = async (input, init = {}) => {
       const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[] };
       if (url.endsWith("/")) return new Response(JSON.stringify({ title: "qdrant", version: "1.17.1" }), { status: 200 });
-      if (url.includes("/points/retrieve")) return new Response(JSON.stringify({ result: (body?.ids ?? [])[0] === COLLECTION_METADATA_ID ? [{ id: COLLECTION_METADATA_ID, payload: collectionMetadataPayload("pi") }] : [{ id: COLLECTION_CONTROL_ID, payload: { ...controlPayload(evolved), content_hash: "bogus" } }] }), { status: 200 });
+      if (new URL(url).pathname.endsWith("/points") && init.method === "POST") return new Response(JSON.stringify({ result: (body?.ids ?? [])[0] === COLLECTION_METADATA_ID ? [{ id: COLLECTION_METADATA_ID, payload: collectionMetadataPayload("pi") }] : [{ id: COLLECTION_CONTROL_ID, payload: { ...controlPayload(evolved), content_hash: "bogus" } }] }), { status: 200 });
       if (url.includes("/collections/pi_memory") && init.method === "GET") return new Response(JSON.stringify(collectionResponse()), { status: 200 });
       return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }), { status: 200 });
     };

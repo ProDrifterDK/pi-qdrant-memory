@@ -15,7 +15,7 @@
 - Use Node.js 20+ and npm >=11.10. Later implementation in a fresh feature worktree begins with `npm ci`; do not install dependencies from this planning worktree.
 - Do not introduce Python, a daemon, sidecar, coordinator database, Qdrant/embedding/LLM SDK, dynamic imports, inline imports, live Qdrant access, npm publication, release tag, or live initialization. Use REST and host APIs only.
 - Remove all executable Hermes/source surface before implementing v2: no `import-hermes` command/module, Hermes source contract, source config, source credentials, source client, tests, docs, package export, or `dist` artifact remains.
-- Qdrant minimum is 1.17.0 and verification is exact 1.17.1. Each host gets a distinct default collection (`pi_memory` or `prime_memory`) with immutable `owner_host`, schema `pi-qdrant-memory-v2`, named `semantic` 1024/Cosine vector, required payload indexes, and defensive `owner_host`/status/secret/expiry/policy filters.
+- Qdrant minimum is 1.17.0 and verification is exact 1.17.1. Each host gets a distinct default collection (`pi_memory` or `prime_memory`) with immutable `owner_host`, schema `pi-qdrant-memory-v2`, named `semantic` 1024/Dot vector. Embeddings are L2-normalized and canonicalized to float32 at the boundary, so Dot preserves Cosine ranking while Qdrant 1.17 readbacks remain hash-stable; payload-only points carry explicit `vector: {}`. Required payload indexes and defensive `owner_host`/status/secret/expiry/policy filters remain mandatory.
 - Configuration is user XDG-only with allowlisted environment overrides; repository contents, origin spoofing, model arguments, endpoints, collection names, credentials, and secret values never select authorization. Capture defaults off and activation requires explicit retention plus egress disclosure/confirmation.
 - Credentials are environment-only (collection-scoped Qdrant session keys, separate admin key for human init, embedding key); model credentials come from the host registry. `local_only` and exact allowlists, residency/data-use labels, cross-provider replay, producer-policy intersections, privacy epochs, tombstones, and retention deadlines are enforced before every egress.
 - Every stored/derived record is immutable unless the contract explicitly names a single-point OCC/CAS view/control update. IDs, hashes, insert-only/update-only modes, read-back verification, strong control writes, fencing tokens, policy epochs, tombstones, and final batch checks provide idempotence without claiming cross-point transactions or exactly-once LLM calls.
@@ -509,7 +509,7 @@ Add fake-fetch tests for health, collection info, retrieve/search/count, methods
 
 - [ ] **Step 2 (4 min): Write red collection/schema tests**
 
-Test named `semantic` 1024/Cosine vectors, payload-only points, all required indexes, immutable owner/schema metadata, separate control ID, owner-independent metadata ID, and Qdrant 1.17 collection initialization/reread behavior.
+Test named `semantic` 1024/Dot vectors with L2-normalized float32 embeddings, explicit `vector: {}` payload-only points, all required indexes, immutable owner/schema metadata, separate control ID, owner-independent metadata ID, and Qdrant 1.17 collection initialization/reread behavior.
 
 - [ ] **Step 3 (4 min): Write red conditional-write tests**
 
@@ -566,7 +566,7 @@ Add `QdrantSessionWriter` with only typed `upsertPoints`/insert-only/update-only
 Create `src/qdrant/schema.ts` with `V2_COLLECTION_METADATA` and all required keyword/integer/datetime/full-text declarations:
 
 ```typescript
-export const V2_COLLECTION_METADATA = { schema: "pi-qdrant-memory-v2", schema_revision: 1, dense_vector: "semantic", embedding_model: "bge-m3", embedding_dimension: 1024, distance: "Cosine" } as const;
+export const V2_COLLECTION_METADATA = { schema: "pi-qdrant-memory-v2", schema_revision: 1, dense_vector: "semantic", embedding_model: "bge-m3", embedding_dimension: 1024, distance: "Dot" } as const; // normalize + float32 at the embedding boundary; payload-only points send vector: {}
 export const REQUIRED_INDEXES = [
   ["record_type", "keyword"], ["owner_host", "keyword"], ["project_id", "keyword"], ["project_identity_kind", "keyword"], ["scope", "keyword"], ["status", "keyword"], ["resolution", "keyword"], ["state_key", "keyword"], ["content_id", "keyword"], ["observation_id", "keyword"], ["session_id", "keyword"], ["turn_id", "keyword"], ["agent_role", "keyword"], ["generation_id", "keyword"], ["job_id", "keyword"], ["category", "keyword"], ["tool_name", "keyword"], ["error_fingerprint", "keyword"], ["secret_scan", "keyword"], ["event_at", "datetime"], ["effective_at", "datetime"], ["created_at", "datetime"], ["lease_expires_at", "datetime"], ["expires_at", "datetime"], ["privacy_epoch", "integer"], ["coordination_policy_epoch", "integer"], ["version", "integer"], ["level", "integer"], ["text", "text"],
 ] as const;

@@ -3,8 +3,9 @@ import { readPolicy, physicalPointIdFor, type QdrantClientOptions, type QdrantRe
 import { V2_COLLECTION_METADATA, REQUIRED_INDEXES, COLLECTION_METADATA_ID, COLLECTION_CONTROL_ID, physicalPointId, controlPayload } from "../../src/qdrant/schema.js";
 import { bindQdrantDestination, coordinationRecordFromPayload, episodeRecordFromPayload, createQdrantCoordinationStore, createQdrantSafeBundle, recordPayload, QdrantContentHashCollisionError } from "../../src/qdrant/write.js";
 import { adminCreateCollection, adminCreatePayloadIndex, adminHealth, adminInsertInitialControlPoint, adminInsertMetadataPoint, adminRetrieve, adminServerInfo, statusCollectionInfo, statusHealth, statusRetrieve } from "../../src/admin/transport.js";
-import { canonicalRecordHash, type ControlRecord, type EpisodeRecord, type TombstoneRecord } from "../../src/domain/records.js";
+import { canonicalRecordHash, type ControlRecord, type EpisodeRecord, type ProcessingPolicyRecord, type TombstoneRecord } from "../../src/domain/records.js";
 import { MAX_SESSION_SEQUENCE } from "../../src/domain/ids.js";
+import { processingPolicyHash, type ProcessingPolicy } from "../../src/domain/policy.js";
 import { coverageId, episodeId, leasePointId, tombstoneId } from "../../src/domain/ids.js";
 import { activatePolicyEpoch, beginForgetBarrier, beginPolicyDrain, createIngestControlReader, QuiescenceProof, readControl, rotateCoordinationPolicy, waitForOldLeasesToQuiesce } from "../../src/coordination/control.js";
 import { claimLease, readLease, releaseLease, renewLease } from "../../src/coordination/leases.js";
@@ -32,7 +33,7 @@ function episode(overrides: Partial<EpisodeRecord> = {}): EpisodeRecord {
     eventAt: "2026-08-10T00:00:00.000Z", modelId: "model-1", embeddingDimension: 1024, originProvider: "provider-1",
     destinationId: "destination-1", status: "active" as const, redactionStatus: "unchanged" as const, secretScan: "passed" as const, text: "safe",
   } satisfies EpisodeRecord;
-  const value = { ...base, ...overrides };
+  const value = { ...base, ...overrides, ...(overrides.vector === undefined ? {} : { vector: overrides.vector.map(Math.fround) }) };
   return { ...value, contentHash: canonicalRecordHash(value) } as EpisodeRecord;
 }
 function control(overrides: Partial<ControlRecord> = {}): ControlRecord { const base = { ownerHost: "pi" as const, schemaRevision: 1 as const, createdAt: "2026-08-10T00:00:00.000Z", privacyEpoch: 0, processingPolicyId: "policy-1", expiresAt: null, recordType: "collection_control" as const, id: COLLECTION_CONTROL_ID, version: 1, activeGeneration: "gen-1", activeBaseGeneration: null, coordinationPolicyEpoch: 2, coordinationPolicyHash: "policy-hash", state: "active" as const, scanCursor: "cursor-old", lastForgetBarrier: null, revokedDestinationIds: [], contentHash: "pending" }; const value = { ...base, ...overrides }; return { ...value, contentHash: canonicalRecordHash(value) } as ControlRecord; }
@@ -48,7 +49,7 @@ function backend(seed: WirePoint[] = [], hooks: BackendHooks = {}): { points: Ma
   const points = new Map<string, WirePoint>(seed.map((point) => [point.id, point]));
   const fetchImpl: typeof fetch = async (input, init = {}) => {
     const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { ids?: string[]; points?: WirePoint[]; update_mode?: string; update_filter?: { must: Array<{ key: string; match?: { value?: unknown }; is_null?: { key: string }; range?: { lte?: string; gt?: string } }> } };
-    if (url.includes("/points/retrieve")) { const ids = body?.ids ?? []; const extra = hooks.extra?.(ids); return json({ result: [...ids.map((id) => points.get(id)).filter((point) => point !== undefined), ...(extra ?? [])], status: "ok" }); }
+    if (new URL(url).pathname.endsWith("/points") && init.method === "POST") { const ids = body?.ids ?? []; const extra = hooks.extra?.(ids); return json({ result: [...ids.map((id) => points.get(id)).filter((point) => point !== undefined), ...(extra ?? [])], status: "ok" }); }
     if (url.includes("/points/scroll")) return json({ result: { points: [], next_page_offset: null }, status: "ok" });
     if (url.includes("/points?") && init.method === "PUT") {
       if (hooks.failUpsert === true) throw new Error("backend upsert failed");
@@ -160,6 +161,13 @@ describe("Qdrant v2 REST capability (safe owner module)", () => {
     expect(fixture.requireSecretScan).toBe("passed");
   });
 
+  it("binds internal episode reads to the expected privacy epoch", async () => {
+    expect(() => readPolicy({ ownerHost: "pi", purpose: "internal", recordTypes: ["episode"], privacyEpoch: -1 })).toThrow(/scope/i);
+    const old = episode({ privacyEpoch: 1, vector: Array.from({ length: 1024 }, () => 0.25) }); const b = backend([{ id: old.id, payload: recordPayload(old), vector: { semantic: [...old.vector!] } }]); const store = storeFor(b);
+    await expect(store.readEpisodes([old.id], 0)).rejects.toThrow(/privacy epoch/i);
+    await expect(store.readEpisodes([old.id], 1)).resolves.toEqual([old]);
+  });
+
   it("applies configured consistency to every read endpoint", async () => {
     const urls: string[] = [];
     const fetchImpl: typeof fetch = async (input) => { urls.push(String(input)); return json({ result: [], status: "ok" }); };
@@ -188,7 +196,7 @@ describe("Qdrant v2 REST capability (safe owner module)", () => {
   it("rejects malformed payload-index schemas and accepts no extra collection vectors", async () => {
     await expect(adminCreatePayloadIndex(qdrantOptions() as never, async () => json({ result: true, status: "ok" }), "Bad-Field!", "keyword")).rejects.toMatchObject({ category: "configuration" });
     await expect(adminCreatePayloadIndex(qdrantOptions() as never, async () => json({ result: true, status: "ok" }), "field", "bogus" as never)).rejects.toMatchObject({ category: "configuration" });
-    const fetchImpl: typeof fetch = async () => json({ result: { config: { params: { vectors: { semantic: { size: 1024, distance: "Cosine" }, extra: { size: 8, distance: "Dot" } } } }, points_count: 0, status: "green" }, status: "ok" });
+    const fetchImpl: typeof fetch = async () => json({ result: { config: { params: { vectors: { semantic: { size: 1024, distance: "Dot" }, extra: { size: 8, distance: "Cosine" } } } }, points_count: 0, status: "green" }, status: "ok" });
     await expect(statusCollectionInfo({ baseUrl: "https://qdrant.example", collection: "pi_memory", ownerHost: "pi", timeoutMs: 1000 }, fetchImpl)).rejects.toMatchObject({ category: "invalid-response" });
   });
 
@@ -239,7 +247,7 @@ describe("Qdrant v2 REST capability (safe owner module)", () => {
     // The control ADVANCES between the drain's read and the CAS evaluation
     // (stale-generation race): the filter then zero-matches and the transition
     // fails closed ("lost the control CAS"), leaving the server state untouched.
-    const noop: typeof fetch = async (input, init = {}) => { const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { points?: WirePoint[]; update_mode?: string; update_filter?: { must: Array<{ key: string; match?: { value?: unknown } }> } }; if (url.includes("/points/retrieve")) { controlReads += 1; if (controlReads === 2) { const before = stored.get(COLLECTION_CONTROL_ID)!; stored.set(COLLECTION_CONTROL_ID, { id: COLLECTION_CONTROL_ID, payload: { ...before.payload, version: 5, state: "draining", content_hash: "5".repeat(64) } }); } const ids = (body as { ids?: string[] }).ids ?? []; return json({ result: ids.map((id) => stored.get(id)).filter((point) => point !== undefined), status: "ok" }); } if (url.includes("/points?") && init.method === "PUT") { const point = body?.points?.[0]; const current = point === undefined ? undefined : stored.get(point.id)?.payload; const must = body?.update_filter?.must ?? []; const matches = must.every((condition) => current?.[condition.key] === condition.match?.value); if (body?.update_mode === "update_only" && !matches) return json({ result: { status: "acknowledged" }, status: "ok" }); if (point !== undefined) stored.set(point.id, { id: point.id, payload: point.payload }); return json({ result: { status: "acknowledged" }, status: "ok" }); } return json({ result: {}, status: "ok" }); };
+    const noop: typeof fetch = async (input, init = {}) => { const url = String(input); const body = init.body === undefined ? undefined : JSON.parse(String(init.body)) as { points?: WirePoint[]; update_mode?: string; update_filter?: { must: Array<{ key: string; match?: { value?: unknown } }> } }; if (new URL(url).pathname.endsWith("/points") && init.method === "POST") { controlReads += 1; if (controlReads === 2) { const before = stored.get(COLLECTION_CONTROL_ID)!; stored.set(COLLECTION_CONTROL_ID, { id: COLLECTION_CONTROL_ID, payload: { ...before.payload, version: 5, state: "draining", content_hash: "5".repeat(64) } }); } const ids = (body as { ids?: string[] }).ids ?? []; return json({ result: ids.map((id) => stored.get(id)).filter((point) => point !== undefined), status: "ok" }); } if (url.includes("/points?") && init.method === "PUT") { const point = body?.points?.[0]; const current = point === undefined ? undefined : stored.get(point.id)?.payload; const must = body?.update_filter?.must ?? []; const matches = must.every((condition) => current?.[condition.key] === condition.match?.value); if (body?.update_mode === "update_only" && !matches) return json({ result: { status: "acknowledged" }, status: "ok" }); if (point !== undefined) stored.set(point.id, { id: point.id, payload: point.payload }); return json({ result: { status: "acknowledged" }, status: "ok" }); } return json({ result: {}, status: "ok" }); };
     vi.stubGlobal("fetch", noop);
     const store = createQdrantCoordinationStore(qdrantOptions());
     await expect(beginPolicyDrain(store, { now: NOW_MS })).rejects.toThrow(/lost the control CAS/i);
@@ -269,7 +277,7 @@ describe("Qdrant v2 REST capability (safe owner module)", () => {
     await adminCreateCollection(options, fetchImpl);
     const createCall = calls.find((call) => call.init.method === "PUT" && !call.url.includes("/index"));
     const createBody = JSON.parse(String(createCall?.init.body)) as { vectors: { semantic: { size: number; distance: string } } };
-    expect(createBody.vectors.semantic).toEqual({ size: 1024, distance: "Cosine" });
+    expect(createBody.vectors.semantic).toEqual({ size: 1024, distance: "Dot" });
   });
 
   it("creates payload-index contracts under the admin key", async () => {
@@ -316,10 +324,10 @@ describe("Qdrant v2 REST capability (safe owner module)", () => {
 
   it("exact authoritative reread cardinality: ambiguous control/lease CAS responses fail closed", async () => {
     const controlPayload2 = controlPayload(control());
-    const ambiguous: typeof fetch = async (input) => { if (String(input).includes("/points/retrieve")) return json({ result: [{ id: COLLECTION_CONTROL_ID, payload: controlPayload2 }, { id: "00000000-0000-4000-8000-000000000099", payload: controlPayload2 }], status: "ok" }); return json({ result: {}, status: "ok" }); };
+    const ambiguous: typeof fetch = async (input) => { if (new URL(String(input)).pathname.endsWith("/points")) return json({ result: [{ id: COLLECTION_CONTROL_ID, payload: controlPayload2 }, { id: "00000000-0000-4000-8000-000000000099", payload: controlPayload2 }], status: "ok" }); return json({ result: {}, status: "ok" }); };
     vi.stubGlobal("fetch", ambiguous);
     await expect(beginPolicyDrain(createQdrantCoordinationStore(qdrantOptions()), { now: NOW_MS })).rejects.toThrow(/ambiguous/i);
-    const leaseAmbiguous: typeof fetch = async (input) => { if (String(input).includes("/points/retrieve")) return json({ result: [{ id: leasePointId("job-1"), payload: { owner_host: "pi", record_type: "lease" } }, { id: leasePointId("job-1"), payload: { owner_host: "pi", record_type: "lease" } }], status: "ok" }); return json({ result: {}, status: "ok" }); };
+    const leaseAmbiguous: typeof fetch = async (input) => { if (new URL(String(input)).pathname.endsWith("/points")) return json({ result: [{ id: leasePointId("job-1"), payload: { owner_host: "pi", record_type: "lease" } }, { id: leasePointId("job-1"), payload: { owner_host: "pi", record_type: "lease" } }], status: "ok" }); return json({ result: {}, status: "ok" }); };
     vi.stubGlobal("fetch", leaseAmbiguous);
     await expect(readLease(createQdrantCoordinationStore(qdrantOptions()), "job-1")).resolves.toBeNull();
   });
@@ -376,11 +384,40 @@ describe("Qdrant v2 REST capability (safe owner module)", () => {
 
   it("does not send a made-up retrieve filter and rejects missing response ownership", async () => {
     const bodies: Array<{ filter?: unknown; ids?: string[] }> = [];
-    const fetchImpl: typeof fetch = async (input, init = {}) => { if (String(input).includes("/points/retrieve")) { bodies.push(JSON.parse(String(init.body)) as { filter?: unknown; ids?: string[] }); return json({ result: [{ id: COLLECTION_METADATA_ID, payload: { record_type: "collection_metadata", status: "active", secret_scan: "passed" } }], status: "ok" }); } return json({ result: {}, status: "ok" }); };
+    const fetchImpl: typeof fetch = async (input, init = {}) => { if (new URL(String(input)).pathname.endsWith("/points")) { bodies.push(JSON.parse(String(init.body)) as { filter?: unknown; ids?: string[] }); return json({ result: [{ id: COLLECTION_METADATA_ID, payload: { record_type: "collection_metadata", status: "active", secret_scan: "passed" } }], status: "ok" }); } return json({ result: {}, status: "ok" }); };
     await expect(statusRetrieve({ baseUrl: "https://qdrant.example", collection: "pi_memory", ownerHost: "pi", apiKey: "k", timeoutMs: 1000 }, fetchImpl, [COLLECTION_METADATA_ID], readPolicy({ ownerHost: "pi", purpose: "metadata", recordTypes: ["collection_metadata"] }))).rejects.toMatchObject({ category: "invalid-response" });
     const sent = bodies[0];
     expect(sent?.ids).toEqual([COLLECTION_METADATA_ID]);
     expect(sent?.filter).toBeUndefined();
+  });
+
+  it("uses Qdrant 1.17 POST /points directly for by-ID reads", async () => {
+    const b = backend([{ id: COLLECTION_CONTROL_ID, payload: controlPayload(control()) }]);
+    const urls: string[] = [];
+    const fetchImpl: typeof fetch = async (input, init = {}) => {
+      const url = new URL(String(input)); urls.push(url.pathname);
+      if (url.pathname.endsWith("/points") && init.method === "POST") return json({ result: [], status: "ok" });
+      return b.fetchImpl(input, init);
+    };
+    vi.stubGlobal("fetch", fetchImpl);
+    const store = createQdrantCoordinationStore(qdrantOptions());
+    await expect(store.readJob("00000000-0000-5000-8000-0000000000ff")).resolves.toBeNull();
+    expect(urls.filter(path => path.endsWith("/points"))).toHaveLength(1);
+    expect(urls.some(path => path.endsWith("/points/retrieve"))).toBe(false);
+  });
+
+  it("writes payload-only coordination points with an explicit empty named-vector map", async () => {
+    // Qdrant 1.17 named-vector collections require every point to carry the
+    // vector field; payload-only control/job/lease points send "vector": {}.
+    const sent: WirePoint[] = [];
+    const b = backend([], { onUpsert: points => sent.push(...points) });
+    const store = storeFor(b);
+    const job = await createJob(store, jobInput());
+    const wire = sent.find(point => point.id === job.id);
+    expect(wire).toBeDefined();
+    expect(wire!.vector).toEqual({});
+    // The empty map survives readback as a payload-only point (no semantic vector).
+    await expect(store.readJob(job.id)).resolves.toMatchObject({ id: job.id, extractorRevision: EXTRACTOR });
   });
 
   it("uses defensive read filters and expiry fail-closed, and maps deterministic physical point IDs", async () => {
@@ -403,6 +440,22 @@ describe("Qdrant v2 REST capability (safe owner module)", () => {
     await expect(store2.readEpisodes([finalExpiredEp.id])).rejects.toThrow(/expired/i);
     expect(physicalPointIdFor("episode", "session-1")).toBe(physicalPointId("episode", "session-1"));
     expect(physicalPointIdFor("episode", "00000000-0000-5000-8000-000000000001")).toBe("00000000-0000-5000-8000-000000000001");
+  });
+
+  it("reads exact producer policies in one bounded batch and discovers episode IDs without vectors", async () => {
+    const basePolicy: ProcessingPolicy = { id: "pending", ownerHost: OWNER, destinationIds: { qdrant: "qdrant:pi", embedding: "embedding:local", llm: "llm:local" }, originProvider: "provider-1", allowCrossProviderReplay: false, expiresAt: null, residency: "local", dataUse: "memory", policyRevision: "capture-lifecycle-v1" };
+    const policy = { ...basePolicy, id: processingPolicyHash(basePolicy) } as ProcessingPolicy;
+    const pending: ProcessingPolicyRecord = { recordType: "processing_policy", id: policy.id, ownerHost: OWNER, schemaRevision: 1, createdAt: NOW, privacyEpoch: 0, processingPolicyId: policy.id, expiresAt: null, policy, canonicalHash: policy.id, contentHash: "pending" };
+    const policyRecord = { ...pending, contentHash: canonicalRecordHash(pending) } as ProcessingPolicyRecord;
+    const ep = episode({ processingPolicyId: policy.id });
+    const b = backend([{ id: physicalPointId("processing_policy", policy.id), payload: recordPayload(policyRecord) as Record<string, unknown> }]);
+    const fetchImpl: typeof fetch = async (input, init = {}) => {
+      if (String(input).includes("/points/scroll")) return json({ result: { points: [{ id: ep.id, payload: recordPayload(ep) }], next_page_offset: null }, status: "ok" });
+      return b.fetchImpl(input, init);
+    };
+    vi.stubGlobal("fetch", fetchImpl); const store = createQdrantCoordinationStore(qdrantOptions());
+    await expect(store.readProcessingPolicies([policy.id])).resolves.toEqual([policyRecord]);
+    await expect(store.scrollEpisodeIds()).resolves.toEqual({ episodeIds: [ep.id] });
   });
 
   it("rejects arbitrary CAS patches and preserves full control payload on update-only", async () => {
@@ -494,7 +547,7 @@ describe("Qdrant v2 REST capability (safe owner module)", () => {
     vi.stubGlobal("fetch", b.fetchImpl);
     const bundle = createQdrantSafeBundle({ options: qdrantOptions(), destination: qdrantDestination, egressMode: "allowlist", coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1 });
     const bound = bindQdrantDestination(bundle.qdrant, qdrantDestination);
-    const vectorA = Array.from({ length: 1024 }, (_, index) => (index % 7) / 10);
+    const vectorA = Array.from({ length: 1024 }, (_, index) => Math.fround((index % 7) / 10));
     const committed = { ...episode(), vector: vectorA, contentHash: "pending" } as EpisodeRecord;
     const finalCommitted = { ...committed, contentHash: canonicalRecordHash(committed) } as EpisodeRecord;
     b.points.set(finalCommitted.id, { id: finalCommitted.id, payload: recordPayload(finalCommitted) as Record<string, unknown>, vector: { semantic: [...vectorA] } });
@@ -508,7 +561,7 @@ describe("Qdrant v2 REST capability (safe owner module)", () => {
     vi.stubGlobal("fetch", b.fetchImpl);
     const bundle = createQdrantSafeBundle({ options: qdrantOptions(), destination: qdrantDestination, egressMode: "allowlist", coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1 });
     const bound = bindQdrantDestination(bundle.qdrant, qdrantDestination);
-    const vectorA = Array.from({ length: 1024 }, (_, index) => (index % 7) / 10);
+    const vectorA = Array.from({ length: 1024 }, (_, index) => Math.fround((index % 7) / 10));
     const committed = { ...episode(), vector: vectorA, contentHash: "pending" } as EpisodeRecord;
     const finalCommitted = { ...committed, contentHash: canonicalRecordHash(committed) } as EpisodeRecord;
     const { vector: _v, ...noVector } = finalCommitted as EpisodeRecord;

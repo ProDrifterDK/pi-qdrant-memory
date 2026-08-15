@@ -1,3 +1,4 @@
+import { resolveAgentMarker, type AgentMarker } from "./capture/episode.js";
 import type { CollectionMetadataContract, HostId } from "./types.js";
 
 export type HostDetectionResult =
@@ -72,6 +73,20 @@ export function resolvePrimeRlmDepth(
 }
 
 
+
+/**
+ * Resolve the exact host lifecycle marker through the hardened capture parser.
+ * Invalid or contradictory metadata is always represented as an ineligible
+ * child, so callers cannot accidentally turn ambiguity into root authority.
+ */
+export function resolveHostAgentMarker(
+  host: HostId,
+  header: unknown,
+  env: Record<string, string | undefined>,
+): AgentMarker {
+  return resolveAgentMarker({ host, header, env });
+}
+
 /** Fail-closed compatibility hook used before a host accepts a destination. */
 export function validateCollectionMetadata(
   expectedHost: HostId,
@@ -81,7 +96,7 @@ export function validateCollectionMetadata(
 ): asserts metadata is CollectionMetadataContract {
   if (metadata.ownerHost !== expectedHost) throw new Error("Collection owner host mismatch");
   if (metadata.schema !== "pi-qdrant-memory-v2" || metadata.schemaRevision !== 1) throw new Error("Collection schema mismatch");
-  if (metadata.dimension !== expectedDimension || metadata.distance !== "Cosine") throw new Error("Collection vector metadata mismatch");
+  if (metadata.dimension !== expectedDimension || metadata.distance !== "Dot") throw new Error("Collection vector metadata mismatch");
   if (expectedModel !== undefined && metadata.model !== expectedModel) throw new Error("Collection model mismatch");
 }
 

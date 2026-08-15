@@ -17,6 +17,10 @@ export interface DocumentEmbeddingClient {
         signal?: AbortSignal;
     }): Promise<readonly number[]>;
 }
+/** Qdrant Dot collections preserve float32 components byte-for-byte. Normalize
+ * once at the embedding boundary so Dot scores retain Cosine semantics while
+ * vector-bound record hashes survive real Qdrant 1.17.1 round trips. */
+export declare function canonicalizeEmbeddingVector(value: unknown, dimension: number): number[];
 export declare class EmbeddingsClient implements DocumentEmbeddingClient {
     #private;
     readonly endpoint: string;

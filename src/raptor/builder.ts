@@ -9,14 +9,14 @@ import { canonicalRecordHash, parseMemoryRecord, type ControlRecord, type Raptor
 import { ProductionCoordinationStore, LeaseAuthority } from "../qdrant/write.js";
 import { redactAndScan, type SecretScanner } from "../security/redaction.js";
 import type { HostId } from "../types.js";
-import { buildClusterDag, type ClusterLeaf, type ClusterNode } from "./cluster.js";
+import { buildClusterDagOffThread, type ClusterDag, type ClusterLeaf, type ClusterNode } from "./cluster.js";
 import { buildManifest, type RaptorManifest } from "./manifest.js";
 import { publicationIdentity } from "./publication.js";
 import { seedWords } from "./random.js";
 
 export const RAPTOR_ALGORITHM_REVISION = "raptor-umap140-diag-gmm-v1";
 export const RAPTOR_PROMPT_REVISION = "raptor-summary-v2";
-const MAX_LEAVES = 1024;
+const MAX_LEAVES = 65_536;
 const MAX_SUMMARY_CHARS = 16_000;
 
 function ownData<T>(value: object, key: string): T {
@@ -47,7 +47,7 @@ export interface RaptorBuildInput {
 }
 export type RaptorBuildResult =
   | { readonly state: "completed"; readonly generationId: string; readonly manifest: RaptorManifest; readonly summaries: readonly RaptorSummaryRecord[]; readonly reused: number }
-  | { readonly state: "pending"; readonly reason: "invalid_input" | "incompatible_policy" | "authority_changed" | "summary_failed" | "scanner" | "embedding_failed" | "write_failed" | "publication_lost" | "cancelled" }
+  | { readonly state: "pending"; readonly reason: "invalid_input" | "incompatible_policy" | "authority_changed" | "summary_failed" | "scanner" | "embedding_failed" | "write_failed" | "publication_lost" | "cancelled" | "clustering_failed" }
   | { readonly state: "empty"; readonly reason: "no_eligible_leaves" };
 
 function iso(value: unknown): string { if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value) || new Date(Date.parse(value)).toISOString() !== value) throw new TypeError("RAPTOR time is invalid"); return value; }
@@ -84,7 +84,11 @@ export function groupRaptorLeavesByPolicy(leaves: readonly RaptorLeafInput[], wo
   }
   return Object.freeze({ groups: Object.freeze([...grouped.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, values]) => { const policy = intersectPolicies(values.map((leaf) => leaf.policy), worker); if (policy === null || policy.destinationIds.llm === undefined) throw new TypeError("RAPTOR group intersection changed"); return Object.freeze({ policy: Object.freeze(policy), leaves: Object.freeze([...values].sort((a, b) => a.id.localeCompare(b.id))) }); })), pendingIds: Object.freeze(pending.sort()) });
 }
-function exactAllSourceIntersection(leaves: readonly RaptorLeafInput[], worker: ProcessingPolicy): ProcessingPolicy | null { return intersectPolicies(leaves.map((leaf) => leaf.policy), worker); }
+function exactAllSourceIntersection(leaves: readonly RaptorLeafInput[], worker: ProcessingPolicy): ProcessingPolicy | null {
+  const policies = new Map<string, ProcessingPolicy>();
+  for (const leaf of leaves) { const prior = policies.get(leaf.policy.id); if (prior !== undefined && !samePolicy(prior, leaf.policy)) return null; policies.set(leaf.policy.id, leaf.policy); }
+  return intersectPolicies([...policies.values()].sort((left, right) => left.id.localeCompare(right.id)), worker);
+}
 function strictSummary(value: string): string {
   let parsed: unknown; try { parsed = JSON.parse(value) as unknown; } catch { throw new TypeError("RAPTOR summary is not JSON"); }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed) || Object.getPrototypeOf(parsed) !== Object.prototype || Object.keys(parsed).length !== 1 || !Object.prototype.hasOwnProperty.call(parsed, "summary")) throw new TypeError("RAPTOR summary envelope is invalid");
@@ -141,14 +145,21 @@ export async function buildRaptorGeneration(store: ProductionCoordinationStore, 
     // or partial build stays unreachable, while a later lease can retry the
     // same logical generation without colliding on prior job/fence provenance.
     const generationId = sha256Hex(canonicalStringify({ domain: "raptor-generation-attempt-v1", generationCoreId, jobId: authority.jobId, fencingToken: authority.fencingToken }));
-    const clusteringLeaves = leaves.map((leaf) => Object.freeze({ ...leaf, tokens: Math.max(leaf.tokens, Math.ceil(Buffer.byteLength(leaf.text, "utf8") / 4) + 32) }));
-    const dag = buildClusterDag(clusteringLeaves as readonly ClusterLeaf[], { seed: seedText, maxLevels: options.maxLevels, tokenBudget: options.summaryInputTokens, umapDimensions: options.umapDimensions, globalNeighbors: Math.max(2, Math.min(leaves.length - 1, Math.ceil(Math.sqrt(leaves.length)))), localNeighbors: options.localNeighbors, gmmMaxClusters: options.gmmMaxClusters, membershipThreshold: options.membershipThreshold });
+    // Summary records retain direct member IDs capped at the schema bound.
+    // Charge every leaf at least 1/1024 of the configured prompt budget so no
+    // learned or fallback cluster can cover more than 1024 leaves.
+    const membershipTokenFloor = Math.max(1, Math.ceil(options.summaryInputTokens / 1024));
+    const clusteringLeaves = leaves.map((leaf) => Object.freeze({ ...leaf, tokens: Math.max(leaf.tokens, Math.ceil(Buffer.byteLength(leaf.text, "utf8") / 4) + 32, membershipTokenFloor) }));
+    let dag: ClusterDag;
+    try {
+      dag = await buildClusterDagOffThread(clusteringLeaves as readonly ClusterLeaf[], { seed: seedText, maxLevels: options.maxLevels, tokenBudget: options.summaryInputTokens, umapDimensions: options.umapDimensions, globalNeighbors: Math.max(2, Math.min(leaves.length - 1, Math.ceil(Math.sqrt(leaves.length)))), localNeighbors: options.localNeighbors, gmmMaxClusters: options.gmmMaxClusters, membershipThreshold: options.membershipThreshold }, { ...(signal === undefined ? {} : { signal }), timeoutMs: 120_000 });
+    } catch { return { state: "pending", reason: signal?.aborted ? "cancelled" : "clustering_failed" }; }
     const nodeText = new Map(leaves.map((leaf) => [leaf.id, leaf.text])); const childrenByParent = new Map<string, string[]>(); for (const edge of dag.edges) { const children = childrenByParent.get(edge.parentId) ?? []; children.push(edge.childId); childrenByParent.set(edge.parentId, children); } for (const children of childrenByParent.values()) children.sort();
     const summaries: RaptorSummaryRecord[] = []; let reused = 0;
     const reuse = new Map<string, RaptorSummaryRecord>();
     for (const untrusted of (reuseCandidates === undefined ? [] : denseArray(reuseCandidates, "RAPTOR reuse candidates", MAX_LEAVES))) { try {
       const candidate = parseMemoryRecord(untrusted, { ownerHost: host, vectorDimension: 1024 }) as RaptorSummaryRecord;
-      if (candidate.recordType !== "raptor_summary" || candidate.vector === undefined || candidate.vector.length !== 1024 || candidate.contentHash !== canonicalRecordHash(candidate) || candidate.ownerHost !== host || candidate.processingPolicyId !== policy.id || candidate.expiresAt !== policy.expiresAt || candidate.summary.length === 0) continue;
+      if (candidate.recordType !== "raptor_summary" || candidate.vector === undefined || candidate.vector.length !== 1024 || candidate.contentHash !== canonicalRecordHash(candidate) || candidate.ownerHost !== host || candidate.generationId !== initialControl.activeGeneration || candidate.privacyEpoch !== authority.privacyEpoch || candidate.coordinationPolicyHash !== authority.coordinationPolicyHash || candidate.coordinationPolicyEpoch !== authority.coordinationPolicyEpoch || candidate.summary.length === 0) continue;
       const rescanned = redactAndScan({ text: candidate.summary, maxChars: MAX_SUMMARY_CHARS, homeDir, ...(scan === undefined ? {} : { scan }) }); if (rescanned.dropped || rescanned.text !== candidate.summary) continue;
       const key = reusableKey({ memberIds: candidate.memberIds ?? [], promptRevision: candidate.promptRevision, modelId: candidate.modelId, algorithm: candidate.algorithm }); if (candidate.algorithmParameters !== null && typeof candidate.algorithmParameters === "object" && (candidate.algorithmParameters as Record<string, unknown>).reuseKey === key) reuse.set(key, candidate);
     } catch { /* invalid reuse is ignored, never authoritative */ } }
@@ -177,7 +188,7 @@ export async function buildRaptorGeneration(store: ProductionCoordinationStore, 
     const overallRange = sourceRange(leaves, evidenceIds); const manifestNodes: RaptorSummaryRecord[] = [];
     for (const chunk of manifest.chunks) { const ids = [...chunk.memberIds]; const key = reusableKey({ memberIds: ids, promptRevision: RAPTOR_PROMPT_REVISION, modelId, algorithm: "raptor-manifest-chunk-v1" }); manifestNodes.push(record({ recordType: "raptor_summary", id: sha256Hex(canonicalStringify({ domain: "raptor-manifest-chunk-point-v1", generationId, chunkId: chunk.id })), ownerHost: host, schemaRevision: 1, createdAt: overallRange.temporalTo, privacyEpoch: authority.privacyEpoch, processingPolicyId: policy.id, expiresAt: policy.expiresAt, coordinationPolicyHash: authority.coordinationPolicyHash, coordinationPolicyEpoch: authority.coordinationPolicyEpoch, generationId, clusterId: chunk.id, membershipHash: recordMembershipHash(ids), level: 0, memberIds: ids, manifestHash: manifest.root.merkleRoot, summary: "[RAPTOR manifest chunk]", modelId, embeddingDimension: 1024, promptRevision: RAPTOR_PROMPT_REVISION, algorithm: "raptor-manifest-chunk-v1", seed, jobId: authority.jobId, fencingToken: authority.fencingToken, temporalFrom: overallRange.temporalFrom, temporalTo: overallRange.temporalTo, coveredProjects: overallRange.projects, algorithmParameters: Object.freeze({ kind: "manifest-chunk", index: chunk.index, contentHash: chunk.contentHash, reuseKey: key }) })); }
     const chunkPointIds = manifestNodes.map((node) => node.id); const rootKey = reusableKey({ memberIds: chunkPointIds, promptRevision: RAPTOR_PROMPT_REVISION, modelId, algorithm: "raptor-manifest-root-v1" });
-    manifestNodes.push(record({ recordType: "raptor_summary", id: generationId, ownerHost: host, schemaRevision: 1, createdAt: overallRange.temporalTo, privacyEpoch: authority.privacyEpoch, processingPolicyId: policy.id, expiresAt: policy.expiresAt, coordinationPolicyHash: authority.coordinationPolicyHash, coordinationPolicyEpoch: authority.coordinationPolicyEpoch, generationId, clusterId: manifest.root.id, membershipHash: recordMembershipHash(chunkPointIds), level: options.maxLevels + 1, memberIds: chunkPointIds, manifestHash: manifest.root.merkleRoot, summary: "[RAPTOR manifest root]", modelId, embeddingDimension: 1024, promptRevision: RAPTOR_PROMPT_REVISION, algorithm: "raptor-manifest-root-v1", seed, jobId: authority.jobId, fencingToken: authority.fencingToken, temporalFrom: overallRange.temporalFrom, temporalTo: overallRange.temporalTo, coveredProjects: overallRange.projects, algorithmParameters: Object.freeze({ kind: "manifest-root", membershipHash: manifest.root.membershipHash, dagRoots: dag.roots, reuseKey: rootKey }) }));
+    manifestNodes.push(record({ recordType: "raptor_summary", id: generationId, ownerHost: host, schemaRevision: 1, createdAt: overallRange.temporalTo, privacyEpoch: authority.privacyEpoch, processingPolicyId: policy.id, expiresAt: policy.expiresAt, coordinationPolicyHash: authority.coordinationPolicyHash, coordinationPolicyEpoch: authority.coordinationPolicyEpoch, generationId, clusterId: manifest.root.id, membershipHash: recordMembershipHash(chunkPointIds), level: options.maxLevels + 1, memberIds: chunkPointIds, manifestHash: manifest.root.merkleRoot, summary: "[RAPTOR manifest root]", modelId, embeddingDimension: 1024, promptRevision: RAPTOR_PROMPT_REVISION, algorithm: "raptor-manifest-root-v1", seed, jobId: authority.jobId, fencingToken: authority.fencingToken, temporalFrom: overallRange.temporalFrom, temporalTo: overallRange.temporalTo, coveredProjects: overallRange.projects, algorithmParameters: Object.freeze({ kind: "manifest-root", membershipHash: manifest.root.membershipHash, dagRootsHash: sha256Hex(canonicalStringify(dag.roots)), dagRootCount: dag.roots.length, reuseKey: rootKey }) }));
     try { for (const node of manifestNodes) summaries.push(await store.writeRaptorSummary(authority, { record: node, destinationIds: destinations, evidenceIds })); } catch { return { state: "pending", reason: "write_failed" }; }
     const finalBarrier = await store.readRaptorBarrier(authority, { destinationIds: destinations, evidenceIds }); if (finalBarrier !== firstBarrier) return { state: "pending", reason: "authority_changed" };
     if (!await store.publishRaptorGeneration(authority, { expected: initialControl, generationId, destinationIds: destinations, evidenceIds })) return { state: "pending", reason: "publication_lost" };

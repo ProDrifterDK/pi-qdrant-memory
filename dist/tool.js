@@ -5,7 +5,7 @@ export const MEMORY_SEARCH_MODES = ["all", "current", "historical", "episodes", 
 export const memorySearchParameters = Type.Object({
     query: Type.String({ minLength: 1, maxLength: 4000 }),
     limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
-    mode: Type.Optional(Type.Union(MEMORY_SEARCH_MODES.map((mode) => Type.Literal(mode)))),
+    mode: Type.Optional(Type.Union([Type.Literal("all"), Type.Literal("current"), Type.Literal("historical"), Type.Literal("episodes"), Type.Literal("curated"), Type.Literal("raptor")])),
     after: Type.Optional(Type.String()),
     before: Type.Optional(Type.String()),
 }, { additionalProperties: false });

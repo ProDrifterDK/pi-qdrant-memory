@@ -6,7 +6,7 @@ export declare const V2_COLLECTION_METADATA: {
     readonly dense_vector: "semantic";
     readonly embedding_model: "bge-m3";
     readonly embedding_dimension: 1024;
-    readonly distance: "Cosine";
+    readonly distance: "Dot";
 };
 export declare const V2_CONTRACT_HASH: string;
 export type PayloadIndexSchema = "keyword" | "integer" | "datetime" | "text";
@@ -25,7 +25,7 @@ export interface CollectionMetadataPayload {
     dense_vector: typeof V2_COLLECTION_METADATA.dense_vector;
     embedding_model: typeof V2_COLLECTION_METADATA.embedding_model;
     embedding_dimension: 1024;
-    distance: "Cosine";
+    distance: "Dot";
     contract_hash: string;
     status: "active";
     secret_scan: "passed";
@@ -34,12 +34,14 @@ export declare function collectionMetadataPayload(ownerHost: HostId, contractHas
 export declare function collectionMetadataPoint(ownerHost: HostId, contractHash?: string): {
     id: string;
     payload: CollectionMetadataPayload;
+    vector: Record<string, never>;
 };
 /** Control payload is intentionally point-only; no Qdrant collection metadata bag is used. */
 export declare function controlPayload(control: ControlRecord): Record<string, unknown>;
 export declare function collectionControlPoint(control: ControlRecord): {
     id: string;
     payload: Record<string, unknown>;
+    vector: Record<string, never>;
 };
 /** Strict bootstrap control validation shared by init, admin insertion and write helper. */
 export declare function bootstrapControlHash(control: ControlRecord): string;
@@ -52,6 +54,6 @@ export declare function isCollectionMetadataPayload(value: unknown, ownerHost: H
 export declare function collectionVectors(): {
     semantic: {
         size: 1024;
-        distance: "Cosine";
+        distance: "Dot";
     };
 };

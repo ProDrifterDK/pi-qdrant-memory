@@ -176,7 +176,7 @@ export function jobId(ownerOrInput, membership, policyHash, extractorRevision, c
     requireEpoch("jobId.coordinationPolicyEpoch", input.coordinationPolicyEpoch);
     requireId("jobId.policyIntersectionId", input.policyIntersectionId);
     requireEpoch("jobId.privacyEpoch", input.privacyEpoch);
-    if (!Array.isArray(input.membership) || input.membership.length === 0 || input.membership.length > MAX_MEMBERS)
+    if (!Array.isArray(input.membership) || input.membership.length === 0 || input.membership.length > 65_536)
         throw new TypeError("jobId.membership must contain bounded IDs");
     input.membership.forEach((id, index) => requireId(`jobId.membership[${index}]`, id));
     return deterministicUuid(`${SCHEMA_NAMESPACE}:job`, input.ownerHost, [...input.membership], input.policyHash, input.extractorRevision, input.coordinationPolicyEpoch, input.policyIntersectionId, input.privacyEpoch);
