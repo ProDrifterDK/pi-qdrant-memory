@@ -1297,7 +1297,11 @@ export class ProductionCoordinationStore {
     const tombstones = [];
     for (let index = 0; index < targetIds.length; index += 1024) tombstones.push(...await this.readTombstones(targetIds.slice(index, index + 1024)));
     if (tombstones.length !== 0) throw new TypeError("RAPTOR evidence is tombstoned");
-    const digest = canonicalStringify({ control, job, claim, destinationIds: [...destinationIds].sort(), targetIds: [...targetIds], tombstones });
+    // Lease renewal changes only version/expiry/contentHash. Keep those
+    // liveness fields out of the semantic barrier while the exact live claim
+    // remains capability-checked above on every read.
+    const stableClaim = { id: claim.id, jobId: claim.jobId, ownerHost: claim.ownerHost, schemaRevision: claim.schemaRevision, createdAt: claim.createdAt, privacyEpoch: claim.privacyEpoch, processingPolicyId: claim.processingPolicyId, recordType: claim.recordType, ownerId: claim.ownerId, fencingToken: claim.fencingToken, state: claim.state, acceptedProposalId: claim.acceptedProposalId, acceptedManifestHash: claim.acceptedManifestHash, coordinationPolicyHash: claim.coordinationPolicyHash, coordinationPolicyEpoch: claim.coordinationPolicyEpoch };
+    const digest = canonicalStringify({ control, job, claim: stableClaim, destinationIds: [...destinationIds].sort(), targetIds: [...targetIds], tombstones });
     return { job, control, claim, digest };
   }
 

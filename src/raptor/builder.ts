@@ -111,14 +111,41 @@ function sourceRange(leaves: readonly RaptorLeafInput[], ids: readonly string[])
 function destinationIds(policy: ProcessingPolicy): readonly string[] { if (policy.destinationIds.llm === undefined) throw new TypeError("RAPTOR LLM destination is absent"); return Object.freeze([policy.destinationIds.qdrant, policy.destinationIds.embedding, policy.destinationIds.llm]); }
 function isGlobalDestination(value: string): boolean { return !/(?:loopback|localhost|127\.0\.0\.1|node[-_:])/iu.test(value); }
 function samePolicy(left: ProcessingPolicy, right: ProcessingPolicy): boolean { return canonicalStringify(left) === canonicalStringify(right); }
+type ActiveLease = { current: LeaseAuthority };
+type LeaseHeartbeatResult<T> = { readonly ok: true; readonly value: T } | { readonly ok: false };
+async function renewActiveLease(store: ProductionCoordinationStore, lease: ActiveLease): Promise<boolean> {
+  const next = await store.renewLease(lease.current).catch(() => null);
+  if (next === null) return false;
+  lease.current = next; return true;
+}
+async function withLeaseHeartbeat<T>(store: ProductionCoordinationStore, lease: ActiveLease, operation: () => Promise<T>): Promise<LeaseHeartbeatResult<T>> {
+  if (!await renewActiveLease(store, lease)) return { ok: false };
+  const intervalMs = Math.max(1, Math.floor(lease.current.leaseMs / 3));
+  let stopped = false; let alive = true; let timer: ReturnType<typeof setTimeout> | undefined; let wake: (() => void) | undefined;
+  const heartbeat = (async (): Promise<void> => {
+    while (!stopped) {
+      await new Promise<void>((resolve) => { wake = resolve; timer = setTimeout(resolve, intervalMs); });
+      timer = undefined; wake = undefined;
+      if (stopped) break;
+      if (!await renewActiveLease(store, lease)) { alive = false; break; }
+    }
+  })();
+  let value!: T; let failure: unknown; let failed = false;
+  try { value = await operation(); } catch (error) { failed = true; failure = error; }
+  finally { stopped = true; if (timer !== undefined) clearTimeout(timer); wake?.(); await heartbeat; }
+  if (!alive) return { ok: false };
+  if (failed) throw failure;
+  return { ok: true, value };
+}
 
 /** Root-only deterministic generation build. All writes/publication are nominal store+lease operations. */
 export async function buildRaptorGeneration(store: ProductionCoordinationStore, authority: LeaseAuthority, input: RaptorBuildInput): Promise<RaptorBuildResult> {
   try {
     if (!ProductionCoordinationStore.isValid(store) || !LeaseAuthority.isValid(authority) || !authority.matchesStore(store)) return { state: "pending", reason: "invalid_input" };
+    const lease = { current: authority };
     if (typeof input !== "object" || input === null) return { state: "pending", reason: "invalid_input" }; plainObject(input, "RAPTOR build input");
     const host = ownData<HostId>(input, "host"); const embedding = ownData<BoundEmbeddingDestination>(input, "embedding");
-    if ((host !== "pi" && host !== "prime") || authority.ownerHost !== host || !BoundEmbeddingDestinationClass.isValid(embedding)) return { state: "pending", reason: "invalid_input" };
+    if ((host !== "pi" && host !== "prime") || lease.current.ownerHost !== host || !BoundEmbeddingDestinationClass.isValid(embedding)) return { state: "pending", reason: "invalid_input" };
     const leavesInput = ownData<readonly RaptorLeafInput[]>(input, "leaves"); const workerPolicyInput = ownData<ProcessingPolicy>(input, "workerPolicy"); const llm = ownData<BoundLlmDestination>(input, "llm"); const modelIdInput = ownData<string>(input, "modelId"); const homeDirInput = ownData<string>(input, "homeDir"); const seedInput = ownData<string | number>(input, "seed");
     const options = Object.freeze({ maxLevels: ownData<number>(input, "maxLevels"), summaryInputTokens: ownData<number>(input, "summaryInputTokens"), umapDimensions: ownData<number>(input, "umapDimensions"), localNeighbors: ownData<number>(input, "localNeighbors"), gmmMaxClusters: ownData<number>(input, "gmmMaxClusters"), membershipThreshold: ownData<number>(input, "membershipThreshold") });
     const global = ownOptional<boolean>(input, "global"); const scan = ownOptional<SecretScanner>(input, "scan"); const signal = ownOptional<AbortSignal>(input, "signal"); const reuseCandidates = ownOptional<readonly RaptorSummaryRecord[]>(input, "reuseCandidates");
@@ -127,24 +154,24 @@ export async function buildRaptorGeneration(store: ProductionCoordinationStore, 
     const leaves = leafSnapshots(leavesInput, host); if (leaves.length === 0) return { state: "empty", reason: "no_eligible_leaves" };
     if (leaves.length !== new Set(leaves.map((leaf) => leaf.id)).size || canonicalStringify(leaves.map((leaf) => leaf.id)) !== canonicalStringify([...leaves.map((leaf) => leaf.id)].sort())) return { state: "pending", reason: "invalid_input" };
     const workerPolicy = policySnapshot(workerPolicyInput); const policy = exactAllSourceIntersection(leaves, workerPolicy);
-    if (policy === null || policy.destinationIds.llm === undefined || policy.id !== authority.processingPolicyId || policy.ownerHost !== host) return { state: "pending", reason: "incompatible_policy" };
+    if (policy === null || policy.destinationIds.llm === undefined || policy.id !== lease.current.processingPolicyId || policy.ownerHost !== host) return { state: "pending", reason: "incompatible_policy" };
     if (typeof llm !== "object" || llm === null || nodeTypes.isProxy(llm)) return { state: "pending", reason: "invalid_input" };
     const rawLlmDestination = ownData<BoundLlmDestination["destination"]>(llm, "destination"); const llmComplete = ownData<BoundLlmDestination["complete"]>(llm, "complete");
     if (typeof rawLlmDestination !== "object" || rawLlmDestination === null) return { state: "pending", reason: "invalid_input" }; plainObject(rawLlmDestination, "RAPTOR LLM destination");
     const llmDestination = Object.freeze({ id: ownData<string>(rawLlmDestination, "id"), residency: ownData<string>(rawLlmDestination, "residency"), dataUse: ownData<string>(rawLlmDestination, "dataUse") }); const embedDestination = embedding.destination;
-    if (typeof llmComplete !== "function" || llmDestination.id !== policy.destinationIds.llm || llmDestination.residency !== policy.residency || llmDestination.dataUse !== policy.dataUse || embedDestination.id !== policy.destinationIds.embedding || embedDestination.residency !== policy.residency || embedDestination.dataUse !== policy.dataUse || embedding.coordination.policyHash !== authority.coordinationPolicyHash || embedding.coordination.policyEpoch !== authority.coordinationPolicyEpoch) return { state: "pending", reason: "incompatible_policy" };
+    if (typeof llmComplete !== "function" || llmDestination.id !== policy.destinationIds.llm || llmDestination.residency !== policy.residency || llmDestination.dataUse !== policy.dataUse || embedDestination.id !== policy.destinationIds.embedding || embedDestination.residency !== policy.residency || embedDestination.dataUse !== policy.dataUse || embedding.coordination.policyHash !== lease.current.coordinationPolicyHash || embedding.coordination.policyEpoch !== lease.current.coordinationPolicyEpoch) return { state: "pending", reason: "incompatible_policy" };
     if (global === true && (!isGlobalDestination(policy.destinationIds.llm) || !isGlobalDestination(policy.destinationIds.embedding))) return { state: "pending", reason: "incompatible_policy" };
     const modelId = text("model ID", modelIdInput); const homeDir = text("home directory", homeDirInput, 4096); const seedText = text("seed", String(seedInput), 4096); const seed = seedWords(seedText)[0];
     if (!Number.isSafeInteger(options.maxLevels) || options.maxLevels < 1 || options.maxLevels > 10 || !Number.isSafeInteger(options.summaryInputTokens) || options.summaryInputTokens < 512 || options.summaryInputTokens > 65_536 || !Number.isSafeInteger(options.umapDimensions) || options.umapDimensions < 1 || options.umapDimensions > 64 || !Number.isSafeInteger(options.localNeighbors) || options.localNeighbors < 2 || options.localNeighbors > 200 || !Number.isSafeInteger(options.gmmMaxClusters) || options.gmmMaxClusters < 1 || options.gmmMaxClusters > 200 || !(options.membershipThreshold >= 0.01 && options.membershipThreshold <= 1)) return { state: "pending", reason: "invalid_input" };
     const evidenceIds = Object.freeze(leaves.map((leaf) => leaf.id)); const destinations = destinationIds(policy); const initialControl = await store.readControl();
-    const firstBarrier = await store.readRaptorBarrier(authority, { destinationIds: destinations, evidenceIds });
+    const firstBarrier = await store.readRaptorBarrier(lease.current, { destinationIds: destinations, evidenceIds });
     if (canonicalStringify(await store.readControl()) !== canonicalStringify(initialControl)) return { state: "pending", reason: "authority_changed" };
-    const manifest = buildManifest({ ownerHost: host, leafIds: evidenceIds, chunkSize: 1024, policyId: policy.id, policyHash: authority.coordinationPolicyHash, policyEpoch: authority.coordinationPolicyEpoch, privacyEpoch: authority.privacyEpoch, algorithm: RAPTOR_ALGORITHM_REVISION, promptRevision: RAPTOR_PROMPT_REVISION, modelId, seed: seedText });
-    const generationCoreId = publicationIdentity({ manifestRoot: manifest.root.id, membershipHash: manifest.root.membershipHash, baseGeneration: initialControl.activeGeneration, privacyEpoch: authority.privacyEpoch, coordinationPolicyEpoch: authority.coordinationPolicyEpoch, coordinationPolicyHash: authority.coordinationPolicyHash, policyId: policy.id, algorithm: RAPTOR_ALGORITHM_REVISION, promptRevision: RAPTOR_PROMPT_REVISION, modelId, seed: seedText });
+    const manifest = buildManifest({ ownerHost: host, leafIds: evidenceIds, chunkSize: 1024, policyId: policy.id, policyHash: lease.current.coordinationPolicyHash, policyEpoch: lease.current.coordinationPolicyEpoch, privacyEpoch: lease.current.privacyEpoch, algorithm: RAPTOR_ALGORITHM_REVISION, promptRevision: RAPTOR_PROMPT_REVISION, modelId, seed: seedText });
+    const generationCoreId = publicationIdentity({ manifestRoot: manifest.root.id, membershipHash: manifest.root.membershipHash, baseGeneration: initialControl.activeGeneration, privacyEpoch: lease.current.privacyEpoch, coordinationPolicyEpoch: lease.current.coordinationPolicyEpoch, coordinationPolicyHash: lease.current.coordinationPolicyHash, policyId: policy.id, algorithm: RAPTOR_ALGORITHM_REVISION, promptRevision: RAPTOR_PROMPT_REVISION, modelId, seed: seedText });
     // Every fenced attempt owns a distinct immutable point namespace. A loser
     // or partial build stays unreachable, while a later lease can retry the
     // same logical generation without colliding on prior job/fence provenance.
-    const generationId = sha256Hex(canonicalStringify({ domain: "raptor-generation-attempt-v1", generationCoreId, jobId: authority.jobId, fencingToken: authority.fencingToken }));
+    const generationId = sha256Hex(canonicalStringify({ domain: "raptor-generation-attempt-v1", generationCoreId, jobId: lease.current.jobId, fencingToken: lease.current.fencingToken }));
     // Summary records retain direct member IDs capped at the schema bound.
     // Charge every leaf at least 1/1024 of the configured prompt budget so no
     // learned or fallback cluster can cover more than 1024 leaves.
@@ -152,14 +179,16 @@ export async function buildRaptorGeneration(store: ProductionCoordinationStore, 
     const clusteringLeaves = leaves.map((leaf) => Object.freeze({ ...leaf, tokens: Math.max(leaf.tokens, Math.ceil(Buffer.byteLength(leaf.text, "utf8") / 4) + 32, membershipTokenFloor) }));
     let dag: ClusterDag;
     try {
-      dag = await buildClusterDagOffThread(clusteringLeaves as readonly ClusterLeaf[], { seed: seedText, maxLevels: options.maxLevels, tokenBudget: options.summaryInputTokens, umapDimensions: options.umapDimensions, globalNeighbors: Math.max(2, Math.min(leaves.length - 1, Math.ceil(Math.sqrt(leaves.length)))), localNeighbors: options.localNeighbors, gmmMaxClusters: options.gmmMaxClusters, membershipThreshold: options.membershipThreshold }, { ...(signal === undefined ? {} : { signal }), timeoutMs: 120_000 });
+      const clustered = await withLeaseHeartbeat(store, lease, () => buildClusterDagOffThread(clusteringLeaves as readonly ClusterLeaf[], { seed: seedText, maxLevels: options.maxLevels, tokenBudget: options.summaryInputTokens, umapDimensions: options.umapDimensions, globalNeighbors: Math.max(2, Math.min(leaves.length - 1, Math.ceil(Math.sqrt(leaves.length)))), localNeighbors: options.localNeighbors, gmmMaxClusters: options.gmmMaxClusters, membershipThreshold: options.membershipThreshold }, { ...(signal === undefined ? {} : { signal }), timeoutMs: 120_000 }));
+      if (!clustered.ok) return { state: "pending", reason: "authority_changed" };
+      dag = clustered.value;
     } catch { return { state: "pending", reason: signal?.aborted ? "cancelled" : "clustering_failed" }; }
     const nodeText = new Map(leaves.map((leaf) => [leaf.id, leaf.text])); const childrenByParent = new Map<string, string[]>(); for (const edge of dag.edges) { const children = childrenByParent.get(edge.parentId) ?? []; children.push(edge.childId); childrenByParent.set(edge.parentId, children); } for (const children of childrenByParent.values()) children.sort();
     const summaries: RaptorSummaryRecord[] = []; let reused = 0;
     const reuse = new Map<string, RaptorSummaryRecord>();
     for (const untrusted of (reuseCandidates === undefined ? [] : denseArray(reuseCandidates, "RAPTOR reuse candidates", MAX_LEAVES))) { try {
       const candidate = parseMemoryRecord(untrusted, { ownerHost: host, vectorDimension: 1024 }) as RaptorSummaryRecord;
-      if (candidate.recordType !== "raptor_summary" || candidate.vector === undefined || candidate.vector.length !== 1024 || candidate.contentHash !== canonicalRecordHash(candidate) || candidate.ownerHost !== host || candidate.generationId !== initialControl.activeGeneration || candidate.privacyEpoch !== authority.privacyEpoch || candidate.coordinationPolicyHash !== authority.coordinationPolicyHash || candidate.coordinationPolicyEpoch !== authority.coordinationPolicyEpoch || candidate.summary.length === 0) continue;
+      if (candidate.recordType !== "raptor_summary" || candidate.vector === undefined || candidate.vector.length !== 1024 || candidate.contentHash !== canonicalRecordHash(candidate) || candidate.ownerHost !== host || candidate.generationId !== initialControl.activeGeneration || candidate.privacyEpoch !== lease.current.privacyEpoch || candidate.coordinationPolicyHash !== lease.current.coordinationPolicyHash || candidate.coordinationPolicyEpoch !== lease.current.coordinationPolicyEpoch || candidate.summary.length === 0) continue;
       const rescanned = redactAndScan({ text: candidate.summary, maxChars: MAX_SUMMARY_CHARS, homeDir, ...(scan === undefined ? {} : { scan }) }); if (rescanned.dropped || rescanned.text !== candidate.summary) continue;
       const key = reusableKey({ memberIds: candidate.memberIds ?? [], promptRevision: candidate.promptRevision, modelId: candidate.modelId, algorithm: candidate.algorithm }); if (candidate.algorithmParameters !== null && typeof candidate.algorithmParameters === "object" && (candidate.algorithmParameters as Record<string, unknown>).reuseKey === key) reuse.set(key, candidate);
     } catch { /* invalid reuse is ignored, never authoritative */ } }
@@ -170,28 +199,44 @@ export async function buildRaptorGeneration(store: ProductionCoordinationStore, 
       if (prior !== undefined) { safeSummary = prior.summary; vector = Object.freeze([...prior.vector!]); reused += 1; }
       else {
         let envelope: string; try { envelope = promptFor(node, childrenByParent.get(node.id) ?? [], nodeText, options.summaryInputTokens); const safePrompt = redactAndScan({ text: envelope, maxChars: Math.min(1_000_000, envelope.length), homeDir, ...(scan === undefined ? {} : { scan }) }); if (safePrompt.dropped || safePrompt.secretScan !== "passed") return { state: "pending", reason: "scanner" }; envelope = safePrompt.text; } catch { return { state: "pending", reason: "summary_failed" }; }
-        const preLlm = await store.readRaptorBarrier(authority, { destinationIds: destinations, evidenceIds }); if (preLlm !== firstBarrier) return { state: "pending", reason: "authority_changed" };
-        let raw: string; try { raw = await llmComplete.call(llm, { envelope, ...(signal === undefined ? {} : { signal }) }); } catch { return { state: "pending", reason: signal?.aborted ? "cancelled" : "summary_failed" }; }
-        const postLlm = await store.readRaptorBarrier(authority, { destinationIds: destinations, evidenceIds }); if (postLlm !== preLlm) return { state: "pending", reason: "authority_changed" };
+        const preLlm = await store.readRaptorBarrier(lease.current, { destinationIds: destinations, evidenceIds }); if (preLlm !== firstBarrier) return { state: "pending", reason: "authority_changed" };
+        let raw: string; try {
+          const completed = await withLeaseHeartbeat(store, lease, () => llmComplete.call(llm, { envelope, ...(signal === undefined ? {} : { signal }) }));
+          if (!completed.ok) return { state: "pending", reason: "authority_changed" };
+          raw = completed.value;
+        } catch { return { state: "pending", reason: signal?.aborted ? "cancelled" : "summary_failed" }; }
+        const postLlm = await store.readRaptorBarrier(lease.current, { destinationIds: destinations, evidenceIds }); if (postLlm !== preLlm) return { state: "pending", reason: "authority_changed" };
         let parsed: string; try { parsed = strictSummary(raw); } catch { return { state: "pending", reason: "summary_failed" }; }
         const redacted = redactAndScan({ text: parsed, maxChars: MAX_SUMMARY_CHARS, homeDir, ...(scan === undefined ? {} : { scan }) }); if (redacted.dropped || redacted.secretScan !== "passed") return { state: "pending", reason: "scanner" }; safeSummary = redacted.text;
-        const preEmbedding = await store.readRaptorBarrier(authority, { destinationIds: destinations, evidenceIds }); if (preEmbedding !== firstBarrier) return { state: "pending", reason: "authority_changed" };
-        try { vector = await embedding.embed({ model: "bge-m3", text: safeSummary, ...(signal === undefined ? {} : { signal }) }); } catch { return { state: "pending", reason: signal?.aborted ? "cancelled" : "embedding_failed" }; }
+        const preEmbedding = await store.readRaptorBarrier(lease.current, { destinationIds: destinations, evidenceIds }); if (preEmbedding !== firstBarrier) return { state: "pending", reason: "authority_changed" };
+        try {
+          const embedded = await withLeaseHeartbeat(store, lease, () => embedding.embed({ model: "bge-m3", text: safeSummary, ...(signal === undefined ? {} : { signal }) }));
+          if (!embedded.ok) return { state: "pending", reason: "authority_changed" };
+          vector = embedded.value;
+        } catch { return { state: "pending", reason: signal?.aborted ? "cancelled" : "embedding_failed" }; }
         if (!Array.isArray(vector) || vector.length !== 1024 || vector.some((component) => typeof component !== "number" || !Number.isFinite(component))) return { state: "pending", reason: "embedding_failed" };
-        vector = Object.freeze([...vector]); const postEmbedding = await store.readRaptorBarrier(authority, { destinationIds: destinations, evidenceIds }); if (postEmbedding !== preEmbedding) return { state: "pending", reason: "authority_changed" };
+        vector = Object.freeze([...vector]); const postEmbedding = await store.readRaptorBarrier(lease.current, { destinationIds: destinations, evidenceIds }); if (postEmbedding !== preEmbedding) return { state: "pending", reason: "authority_changed" };
       }
       const range = sourceRange(leaves, node.leafIds); const createdAt = range.temporalTo; const id = sha256Hex(canonicalStringify({ domain: "raptor-summary-point-v1", generationId, clusterId: node.id }));
-      const value = record({ recordType: "raptor_summary", id, ownerHost: host, schemaRevision: 1, createdAt: iso(createdAt), privacyEpoch: authority.privacyEpoch, processingPolicyId: policy.id, expiresAt: policy.expiresAt, coordinationPolicyHash: authority.coordinationPolicyHash, coordinationPolicyEpoch: authority.coordinationPolicyEpoch, generationId, clusterId: node.id, membershipHash: recordMembershipHash(memberIds), level: node.level, memberIds, manifestHash: manifest.root.merkleRoot, summary: safeSummary, vector: [...vector], modelId, embeddingDimension: 1024, promptRevision: RAPTOR_PROMPT_REVISION, algorithm: RAPTOR_ALGORITHM_REVISION, seed, jobId: authority.jobId, fencingToken: authority.fencingToken, temporalFrom: range.temporalFrom, temporalTo: range.temporalTo, coveredProjects: range.projects, algorithmParameters: algorithmParameters(options, seed, key, prior === undefined ? "generated" : "reused") });
-      try { summaries.push(await store.writeRaptorSummary(authority, { record: value, destinationIds: destinations, evidenceIds })); } catch { return { state: "pending", reason: "write_failed" }; }
+      const value = record({ recordType: "raptor_summary", id, ownerHost: host, schemaRevision: 1, createdAt: iso(createdAt), privacyEpoch: lease.current.privacyEpoch, processingPolicyId: policy.id, expiresAt: policy.expiresAt, coordinationPolicyHash: lease.current.coordinationPolicyHash, coordinationPolicyEpoch: lease.current.coordinationPolicyEpoch, generationId, clusterId: node.id, membershipHash: recordMembershipHash(memberIds), level: node.level, memberIds, manifestHash: manifest.root.merkleRoot, summary: safeSummary, vector: [...vector], modelId, embeddingDimension: 1024, promptRevision: RAPTOR_PROMPT_REVISION, algorithm: RAPTOR_ALGORITHM_REVISION, seed, jobId: lease.current.jobId, fencingToken: lease.current.fencingToken, temporalFrom: range.temporalFrom, temporalTo: range.temporalTo, coveredProjects: range.projects, algorithmParameters: algorithmParameters(options, seed, key, prior === undefined ? "generated" : "reused") });
+      if (!await renewActiveLease(store, lease)) return { state: "pending", reason: "authority_changed" };
+      try { summaries.push(await store.writeRaptorSummary(lease.current, { record: value, destinationIds: destinations, evidenceIds })); } catch { return { state: "pending", reason: "write_failed" }; }
       nodeText.set(node.id, safeSummary);
     }
     const overallRange = sourceRange(leaves, evidenceIds); const manifestNodes: RaptorSummaryRecord[] = [];
-    for (const chunk of manifest.chunks) { const ids = [...chunk.memberIds]; const key = reusableKey({ memberIds: ids, promptRevision: RAPTOR_PROMPT_REVISION, modelId, algorithm: "raptor-manifest-chunk-v1" }); manifestNodes.push(record({ recordType: "raptor_summary", id: sha256Hex(canonicalStringify({ domain: "raptor-manifest-chunk-point-v1", generationId, chunkId: chunk.id })), ownerHost: host, schemaRevision: 1, createdAt: overallRange.temporalTo, privacyEpoch: authority.privacyEpoch, processingPolicyId: policy.id, expiresAt: policy.expiresAt, coordinationPolicyHash: authority.coordinationPolicyHash, coordinationPolicyEpoch: authority.coordinationPolicyEpoch, generationId, clusterId: chunk.id, membershipHash: recordMembershipHash(ids), level: 0, memberIds: ids, manifestHash: manifest.root.merkleRoot, summary: "[RAPTOR manifest chunk]", modelId, embeddingDimension: 1024, promptRevision: RAPTOR_PROMPT_REVISION, algorithm: "raptor-manifest-chunk-v1", seed, jobId: authority.jobId, fencingToken: authority.fencingToken, temporalFrom: overallRange.temporalFrom, temporalTo: overallRange.temporalTo, coveredProjects: overallRange.projects, algorithmParameters: Object.freeze({ kind: "manifest-chunk", index: chunk.index, contentHash: chunk.contentHash, reuseKey: key }) })); }
+    for (const chunk of manifest.chunks) { const ids = [...chunk.memberIds]; const key = reusableKey({ memberIds: ids, promptRevision: RAPTOR_PROMPT_REVISION, modelId, algorithm: "raptor-manifest-chunk-v1" }); manifestNodes.push(record({ recordType: "raptor_summary", id: sha256Hex(canonicalStringify({ domain: "raptor-manifest-chunk-point-v1", generationId, chunkId: chunk.id })), ownerHost: host, schemaRevision: 1, createdAt: overallRange.temporalTo, privacyEpoch: lease.current.privacyEpoch, processingPolicyId: policy.id, expiresAt: policy.expiresAt, coordinationPolicyHash: lease.current.coordinationPolicyHash, coordinationPolicyEpoch: lease.current.coordinationPolicyEpoch, generationId, clusterId: chunk.id, membershipHash: recordMembershipHash(ids), level: 0, memberIds: ids, manifestHash: manifest.root.merkleRoot, summary: "[RAPTOR manifest chunk]", modelId, embeddingDimension: 1024, promptRevision: RAPTOR_PROMPT_REVISION, algorithm: "raptor-manifest-chunk-v1", seed, jobId: lease.current.jobId, fencingToken: lease.current.fencingToken, temporalFrom: overallRange.temporalFrom, temporalTo: overallRange.temporalTo, coveredProjects: overallRange.projects, algorithmParameters: Object.freeze({ kind: "manifest-chunk", index: chunk.index, contentHash: chunk.contentHash, reuseKey: key }) })); }
     const chunkPointIds = manifestNodes.map((node) => node.id); const rootKey = reusableKey({ memberIds: chunkPointIds, promptRevision: RAPTOR_PROMPT_REVISION, modelId, algorithm: "raptor-manifest-root-v1" });
-    manifestNodes.push(record({ recordType: "raptor_summary", id: generationId, ownerHost: host, schemaRevision: 1, createdAt: overallRange.temporalTo, privacyEpoch: authority.privacyEpoch, processingPolicyId: policy.id, expiresAt: policy.expiresAt, coordinationPolicyHash: authority.coordinationPolicyHash, coordinationPolicyEpoch: authority.coordinationPolicyEpoch, generationId, clusterId: manifest.root.id, membershipHash: recordMembershipHash(chunkPointIds), level: options.maxLevels + 1, memberIds: chunkPointIds, manifestHash: manifest.root.merkleRoot, summary: "[RAPTOR manifest root]", modelId, embeddingDimension: 1024, promptRevision: RAPTOR_PROMPT_REVISION, algorithm: "raptor-manifest-root-v1", seed, jobId: authority.jobId, fencingToken: authority.fencingToken, temporalFrom: overallRange.temporalFrom, temporalTo: overallRange.temporalTo, coveredProjects: overallRange.projects, algorithmParameters: Object.freeze({ kind: "manifest-root", membershipHash: manifest.root.membershipHash, dagRootsHash: sha256Hex(canonicalStringify(dag.roots)), dagRootCount: dag.roots.length, reuseKey: rootKey }) }));
-    try { for (const node of manifestNodes) summaries.push(await store.writeRaptorSummary(authority, { record: node, destinationIds: destinations, evidenceIds })); } catch { return { state: "pending", reason: "write_failed" }; }
-    const finalBarrier = await store.readRaptorBarrier(authority, { destinationIds: destinations, evidenceIds }); if (finalBarrier !== firstBarrier) return { state: "pending", reason: "authority_changed" };
-    if (!await store.publishRaptorGeneration(authority, { expected: initialControl, generationId, destinationIds: destinations, evidenceIds })) return { state: "pending", reason: "publication_lost" };
+    manifestNodes.push(record({ recordType: "raptor_summary", id: generationId, ownerHost: host, schemaRevision: 1, createdAt: overallRange.temporalTo, privacyEpoch: lease.current.privacyEpoch, processingPolicyId: policy.id, expiresAt: policy.expiresAt, coordinationPolicyHash: lease.current.coordinationPolicyHash, coordinationPolicyEpoch: lease.current.coordinationPolicyEpoch, generationId, clusterId: manifest.root.id, membershipHash: recordMembershipHash(chunkPointIds), level: options.maxLevels + 1, memberIds: chunkPointIds, manifestHash: manifest.root.merkleRoot, summary: "[RAPTOR manifest root]", modelId, embeddingDimension: 1024, promptRevision: RAPTOR_PROMPT_REVISION, algorithm: "raptor-manifest-root-v1", seed, jobId: lease.current.jobId, fencingToken: lease.current.fencingToken, temporalFrom: overallRange.temporalFrom, temporalTo: overallRange.temporalTo, coveredProjects: overallRange.projects, algorithmParameters: Object.freeze({ kind: "manifest-root", membershipHash: manifest.root.membershipHash, dagRootsHash: sha256Hex(canonicalStringify(dag.roots)), dagRootCount: dag.roots.length, reuseKey: rootKey }) }));
+    try {
+      for (const node of manifestNodes) {
+        if (!await renewActiveLease(store, lease)) return { state: "pending", reason: "authority_changed" };
+        summaries.push(await store.writeRaptorSummary(lease.current, { record: node, destinationIds: destinations, evidenceIds }));
+      }
+    } catch { return { state: "pending", reason: "write_failed" }; }
+    if (!await renewActiveLease(store, lease)) return { state: "pending", reason: "authority_changed" };
+    const finalBarrier = await store.readRaptorBarrier(lease.current, { destinationIds: destinations, evidenceIds }); if (finalBarrier !== firstBarrier) return { state: "pending", reason: "authority_changed" };
+    if (!await store.publishRaptorGeneration(lease.current, { expected: initialControl, generationId, destinationIds: destinations, evidenceIds })) return { state: "pending", reason: "publication_lost" };
+    if (!await store.completeRaptorJob(lease.current, { generationId, evidenceIds, destinationIds: destinations })) return { state: "pending", reason: "authority_changed" };
     return Object.freeze({ state: "completed", generationId, manifest, summaries: Object.freeze(summaries), reused });
   } catch { return { state: "pending", reason: "invalid_input" }; }
 }

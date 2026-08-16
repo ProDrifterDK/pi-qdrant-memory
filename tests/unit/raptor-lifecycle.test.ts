@@ -89,9 +89,9 @@ function runtime(state: ReturnType<typeof backend>): { store: ProductionCoordina
 function leaves(count: number, sourcePolicy: ProcessingPolicy, prefix: string, long = false): RootRaptorLifecycleInput["leaves"] {
   return Array.from({ length: count }, (_, index) => ({ id: episodeId(OWNER, "raptor-session", `${prefix}-${String(index).padStart(3, "0")}`), text: long ? `safe memory ${"x".repeat(340)}` : `safe memory ${index}`, vector: Array.from({ length: 1024 }, () => Math.fround(index < count / 2 ? index * 0.05 : 8 + index * 0.05)), tokens: long ? 120 : 16, projectId: "project-raptor", eventAt: NOW, policy: sourcePolicy }));
 }
-function options(input: { store: ProductionCoordinationStore; embedding: BoundEmbeddingDestination; leaves: RootRaptorLifecycleInput["leaves"]; sourcePolicy: ProcessingPolicy; complete: (input: { envelope: string; signal?: AbortSignal }) => Promise<string>; reuseCandidates?: RootRaptorLifecycleInput["reuseCandidates"] }): RootRaptorLifecycleInput {
+function options(input: { store: ProductionCoordinationStore; embedding: BoundEmbeddingDestination; leaves: RootRaptorLifecycleInput["leaves"]; sourcePolicy: ProcessingPolicy; complete: (input: { envelope: string; signal?: AbortSignal }) => Promise<string>; reuseCandidates?: RootRaptorLifecycleInput["reuseCandidates"]; leaseMs?: number; clock?: () => number }): RootRaptorLifecycleInput {
   const state = stateForStore.get(input.store); if (state === undefined) throw new Error("missing test backend"); seedDurableLeaves(state, input.leaves);
-  return { host: OWNER, store: input.store, env: {}, nodeId: "raptor-node", leaseMs: 30_000, maxClockSkewMs: 0, extractorRevision: "raptor-extractor-v1", clock: () => NOW_MS, workerPolicy: input.sourcePolicy, leaves: input.leaves, llm: { destination: llmDestination, complete: input.complete }, embedding: input.embedding, modelId: "memory-model", homeDir: "/home/tester", seed: "s2", maxLevels: 5, summaryInputTokens: 512, umapDimensions: 2, localNeighbors: 2, gmmMaxClusters: 4, membershipThreshold: 0.1, ...(input.reuseCandidates === undefined ? {} : { reuseCandidates: input.reuseCandidates }) };
+  return { host: OWNER, store: input.store, env: {}, nodeId: "raptor-node", leaseMs: input.leaseMs ?? 30_000, maxClockSkewMs: 0, extractorRevision: "raptor-extractor-v1", clock: input.clock ?? (() => NOW_MS), workerPolicy: input.sourcePolicy, leaves: input.leaves, llm: { destination: llmDestination, complete: input.complete }, embedding: input.embedding, modelId: "memory-model", homeDir: "/home/tester", seed: "s2", maxLevels: 5, summaryInputTokens: 512, umapDimensions: 2, localNeighbors: 2, gmmMaxClusters: 4, membershipThreshold: 0.1, ...(input.reuseCandidates === undefined ? {} : { reuseCandidates: input.reuseCandidates }) };
 }
 function raptorPoints(state: ReturnType<typeof backend>): WirePoint[] { return [...state.points.values()].filter((point) => point.payload.record_type === "raptor_summary"); }
 function activeGeneration(state: ReturnType<typeof backend>): string | null { return state.points.get(COLLECTION_CONTROL_ID)?.payload.active_generation as string | null; }
@@ -112,6 +112,23 @@ describe("Task 10 nominal RAPTOR lifecycle and publication", () => {
     expect(terminalLease?.payload).toMatchObject({ state: "completed", terminal_operation: "raptor" });
     expect(prompts.some((prompt) => prompt.includes("safe level summary"))).toBe(true);
     expect(prompts.every((prompt) => !/(?<!sha256:)[a-f0-9]{64}/u.test(prompt))).toBe(true);
+  });
+
+  it("renews a short lease while a slow model completion is in flight", async () => {
+    const state = backend(); const bound = runtime(state); const sourcePolicy = policy("lease-heartbeat");
+    let now = NOW_MS; let calls = 0;
+    const complete = async (): Promise<string> => {
+      calls += 1;
+      const ticker = setInterval(() => { now += 20; }, 20);
+      try { await new Promise((resolve) => setTimeout(resolve, 160)); }
+      finally { clearInterval(ticker); }
+      return JSON.stringify({ summary: "safe renewed summary" });
+    };
+    const result = await runRaptorFromLifecycle(SessionManager.inMemory(), options({ ...bound, sourcePolicy, leaves: leaves(2, sourcePolicy, "lease-heartbeat"), complete, leaseMs: 90, clock: () => now }));
+    expect(result.state).toBe("completed"); expect(calls).toBe(1);
+    const terminalLease = [...state.points.values()].find((point) => point.payload.record_type === "lease");
+    expect(terminalLease?.payload).toMatchObject({ state: "completed", terminal_operation: "raptor" });
+    expect(Number(terminalLease?.payload.version)).toBeGreaterThan(2);
   });
 
   it("structurally redacts summaries, persists 1024-vector nodes, and reuses validated summaries without LLM egress", async () => {

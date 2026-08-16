@@ -419,16 +419,9 @@ export async function runRaptorFromLifecycle(sessionManager, input) {
     if (authority === null)
         return Object.freeze({ state: "pending", reason: "authority_changed" });
     const buildInput = { host, workerPolicy, leaves, llm: input.llm, embedding: input.embedding, modelId: input.modelId, homeDir: input.homeDir, seed: input.seed, maxLevels: input.maxLevels, summaryInputTokens: input.summaryInputTokens, umapDimensions: input.umapDimensions, localNeighbors: input.localNeighbors, gmmMaxClusters: input.gmmMaxClusters, membershipThreshold: input.membershipThreshold, ...(input.global === undefined ? {} : { global: input.global }), ...(input.scan === undefined ? {} : { scan: input.scan }), ...(input.signal === undefined ? {} : { signal: input.signal }), ...(input.reuseCandidates === undefined ? {} : { reuseCandidates: input.reuseCandidates }) };
-    const result = await buildRaptorGeneration(store, authority, buildInput);
-    // RAPTOR has no curation proposal. Once the builder has published the
-    // generation, use the named fenced terminal transition instead of releasing
-    // a successful job as if it were merely retryable work.
-    if (result.state === "completed") {
-        const completed = await store.completeRaptorJob(authority, { generationId: result.generationId, evidenceIds: membership, destinationIds: [policy.destinationIds.qdrant, policy.destinationIds.embedding, policy.destinationIds.llm] });
-        if (!completed)
-            return Object.freeze({ state: "pending", reason: "authority_changed" });
-    }
-    return result;
+    // The builder renews its lease while clustering/model/embedding work runs
+    // and performs the fenced terminal transition with the latest authority.
+    return buildRaptorGeneration(store, authority, buildInput);
 }
 Object.freeze(runRaptorFromLifecycle);
 //# sourceMappingURL=root.js.map
