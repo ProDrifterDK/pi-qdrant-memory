@@ -236,7 +236,7 @@ export class MemoryRetriever {
                         if (!typeMatches || record.ownerHost !== input.host || record.privacyEpoch !== control.privacyEpoch || isExpired(record.expiresAt, now, skew))
                             continue;
                         if (record.recordType === "raptor_summary") {
-                            if (lane === "raptor" && control.activeGeneration !== null && record.generationId === control.activeGeneration && record.coordinationPolicyEpoch === control.coordinationPolicyEpoch && record.coordinationPolicyHash === control.coordinationPolicyHash && record.memberIds !== undefined && record.memberIds.length > 0 && record.memberIds.length <= 1024 && record.coveredProjects.includes(input.project.id))
+                            if (lane === "raptor" && control.activeGeneration !== null && record.generationId === control.activeGeneration && record.coordinationPolicyEpoch === control.coordinationPolicyEpoch && record.coordinationPolicyHash === control.coordinationPolicyHash && record.memberIds !== undefined && record.memberIds.length > 0 && record.memberIds.length <= 1024 && record.coveredProjects.length === 1 && record.coveredProjects[0] === input.project.id)
                                 raptorSeeds.push({ record, score: hit.score });
                             continue;
                         }

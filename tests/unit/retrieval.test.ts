@@ -333,6 +333,24 @@ describe("MemoryRetriever guarded exact lane", () => {
     } finally { vi.unstubAllGlobals(); }
   });
 
+  it("ignores mixed-project RAPTOR seeds without poisoning project-local descent", async () => {
+    const values = fixtures(); const base = readerFixture(); const generationId = "generation-project-isolation";
+    const control = canonical<ControlRecord>({ ...values.control, activeGeneration: generationId, contentHash: "pending" }); vi.mocked(base.reader.readControl).mockResolvedValue(control); vi.mocked(base.calls.exact).mockResolvedValue([]);
+    const local = canonical<RaptorSummaryRecord>({ recordType: "raptor_summary", id: "summary-local", ownerHost: "prime", schemaRevision: 1, createdAt: NOW, privacyEpoch: 4, processingPolicyId: values.activePolicy.id, expiresAt: null, coordinationPolicyHash: "coord-hash", coordinationPolicyEpoch: 9, generationId, clusterId: "cluster-local", membershipHash: manifestHash([values.episode.id]), level: 1, memberIds: [values.episode.id], manifestHash: "merkle-local", summary: "alpha local memory", vector: VECTOR, modelId: "summary-model", embeddingDimension: 1024, promptRevision: "raptor-summary-v2", algorithm: "raptor-umap140-diag-gmm-v1", seed: 7, jobId: "job-local", fencingToken: 1, temporalFrom: NOW, temporalTo: NOW, coveredProjects: ["project-1"], algorithmParameters: { kind: "summary" }, contentHash: "pending" });
+    const foreignId = "33333333-3333-5333-8333-333333333333";
+    const mixed = canonical<RaptorSummaryRecord>({ ...local, id: "summary-mixed", clusterId: "cluster-mixed", memberIds: [values.episode.id, foreignId], membershipHash: manifestHash([values.episode.id, foreignId]), coveredProjects: ["project-1", "project-2"], contentHash: "pending" });
+    vi.mocked(base.reader.search).mockResolvedValue([{ record: mixed, score: 0.99 }, { record: local, score: 0.98 }]); vi.mocked(base.reader.retrieveEvidence).mockResolvedValue([values.episode]);
+    const transport = vi.fn(async () => new Response(JSON.stringify({ data: [{ embedding: VECTOR }] }), { status: 200 })); vi.stubGlobal("fetch", transport);
+    try {
+      const client = new EmbeddingsClient({ baseUrl: "http://127.0.0.1:8080/v1", model: "bge-m3", dimension: 1024, queryPrefix: "search_query: ", timeoutMs: 2500 }); const destination = { id: "embed:local", residency: "local", dataUse: "memory" };
+      const embedding = bindEmbeddingDestination(createEmbeddingDestinationFactory({ endpoint: "http://127.0.0.1:8080/v1", destination, client: bindEmbeddingDocumentClient({ endpoint: "http://127.0.0.1:8080/v1", client }), egressMode: "allowlist", coordinationPolicyHash: control.coordinationPolicyHash, coordinationPolicyEpoch: control.coordinationPolicyEpoch }), destination);
+      const retriever = new MemoryRetriever({ reader: base.reader, config: { topK: 5, candidatesPerLane: 20, minScore: 0.35, projectBoost: 0, contextBudgetChars: 1200, toolResultBudgetChars: 8000, hardContextCharBudget: 16000, timeoutMs: 2500, rootScope: "project", childSearch: true }, embedding, embeddingDestination: destination, maxClockSkewMs: 300_000, now: () => Date.parse(NOW) });
+      const result = await retriever.search({ query: "alpha", host: "prime", project: { id: "project-1", label: "repo", identityKind: "registered" }, isChild: false, modelDestination: { id: "provider/model", residency: "local", dataUse: "memory" }, mode: "raptor" });
+      expect(result.hits).toEqual([expect.objectContaining({ id: values.episode.id, lane: "raptor" })]);
+      expect(base.reader.retrieveEvidence).toHaveBeenCalledWith([values.episode.id]);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
   it("chunks a multi-hit curated evidence closure without weakening validation", async () => {
     const values = fixtures(); const base = readerFixture();
     const episodes = Array.from({ length: 1025 }, (_, index) => canonical<EpisodeRecord>({
