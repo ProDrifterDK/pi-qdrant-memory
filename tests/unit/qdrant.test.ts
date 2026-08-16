@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readPolicy, physicalPointIdFor, type QdrantClientOptions, type QdrantReadPolicy } from "../../src/qdrant/client.js";
-import { V2_COLLECTION_METADATA, REQUIRED_INDEXES, COLLECTION_METADATA_ID, COLLECTION_CONTROL_ID, physicalPointId, controlPayload } from "../../src/qdrant/schema.js";
-import { bindQdrantDestination, coordinationRecordFromPayload, episodeRecordFromPayload, createQdrantCoordinationStore, createQdrantSafeBundle, recordPayload, QdrantContentHashCollisionError } from "../../src/qdrant/write.js";
+import { V2_COLLECTION_METADATA, V2_CONTRACT_HASH, REQUIRED_INDEXES, COLLECTION_METADATA_ID, COLLECTION_CONTROL_ID, physicalPointId, bootstrapControlHash, collectionControlPoint, controlPayload } from "../../src/qdrant/schema.js";
+import { bindQdrantDestination, coordinationRecordFromPayload, episodeRecordFromPayload, createQdrantCoordinationStore, createQdrantSafeBundle, recordFromPayload, recordPayload, QdrantContentHashCollisionError } from "../../src/qdrant/write.js";
 import { adminCreateCollection, adminCreatePayloadIndex, adminHealth, adminInsertInitialControlPoint, adminInsertMetadataPoint, adminRetrieve, adminServerInfo, statusCollectionInfo, statusHealth, statusRetrieve } from "../../src/admin/transport.js";
+import { createGuardedMemoryReadStore } from "../../src/retrieval/search.js";
 import { canonicalRecordHash, type ControlRecord, type EpisodeRecord, type ProcessingPolicyRecord, type TombstoneRecord } from "../../src/domain/records.js";
 import { MAX_SESSION_SEQUENCE } from "../../src/domain/ids.js";
 import { processingPolicyHash, type ProcessingPolicy } from "../../src/domain/policy.js";
@@ -37,6 +38,7 @@ function episode(overrides: Partial<EpisodeRecord> = {}): EpisodeRecord {
   return { ...value, contentHash: canonicalRecordHash(value) } as EpisodeRecord;
 }
 function control(overrides: Partial<ControlRecord> = {}): ControlRecord { const base = { ownerHost: "pi" as const, schemaRevision: 1 as const, createdAt: "2026-08-10T00:00:00.000Z", privacyEpoch: 0, processingPolicyId: "policy-1", expiresAt: null, recordType: "collection_control" as const, id: COLLECTION_CONTROL_ID, version: 1, activeGeneration: "gen-1", activeBaseGeneration: null, coordinationPolicyEpoch: 2, coordinationPolicyHash: "policy-hash", state: "active" as const, scanCursor: "cursor-old", lastForgetBarrier: null, revokedDestinationIds: [], contentHash: "pending" }; const value = { ...base, ...overrides }; return { ...value, contentHash: canonicalRecordHash(value) } as ControlRecord; }
+function bootstrapControl(): ControlRecord { const base = { ownerHost: "pi" as const, schemaRevision: 1 as const, createdAt: NOW, privacyEpoch: 0, processingPolicyId: V2_CONTRACT_HASH, expiresAt: null, recordType: "collection_control" as const, id: COLLECTION_CONTROL_ID, version: 0, activeGeneration: null, activeBaseGeneration: null, coordinationPolicyEpoch: 0, coordinationPolicyHash: V2_CONTRACT_HASH, state: "active" as const, scanCursor: null, lastForgetBarrier: null, revokedDestinationIds: [], contentHash: "pending" }; return { ...base, contentHash: bootstrapControlHash(base as ControlRecord) } as ControlRecord; }
 function tombstone(overrides: Partial<TombstoneRecord> = {}): TombstoneRecord { const base = { ownerHost: "pi" as const, schemaRevision: 1 as const, createdAt: "2026-08-10T00:00:00.000Z", privacyEpoch: 0, processingPolicyId: "policy-1", expiresAt: null, recordType: "tombstone" as const, id: "pending", scope: "occurrence" as const, targetId: "00000000-0000-5000-8000-000000000001", contentHash: "pending" }; const value = { ...base, ...overrides }; const id = tombstoneId("pi", value.targetId); return { ...value, id, contentHash: canonicalRecordHash({ ...value, id }) } as TombstoneRecord; }
 
 function qdrantOptions(baseUrl = "http://qdrant", ownerHost: "pi" | "prime" = "pi"): QdrantClientOptions {
@@ -184,6 +186,16 @@ describe("Qdrant v2 REST capability (safe owner module)", () => {
   it("rejects malformed response payloads as invalid responses", async () => {
     const malformed = backend([{ id: COLLECTION_CONTROL_ID, payload: { owner_host: "pi", record_type: "collection_control", status: "active", secret_scan: "passed", version: 1 } }]);
     await expect(storeFor(malformed).readControl()).rejects.toThrow();
+  });
+
+  it("reads the exact version-0 bootstrap control through the guarded reader", async () => {
+    const initial = bootstrapControl();
+    const point = collectionControlPoint(initial);
+    const b = backend([{ id: point.id, payload: point.payload }]);
+    vi.stubGlobal("fetch", b.fetchImpl);
+    const store = createGuardedMemoryReadStore({ ...qdrantOptions(), destination: qdrantDestination, egressMode: "allowlist" });
+    await expect(store.readControl()).resolves.toMatchObject({ id: COLLECTION_CONTROL_ID, version: 0, ownerHost: OWNER, coordinationPolicyEpoch: 0 });
+    expect(() => recordFromPayload(point.payload, OWNER)).toThrow(/invalid/i);
   });
 
   it("classifies malformed scroll offsets as response errors", async () => {
@@ -357,6 +369,22 @@ describe("Qdrant v2 REST capability (safe owner module)", () => {
     const put = bodies[0] as { points: Array<{ payload: Record<string, unknown>; vector?: unknown }> };
     expect(put.points[0]?.payload.vector).toBeUndefined();
     expect(put.points[0]?.vector).toEqual({ semantic: finalEp.vector });
+  });
+
+  it("preserves first-writer processing-policy provenance across idempotent insert-only delivery", async () => {
+    const basePolicy: ProcessingPolicy = { id: "pending", ownerHost: OWNER, destinationIds: { qdrant: qdrantDestination.id, embedding: "embedding:local" }, originProvider: "provider-1", allowCrossProviderReplay: false, expiresAt: null, residency: "local", dataUse: "memory", policyRevision: "capture-lifecycle-v1" };
+    const policy = { ...basePolicy, id: processingPolicyHash(basePolicy) } as ProcessingPolicy;
+    const firstPending: ProcessingPolicyRecord = { recordType: "processing_policy", id: policy.id, ownerHost: OWNER, schemaRevision: 1, createdAt: NOW, privacyEpoch: 0, processingPolicyId: policy.id, expiresAt: null, policy, canonicalHash: policy.id, contentHash: "pending" };
+    const first = { ...firstPending, contentHash: canonicalRecordHash(firstPending) } as ProcessingPolicyRecord;
+    const laterPending = { ...first, createdAt: "2026-08-11T00:00:00.000Z", privacyEpoch: 1, contentHash: "pending" } as ProcessingPolicyRecord;
+    const later = { ...laterPending, contentHash: canonicalRecordHash(laterPending) } as ProcessingPolicyRecord;
+    expect(later.contentHash).toBe(first.contentHash);
+    const b = backend([{ id: physicalPointId("processing_policy", policy.id), payload: recordPayload(first) as Record<string, unknown> }]);
+    vi.stubGlobal("fetch", b.fetchImpl);
+    const bundle = createQdrantSafeBundle({ options: qdrantOptions(), destination: qdrantDestination, egressMode: "allowlist", coordinationPolicyHash: POLICY_HASH, coordinationPolicyEpoch: 1 });
+    const bound = bindQdrantDestination(bundle.qdrant, qdrantDestination);
+    await expect(bound.insertAndReadback(later)).resolves.toBe("existing");
+    await expect(bound.retrieve("processing_policy", policy.id)).resolves.toEqual(first);
   });
 
   it("allows tombstone verification only through explicit internal policy", async () => {

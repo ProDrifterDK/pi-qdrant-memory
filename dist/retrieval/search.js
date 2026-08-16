@@ -7,7 +7,7 @@ import { mergeCandidates } from "./merge.js";
 import { fetchJson, fetchOk, MemoryClientError } from "../clients/http.js";
 import { tombstoneId } from "../domain/ids.js";
 import { expectedQdrantCollection, physicalPointIdFor } from "../qdrant/client.js";
-import { COLLECTION_CONTROL_ID } from "../qdrant/schema.js";
+import { COLLECTION_CONTROL_ID, assertBootstrapControl, controlRecordFromPayload } from "../qdrant/schema.js";
 import { recordFromPayload } from "../qdrant/write.js";
 import { bindConfiguredDestination } from "../security/egress.js";
 function clampLimit(value) { return Number.isFinite(value) ? Math.min(10, Math.max(1, Math.trunc(value))) : 1; }
@@ -103,6 +103,19 @@ function tombstoneTargets(candidate) {
     return [...new Set([candidate.id, ...candidate.evidenceIds, candidate.contentId, candidate.observationId, candidate.stateKey].filter((value) => typeof value === "string" && value.length > 0))].sort();
 }
 function sameControl(left, right) { return canonicalStringify(left) === canonicalStringify(right); }
+function parseControlRecord(value, ownerHost) {
+    if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+        const candidate = value;
+        if (candidate.recordType === "collection_control" && candidate.version === 0) {
+            assertBootstrapControl(value, ownerHost);
+            return value;
+        }
+    }
+    const parsed = parseMemoryRecord(value, { ownerHost });
+    if (parsed.recordType !== "collection_control")
+        throw new TypeError("Collection control is invalid");
+    return parsed;
+}
 function isExpired(expiresAt, now, skew) { return expiresAt !== null && expiresAt !== undefined && Date.parse(expiresAt) <= now + skew; }
 function validProject(project) { return typeof project.id === "string" && project.id.length > 0 && project.id.length <= 512 && (project.identityKind === "registered" || project.identityKind === "local_only") && project.registrationValid !== false; }
 /** Guarded hybrid retrieval. Every result passes a final stable-control, policy and tombstone barrier. */
@@ -119,13 +132,16 @@ export class MemoryRetriever {
             return { query, hits: [] };
         try {
             const now = (this.dependencies.now ?? Date.now)();
-            const control = parseMemoryRecord(await this.dependencies.reader.readControl());
-            if (control.recordType !== "collection_control" || control.ownerHost !== input.host || control.state !== "active")
+            const control = parseControlRecord(await this.dependencies.reader.readControl(), input.host);
+            // A genuine version-0 bootstrap carries only the contract placeholder
+            // identity: it must never authorize retrieval lanes or embedding egress
+            // before the one-time worker-policy activation binds the collection.
+            if (control.recordType !== "collection_control" || control.ownerHost !== input.host || control.state !== "active" || control.version === 0)
                 return { query, hits: [] };
             const readerDestination = this.dependencies.reader.destination;
             if (control.revokedDestinationIds.includes(readerDestination.id) || control.revokedDestinationIds.includes(input.modelDestination.id))
                 return { query, hits: [] };
-            const preQueryControl = parseMemoryRecord(await this.dependencies.reader.readControl());
+            const preQueryControl = parseControlRecord(await this.dependencies.reader.readControl(), input.host);
             if (preQueryControl.recordType !== "collection_control" || !sameControl(control, preQueryControl))
                 return { query, hits: [] };
             const mode = input.mode ?? "all";
@@ -193,7 +209,7 @@ export class MemoryRetriever {
                         denseVector = undefined;
                     }
                     if (denseVector !== undefined) {
-                        const afterEmbedding = parseMemoryRecord(await this.dependencies.reader.readControl());
+                        const afterEmbedding = parseControlRecord(await this.dependencies.reader.readControl(), input.host);
                         if (!sameControl(control, afterEmbedding))
                             return { query, hits: [] };
                     }
@@ -345,7 +361,7 @@ export class MemoryRetriever {
                 tombstones.push(...await this.dependencies.reader.readTombstones(targets.slice(index, index + 8192)));
             if (tombstones.length > 0)
                 return { query, hits: [] };
-            const finalControl = parseMemoryRecord(await this.dependencies.reader.readControl());
+            const finalControl = parseControlRecord(await this.dependencies.reader.readControl(), input.host);
             if (!sameControl(control, finalControl))
                 return { query, hits: [] };
             const limited = authorized.slice(0, clampLimit(input.limit ?? this.dependencies.config.topK));
@@ -445,7 +461,9 @@ function mandatory(filter, ownerHost) {
         throw new MemoryClientError("configuration", "Guarded Qdrant filter is incomplete");
 }
 function parseBound(pointValue, ownerHost) {
-    const record = recordFromPayload(pointValue.payload, ownerHost, pointValue.vector?.semantic);
+    const record = pointValue.payload.record_type === "collection_control"
+        ? controlRecordFromPayload(pointValue.payload, ownerHost)
+        : recordFromPayload(pointValue.payload, ownerHost, pointValue.vector?.semantic);
     const expected = record.recordType === "collection_control" ? record.id : physicalPointIdFor(record.recordType, record.id);
     if (expected !== pointValue.id)
         invalid("Qdrant point identity is mismatched");

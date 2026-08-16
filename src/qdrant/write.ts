@@ -439,6 +439,13 @@ async function insertOnly<T extends MemoryRecord>(client: QdrantWriteVerificatio
         const normalized = { ...candidate.payload, job_id: point.payload.job_id };
         payloadMatches = canonicalStringify(normalized) === canonicalStringify(point.payload);
       }
+      if (!payloadMatches && parsed.recordType === "processing_policy") {
+        const existing = recordFromPayload(candidate.payload, client.ownerHost);
+        if (existing.recordType === "processing_policy") {
+          const normalized = recordPayload({ ...existing, createdAt: parsed.createdAt, privacyEpoch: parsed.privacyEpoch });
+          payloadMatches = canonicalStringify(normalized) === canonicalStringify(point.payload);
+        }
+      }
       if (!payloadMatches) return false;
       if (point.vector === undefined) return candidate.vector === undefined;
       return candidate.vector !== undefined && canonicalStringify(candidate.vector.semantic) === canonicalStringify(point.vector.semantic);
@@ -1486,6 +1493,30 @@ export class ProductionCoordinationStore {
   }
   async initializeControl(initial: ControlRecord): Promise<ControlRecord> {
     return initializeControlOnProtocol(this.#protocol, this.#authorityScope, initial);
+  }
+  /**
+   * One-time bootstrap→worker control activation: legal ONLY from the exact
+   * active version-0 bootstrap to version 1 / coordination epoch 1. The worker
+   * ProcessingPolicyRecord must already be persisted and is re-read and
+   * validated here; the next control is CONSTRUCTED from the live bootstrap
+   * (never caller-supplied) so the only permitted delta is exactly
+   * processingPolicyId === coordinationPolicyHash === workerPolicyId.
+   * Returns the freshly re-read control after a won CAS, or false when the
+   * transition does not apply (already activated, lost race, missing policy).
+   */
+  async activateWorkerPolicyControl(workerPolicyId: string): Promise<ControlRecord | false> {
+    if (typeof workerPolicyId !== "string" || !/^[a-f0-9]{64}$/u.test(workerPolicyId)) return false;
+    let current: ControlRecord;
+    try { current = await this.readControl(); } catch { return false; }
+    if (current.version !== 0 || current.state !== "active") return false;
+    try { assertBootstrapControl(current, this.ownerHost); } catch { return false; }
+    let policies: ProcessingPolicyRecord[];
+    try { policies = await this.readProcessingPolicies([workerPolicyId]); } catch { return false; }
+    if (policies.length !== 1 || policies[0]!.id !== workerPolicyId || policies[0]!.policy.id !== workerPolicyId) return false;
+    const pending = { ...current, version: 1, processingPolicyId: workerPolicyId, coordinationPolicyEpoch: 1, coordinationPolicyHash: workerPolicyId, contentHash: "pending" };
+    const next: ControlRecord = { ...pending, contentHash: canonicalRecordHash(pending as ControlRecord) };
+    if (!(await this.#protocol.compareAndSwapControl(0, next))) return false;
+    try { return await this.readControl(); } catch { return false; }
   }
   async beginPolicyDrain(input: { now: number }): Promise<ControlRecord> {
     return beginPolicyDrainOnProtocol(this.#protocol, this.#authorityScope, input);

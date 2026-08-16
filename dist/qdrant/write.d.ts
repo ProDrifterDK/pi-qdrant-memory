@@ -196,6 +196,17 @@ export declare class ProductionCoordinationStore {
     }): Promise<boolean>;
     createTombstone(input: CreateTombstoneInput): Promise<TombstoneRecord[]>;
     initializeControl(initial: ControlRecord): Promise<ControlRecord>;
+    /**
+     * One-time bootstrap→worker control activation: legal ONLY from the exact
+     * active version-0 bootstrap to version 1 / coordination epoch 1. The worker
+     * ProcessingPolicyRecord must already be persisted and is re-read and
+     * validated here; the next control is CONSTRUCTED from the live bootstrap
+     * (never caller-supplied) so the only permitted delta is exactly
+     * processingPolicyId === coordinationPolicyHash === workerPolicyId.
+     * Returns the freshly re-read control after a won CAS, or false when the
+     * transition does not apply (already activated, lost race, missing policy).
+     */
+    activateWorkerPolicyControl(workerPolicyId: string): Promise<ControlRecord | false>;
     beginPolicyDrain(input: {
         now: number;
     }): Promise<ControlRecord>;

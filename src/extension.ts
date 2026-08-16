@@ -14,7 +14,7 @@ import { EmbeddingsClient, bindEmbeddingDestination, bindEmbeddingDocumentClient
 import { MemoryClientError } from "./clients/http.js";
 import { destinationForEndpoint } from "./security/egress.js";
 import { canonicalStringify, deterministicUuid, sha256Hex } from "./domain/canonical.js";
-import { canonicalRecordHash, episodeSemanticProjection, type ControlRecord, type RaptorSummaryRecord } from "./domain/records.js";
+import { canonicalRecordHash, episodeSemanticProjection, type ControlRecord, type ProcessingPolicyRecord, type RaptorSummaryRecord } from "./domain/records.js";
 import { intersectPolicies, processingPolicyHash, type ProcessingPolicy } from "./domain/policy.js";
 import { createOutbox, resolveOutboxNodeId, type Outbox } from "./outbox/store.js";
 import { createIngestProcessor, createOutboxDelivery, type OutboxDelivery } from "./outbox/delivery.js";
@@ -28,6 +28,7 @@ import { loadConfig } from "./config.js";
 import { detectHost, resolveHostAgentMarker } from "./host.js";
 import { resolveProjectIdentity, type ProjectIdentity } from "./project.js";
 import { createGuardedMemoryReadStore, MemoryRetriever, type MemorySearchResult } from "./retrieval/search.js";
+import { assertBootstrapControl } from "./qdrant/schema.js";
 import {
   MemoryService,
   type MemoryWarning,
@@ -244,11 +245,75 @@ function configuredEmbeddingDestination(config: RuntimeConfig): AuthorizedDestin
   }
   return config.privacy.allowedEmbeddingDestinations.length === 1 ? Object.freeze({ ...config.privacy.allowedEmbeddingDestinations[0]! }) : undefined;
 }
+
+/** Narrow IO seam for the one-time bootstrap→worker control activation; production wires the real bundle, tests use fakes. */
+export interface BootstrapActivationIo {
+  readPolicy(id: string): Promise<ProcessingPolicyRecord | null>;
+  insertPolicy(record: ProcessingPolicyRecord): Promise<unknown>;
+  /** Persisted-policy-verified CAS + fresh re-read; false when the transition did not land (lost race or not applicable). */
+  activate(workerPolicyId: string): Promise<ControlRecord | false>;
+  readControl(): Promise<ControlRecord>;
+}
+
+/**
+ * A fresh collection boots with the contract placeholder as
+ * `control.processingPolicyId`, for which no ProcessingPolicyRecord exists.
+ * The first live root session activates it exactly once: persist the session
+ * worker policy insert-only, then CAS control v0→v1 (coordination epoch 0→1,
+ * processingPolicyId/coordinationPolicyHash = worker policy id). Same-config
+ * racers derive the identical content-addressed transition; a divergent winner
+ * never rebrands this session — activation fails closed unless the re-read
+ * control converges EXACTLY on the local worker policy id. Any failure
+ * propagates so the caller keeps the bootstrap control (capture stays buffered
+ * locally) and retries on the next session start.
+ */
+export async function activateBootstrapWorkerPolicy(input: {
+  control: ControlRecord;
+  policy: ProcessingPolicy;
+  now?: () => number;
+  io: BootstrapActivationIo;
+}): Promise<ControlRecord> {
+  const control = input.control;
+  const policy = input.policy;
+  if (policy.ownerHost !== control.ownerHost || policy.id !== processingPolicyHash(policy)) throw new TypeError("Worker policy is not content-addressed for this host");
+  if (control.version !== 0 || control.state !== "active") {
+    // Already-activated (or otherwise non-bootstrap) controls are authoritative
+    // only when they converge on THIS session's worker policy identity; a
+    // divergent winner must never brand a runtime for a different policy. The
+    // coordination hash is deliberately not pinned here: explicit rotations
+    // advance it while the worker policy binding persists.
+    if (control.ownerHost !== policy.ownerHost || control.processingPolicyId !== policy.id || control.contentHash !== canonicalRecordHash(control)) throw new TypeError("Active worker policy does not match the local worker policy");
+    return control;
+  }
+  assertBootstrapControl(control, control.ownerHost);
+  const createdAtMs = (input.now ?? Date.now)();
+  const instant = new Date(createdAtMs);
+  if (!Number.isFinite(instant.getTime())) throw new TypeError("Activation clock is invalid");
+  const pendingRecord = {
+    recordType: "processing_policy" as const, id: policy.id, ownerHost: control.ownerHost, schemaRevision: 1 as const,
+    createdAt: instant.toISOString(), privacyEpoch: control.privacyEpoch, processingPolicyId: policy.id,
+    expiresAt: policy.expiresAt, contentHash: "pending", policy, canonicalHash: policy.id,
+  };
+  const policyRecord: ProcessingPolicyRecord = { ...pendingRecord, contentHash: canonicalRecordHash(pendingRecord as ProcessingPolicyRecord) };
+  // Read-first idempotence: the producer record may already exist from ingest
+  // with the first writer's createdAt provenance; identity is the content hash
+  // (createdAt is excluded), so an exact-hash match converges without a write
+  // and a same-ID/different-hash record fails closed instead of overwriting.
+  const existing = await input.io.readPolicy(policy.id).catch(() => null);
+  if (existing !== null && existing.contentHash !== policyRecord.contentHash) throw new TypeError("Worker policy content hash collision");
+  if (existing === null) await input.io.insertPolicy(policyRecord);
+  const won = await input.io.activate(policy.id);
+  const finalControl = won === false ? await input.io.readControl() : won;
+  if (finalControl.ownerHost !== control.ownerHost || finalControl.version !== 1 || finalControl.coordinationPolicyEpoch !== 1 || finalControl.processingPolicyId !== policy.id || finalControl.coordinationPolicyHash !== policy.id || finalControl.state !== "active" || finalControl.contentHash !== canonicalRecordHash(finalControl)) throw new TypeError("Bootstrap activation did not converge on the local worker policy");
+  return finalControl;
+}
+
 async function createProductionRuntime(
   session: MemoryLifecycleSession,
   outbox: Outbox,
   policy: ProcessingPolicy,
   dependencies: Pick<MemoryExtensionDependencies, "fetchImpl">,
+  onActivationPending?: (warning: MemoryWarning) => void,
 ): Promise<ProductionLifecycleRuntime> {
   // Production mutation authority never accepts an injected transport. Tests
   // inject the high-level lifecycle seam instead of minting raw Qdrant powers.
@@ -265,7 +330,51 @@ async function createProductionRuntime(
     egressMode: session.config.privacy.egressMode, ...(session.config.qdrant.apiKey === undefined ? {} : { apiKey: session.config.qdrant.apiKey }),
     ...(session.config.outbox.nodeId === undefined ? {} : { nodeId: session.config.outbox.nodeId }),
   });
-  const control = await reader.readControl();
+  const initialControl = await reader.readControl();
+  // One-time bootstrap→worker activation: a fresh collection references the
+  // contract placeholder, which has no ProcessingPolicyRecord, so human admin
+  // enqueue cannot resolve the active worker policy until the first live root
+  // session binds its exact worker policy through insert + control CAS. Any
+  // failure keeps the bootstrap control (fail-closed: capture stays buffered
+  // in the durable outbox, no embedding/LLM egress) and is retried on the next
+  // session start; a persistent failure surfaces once as a bounded warning.
+  let control = initialControl;
+  if (initialControl.version === 0 && initialControl.state === "active") {
+    let activationBundle: ReturnType<typeof createQdrantSafeBundle> | undefined;
+    const activationIo = () => {
+      activationBundle ??= createQdrantSafeBundle({
+        options: { baseUrl: session.config.qdrant.url, collection: session.config.qdrant.collection, ownerHost: session.host, timeoutMs: session.config.retrieval.timeoutMs,
+          readConsistency: session.config.coordination.readConsistency, maxClockSkewMs: session.config.coordination.maxClockSkewMs,
+          replicationFactor: session.config.qdrant.replicationFactor, writeConsistencyFactor: session.config.qdrant.writeConsistencyFactor,
+          ...(session.config.qdrant.apiKey === undefined ? {} : { apiKey: session.config.qdrant.apiKey }) },
+        destination: qdrantDestination, egressMode: session.config.privacy.egressMode,
+        ...(session.config.outbox.nodeId === undefined ? {} : { nodeId: session.config.outbox.nodeId }),
+        coordinationPolicyHash: initialControl.coordinationPolicyHash, coordinationPolicyEpoch: initialControl.coordinationPolicyEpoch,
+      });
+      return activationBundle;
+    };
+    try {
+      control = await activateBootstrapWorkerPolicy({
+        control: initialControl, policy,
+        io: {
+          readPolicy: (id) => bindQdrantDestination(activationIo().qdrant, qdrantDestination).retrieve("processing_policy", id),
+          insertPolicy: async (record) => { await bindQdrantDestination(activationIo().qdrant, qdrantDestination).insertAndReadback(record); },
+          activate: (workerPolicyId) => activationIo().store.activateWorkerPolicyControl(workerPolicyId),
+          readControl: () => reader.readControl(),
+        },
+      });
+    } catch {
+      control = initialControl;
+    }
+  }
+  // A bootstrap placeholder or a divergent activation winner never brands this
+  // session's worker policy: fail closed until activation converges on the
+  // exact local policy identity. coordinationPolicyHash is not pinned here:
+  // explicit coordination rotations legitimately advance it post-activation.
+  if (control.version === 0 || control.state !== "active" || control.processingPolicyId !== policy.id) {
+    onActivationPending?.({ category: "configuration", message: "pi-qdrant-memory: worker policy activation pending; capture remains buffered locally." });
+    throw new MemoryClientError("configuration", "Memory worker policy activation is pending");
+  }
   const bundle = createQdrantSafeBundle({
     options: { baseUrl: session.config.qdrant.url, collection: session.config.qdrant.collection, ownerHost: session.host, timeoutMs: session.config.retrieval.timeoutMs,
       readConsistency: session.config.coordination.readConsistency, maxClockSkewMs: session.config.coordination.maxClockSkewMs,
@@ -883,7 +992,7 @@ export function createMemoryExtension(
     let disabledWarning: MemoryWarning | undefined;
     const lifecycleInput = { homeDir: dependencies.homeDir ?? homedir(), env, ...(dependencies.now === undefined ? {} : { now: dependencies.now }) };
     let lifecycle: MemoryLifecycleCoordinator = dependencies.lifecycleCoordinator ?? (dependencies.lifecycleCoordinatorFactory === undefined
-      ? createProductionLifecycleCoordinatorInternal({ ...lifecycleInput, runtimeFactory: (session, outbox, policy) => createProductionRuntime(session, outbox, policy, dependencies) })
+      ? createProductionLifecycleCoordinatorInternal({ ...lifecycleInput, runtimeFactory: (session, outbox, policy) => createProductionRuntime(session, outbox, policy, dependencies, (warning) => warnOnce(warning, session.ctx, "lifecycle:activation")) })
       : dependencies.lifecycleCoordinatorFactory(lifecycleInput));
     let sessionState: SessionLifecycleState | undefined;
     let captureEnabled = false;
@@ -968,7 +1077,7 @@ export function createMemoryExtension(
             ...(activeConfig.outbox.nodeId === undefined ? {} : { nodeId: activeConfig.outbox.nodeId }),
           }, activeConfig.qdrant.apiKey, dependencies.fetchImpl));
           const resolveEmbedding = async (control: ControlRecord) => {
-            const destination = configuredEmbeddingDestination(activeConfig); if (destination === undefined || validatedEmbeddings === undefined || control.ownerHost !== host || control.state !== "active" || control.revokedDestinationIds.includes(destination.id)) return undefined;
+            const destination = configuredEmbeddingDestination(activeConfig); if (destination === undefined || validatedEmbeddings === undefined || control.version === 0 || control.ownerHost !== host || control.state !== "active" || control.revokedDestinationIds.includes(destination.id)) return undefined;
             const factory = createEmbeddingDestinationFactory({ endpoint: activeConfig.embeddings.baseUrl, destination, client: validatedEmbeddings, egressMode: activeConfig.privacy.egressMode, ...(activeConfig.outbox.nodeId === undefined ? {} : { nodeId: activeConfig.outbox.nodeId }), coordinationPolicyHash: control.coordinationPolicyHash, coordinationPolicyEpoch: control.coordinationPolicyEpoch });
             return Object.freeze({ embedding: bindEmbeddingDestination(factory, destination), destination });
           };
@@ -1051,7 +1160,7 @@ export function createMemoryExtension(
     pi.on("session_start", async (_event, ctx) => {
       try { service?.clear(); } catch { /* cache reset is best effort */ }
       try { lifecycle.clear(); } catch { warnOnce(lifecycleWarning("start"), ctx, "lifecycle:start"); }
-      sessionState = undefined; rootTurns = 0; rootToolCalls = 0; pendingRootEpisodes = [];
+      sessionState = undefined; captureEnabled = false; rootTurns = 0; rootToolCalls = 0; pendingRootEpisodes = [];
       if (disabledWarning !== undefined) warnOnce(disabledWarning, ctx);
       await service?.checkHealth(ctx);
       if (host === undefined || config === undefined || !config.capture.enabled) return;
@@ -1060,6 +1169,7 @@ export function createMemoryExtension(
         const project = await projectResolver(ctx.cwd);
         if (!validProjectIdentity(project)) throw new Error("project identity");
         const marker = resolveHostAgentMarker(host, ctx.sessionManager.getHeader(), env);
+        if (!marker.rootWorkAllowed) return;
         const state = { sessionId, project, marker } satisfies SessionLifecycleState;
         const recovery = await closedProducerPaths(host, dependencies.homeDir ?? homedir(), env, (dependencies.now ?? Date.now)(), config.coordination.maxClockSkewMs);
         await lifecycle.start({ host, config, sessionId, cwd: ctx.cwd, project, marker, getEntries: sessionEntries(ctx), ctx });

@@ -349,7 +349,7 @@ try {
   const qdrantDestination = egress.destinationForEndpoint(qdrantBase, nodeId, { residency: "local", dataUse: "memory" });
   const embeddingDestination = egress.destinationForEndpoint(`${embeddingBase}/v1`, nodeId, { residency: "local", dataUse: "memory" });
   const completionDestination = egress.destinationForEndpoint(`${completionBase}/v1`, nodeId, { residency: "local", dataUse: "memory" });
-  const qdrantPolicyBase = { id: "pending", ownerHost: expectedHost, destinationIds: { qdrant: qdrantDestination.id, embedding: embeddingDestination.id, llm: completionDestination.id }, originProvider: "openai", allowCrossProviderReplay: false, expiresAt: null, residency: "local", dataUse: "memory", policyRevision: "compat-v2" };
+  const qdrantPolicyBase = { id: "pending", ownerHost: expectedHost, destinationIds: { qdrant: qdrantDestination.id, embedding: embeddingDestination.id, llm: completionDestination.id }, originProvider: "openai", allowCrossProviderReplay: false, expiresAt: null, residency: "local", dataUse: "memory", policyRevision: "capture-lifecycle-v1" };
   const qdrantPolicy = { ...qdrantPolicyBase, id: policyModule.processingPolicyHash(qdrantPolicyBase) };
   const controlBase = { ownerHost: expectedHost, schemaRevision: 1, createdAt: "2026-08-08T00:00:00.000Z", privacyEpoch: 0, processingPolicyId: qdrantPolicy.id, expiresAt: null, recordType: "collection_control", id: schema.COLLECTION_CONTROL_ID, version: 1, activeGeneration: null, activeBaseGeneration: null, coordinationPolicyEpoch: 0, coordinationPolicyHash: schema.V2_CONTRACT_HASH, state: "active", scanCursor: null, lastForgetBarrier: null, revokedDestinationIds: [], contentHash: "pending" };
   const control = { ...controlBase, contentHash: records.canonicalRecordHash(controlBase) };
@@ -540,7 +540,9 @@ try {
   const lifecycleFiles = [];
   const collectLifecycleFiles = (path, prefix = "") => { let entries; try { entries = readdirSync(path, { withFileTypes: true }); } catch { return; } for (const entry of entries) { const relative = prefix === "" ? entry.name : `${prefix}/${entry.name}`; if (entry.isDirectory()) collectLifecycleFiles(join(path, entry.name), relative); else lifecycleFiles.push(relative); } };
   collectLifecycleFiles(tempRoot);
-  assert.ok(capturedWrite, `root lifecycle must persist a post-cutoff episode through the packed extension: ${JSON.stringify({ qdrantWrites, hostNotifications, embeddingRequests, lifecycleFiles: lifecycleFiles.filter((path) => path.includes("pi-qdrant-memory")) })}`);
+  const lifecycleJobs = await Promise.all(lifecycleFiles.filter((path) => path.includes("/jobs/")).map(async (path) => JSON.parse(await readFile(join(tempRoot, path), "utf8"))));
+  const lifecycleStates = await Promise.all(lifecycleFiles.filter((path) => path.includes("/outbox/") && path.endsWith("/state.json")).map(async (path) => JSON.parse(await readFile(join(tempRoot, path), "utf8"))));
+  assert.ok(capturedWrite, `root lifecycle must persist a post-cutoff episode through the packed extension: ${JSON.stringify({ qdrantPolicy, control, qdrantWrites, qdrantReads, qdrantRequests, hostNotifications, stubFailures: stubFailures.map(String), embeddingRequests, lifecycleJobs, lifecycleStates, lifecycleFiles: lifecycleFiles.filter((path) => path.includes("pi-qdrant-memory")) })}`);
   assert.equal(capturedWrite.ownerHost, expectedHost, JSON.stringify(capturedWrite));
   assert.equal(capturedWrite.projectId, expectedProjectId, JSON.stringify(capturedWrite));
   assert.equal(capturedWrite.projectIdentityKind, "registered", JSON.stringify(capturedWrite));
@@ -568,24 +570,24 @@ try {
   assert.match(toolResult.content?.[0]?.text ?? "", /compatibility untrusted fixture/);
 
   {
-    const childLoaded = await hostModule.discoverAndLoadExtensions([extensionPath], tempRoot, join(tempRoot, "agent"));
-    assert.deepEqual(childLoaded.errors, []); assert.equal(childLoaded.extensions.length, 1);
-    const childExtension = childLoaded.extensions[0];
-    const childSessionStart = oneHandler(childExtension, "session_start");
-    const childBeforeAgentStart = oneHandler(childExtension, "before_agent_start");
-    const childContextHandler = oneHandler(childExtension, "context");
-    const childAgentEnd = oneHandler(childExtension, "agent_end");
-    const childBeforeCompact = oneHandler(childExtension, "session_before_compact");
-    const childShutdown = oneHandler(childExtension, "session_shutdown");
-    const childTool = childExtension.tools.get("qdrant_memory_search").definition;
-    const childBranch = [{ type: "message", message: { role: "user", content: "remember child alpha architecture" } }];
-    const childContext = await makeContext({ tempRoot, branch: childBranch, sessionId: "compat-session-child", rlmDepth: expectedHost === "prime" ? 1 : undefined, expectedHost, child: true });
-    const childMessages = [structuredClone(childBranch[0].message)];
-    const beforeChildCounts = [qdrantRequests.length, qdrantWrites.length, completionRequests.length];
     const childEnv = childEnvironment(expectedHost);
     const previousChildEnv = new Map(Object.entries(childEnv).map(([name]) => [name, process.env[name]]));
     Object.assign(process.env, childEnv);
     try {
+      const childLoaded = await hostModule.discoverAndLoadExtensions([extensionPath], tempRoot, join(tempRoot, "agent"));
+      assert.deepEqual(childLoaded.errors, []); assert.equal(childLoaded.extensions.length, 1);
+      const childExtension = childLoaded.extensions[0];
+      const childSessionStart = oneHandler(childExtension, "session_start");
+      const childBeforeAgentStart = oneHandler(childExtension, "before_agent_start");
+      const childContextHandler = oneHandler(childExtension, "context");
+      const childAgentEnd = oneHandler(childExtension, "agent_end");
+      const childBeforeCompact = oneHandler(childExtension, "session_before_compact");
+      const childShutdown = oneHandler(childExtension, "session_shutdown");
+      const childTool = childExtension.tools.get("qdrant_memory_search").definition;
+      const childBranch = [{ type: "message", message: { role: "user", content: "remember child alpha architecture" } }];
+      const childContext = await makeContext({ tempRoot, branch: childBranch, sessionId: "compat-session-child", rlmDepth: expectedHost === "prime" ? 1 : undefined, expectedHost, child: true });
+      const childMessages = [structuredClone(childBranch[0].message)];
+      const beforeChildCounts = [qdrantRequests.length, qdrantWrites.length, completionRequests.length];
       await childSessionStart({ type: "session_start" }, childContext);
       childContext.sessionManager.appendMessage({ role: "user", content: "child post-cutoff memory must not persist" });
       await childBeforeAgentStart({ type: "before_agent_start", prompt: "remember child alpha architecture" }, childContext);
@@ -594,14 +596,14 @@ try {
       const childResult = await childContextHandler({ type: "context", messages: childMessages }, childContext);
       assert.equal(childResult, undefined);
       await childShutdown({ type: "session_shutdown" }, childContext);
+      assert.deepEqual([qdrantRequests.length, qdrantWrites.length, completionRequests.length], beforeChildCounts, `child lifecycle must not recall, capture, curate, or run RAPTOR: ${JSON.stringify(qdrantWrites.slice(beforeChildCounts[1]))}`);
+      const childToolResult = await childTool.execute("compat-tool-child", { query: "explicit child compatibility search", limit: 1 }, undefined, undefined, childContext);
+      assert.equal(typeof childToolResult.content?.[0]?.text, "string");
     } finally {
       for (const [name, value] of previousChildEnv) {
         if (value === undefined) delete process.env[name]; else process.env[name] = value;
       }
     }
-    assert.deepEqual([qdrantRequests.length, qdrantWrites.length, completionRequests.length], beforeChildCounts, "child lifecycle must not recall, capture, curate, or run RAPTOR");
-    const childToolResult = await childTool.execute("compat-tool-child", { query: "explicit child compatibility search", limit: 1 }, undefined, undefined, childContext);
-    assert.equal(typeof childToolResult.content?.[0]?.text, "string");
   }
 
   if (expectedHost === "pi") {

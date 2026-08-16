@@ -3,10 +3,13 @@ import { statusCollectionInfo, statusHealth } from "../../src/admin/transport.js
 import { beginForgetBarrier } from "../../src/coordination/control.js";
 import { createJob } from "../../src/coordination/jobs.js";
 import { createTombstone } from "../../src/coordination/tombstones.js";
-import { COLLECTION_CONTROL_ID } from "../../src/qdrant/schema.js";
+import { COLLECTION_CONTROL_ID, V2_CONTRACT_HASH } from "../../src/qdrant/schema.js";
 import { createGuardedMemoryReadStore, MemoryRetriever } from "../../src/retrieval/search.js";
 import { laneFilter } from "../../src/retrieval/filters.js";
-import { createQdrantCoordinationStore } from "../../src/qdrant/write.js";
+import { createQdrantCoordinationStore, bindQdrantDestination, createQdrantSafeBundle } from "../../src/qdrant/write.js";
+import { activateBootstrapWorkerPolicy } from "../../src/extension.js";
+import { productionOperation } from "../../src/admin/production.js";
+import { intersectPolicies } from "../../src/domain/policy.js";
 import { isolatedCollection, isolatedOptions, initializeIsolated, isolatedQdrantUrl, isolatedRunId, qdrantVersion, waitForIsolatedQdrant, deterministicUuid, isolatedConfig, startEmbeddingStub, task14Episode, task14Policy, task14PolicyRecord, task14Runtime, ISOLATED_QDRANT_VERSION, TASK14_QDRANT_DESTINATION, TASK14_EMBEDDING_DESTINATION, TASK14_LLM_DESTINATION } from "./qdrant-fixtures.js";
 import type { HostId } from "../../src/types.js";
 
@@ -163,5 +166,50 @@ isolated("real Qdrant 1.17.1 collection and coordination contract", () => {
       const prime = stores.get("prime")!;
       await expect(prime.readTombstones([episode.id])).resolves.toHaveLength(0);
     } finally { await stub.close(); }
+  }, 120_000);
+
+  it("activates the bootstrap worker policy so human curation enqueue resolves it", async () => {
+    // Prime remains the exact active version-0 bootstrap through this file.
+    const probe = stores.get("prime")!;
+    const control = await probe.readControl();
+    expect(control).toMatchObject({ version: 0, state: "active", processingPolicyId: V2_CONTRACT_HASH, coordinationPolicyHash: V2_CONTRACT_HASH });
+    const options = isolatedOptions(url, "prime");
+    const bundle = createQdrantSafeBundle({ options, destination: TASK14_QDRANT_DESTINATION, egressMode: "allowlist", coordinationPolicyHash: control.coordinationPolicyHash, coordinationPolicyEpoch: control.coordinationPolicyEpoch });
+    const bound = bindQdrantDestination(bundle.qdrant, TASK14_QDRANT_DESTINATION);
+    const policy = task14Policy("prime", "task14-policy-activation");
+    await bound.insertAndReadback(task14PolicyRecord(policy, control));
+    const vector = Array.from({ length: 1024 }, () => 0.5);
+    const episode = task14Episode({ id: deterministicUuid(`${isolatedRunId(process.env)}:activation:1`), ownerHost: "prime", control, policy, text: "task14 bootstrap activation probe", vector });
+    await bound.insertAndReadback(episode);
+    const config = isolatedConfig(url, "prime");
+    const adminEnv = { PI_QDRANT_MEMORY_ADMIN_QDRANT_API_KEY: "task14-admin" };
+    // Red proof at the production seam: the placeholder has no policy record.
+    await expect(productionOperation(config, adminEnv, { command: "curate", action: "enqueue" })).rejects.toThrow(/active worker policy/i);
+    const activated = await activateBootstrapWorkerPolicy({
+      control, policy, now: () => Date.parse("2026-08-15T00:02:00.000Z"),
+      io: {
+        readPolicy: (id) => bound.retrieve("processing_policy", id),
+        insertPolicy: (record) => bound.insertAndReadback(record),
+        activate: (workerPolicyId) => bundle.store.activateWorkerPolicyControl(workerPolicyId),
+        readControl: () => probe.readControl(),
+      },
+    });
+    expect(activated).toMatchObject({ version: 1, coordinationPolicyEpoch: 1, processingPolicyId: policy.id, coordinationPolicyHash: policy.id, state: "active" });
+    // Idempotent: an already-activated control performs no writes.
+    const again = await activateBootstrapWorkerPolicy({
+      control: activated, policy,
+      io: {
+        readPolicy: async () => { throw new Error("must not read policy"); },
+        insertPolicy: async () => { throw new Error("must not insert"); },
+        activate: async () => { throw new Error("must not activate"); },
+        readControl: () => probe.readControl(),
+      },
+    });
+    expect(again).toBe(activated);
+    // Green: the human admin path now resolves the active worker policy.
+    const result = await productionOperation(config, adminEnv, { command: "curate", action: "enqueue" }) as Record<string, unknown>;
+    expect(result).toMatchObject({ ok: true, queued: true, privacyEpoch: 0, membershipCount: 1 });
+    expect(result.jobId).toBeTypeOf("string");
+    expect(intersectPolicies([policy], policy)?.id).toBe(policy.id);
   }, 120_000);
 });

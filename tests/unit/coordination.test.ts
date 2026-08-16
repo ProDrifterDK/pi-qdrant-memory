@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { canonicalStringify, deterministicUuid, sha256Hex } from "../../src/domain/canonical.js";
 import { contentId, coverageId, curatedCurrentId, episodeId, jobId, leasePointId, manifestHash, observationId, proposalContentHash, proposalIdFor, stateKey, tombstoneId } from "../../src/domain/ids.js";
 import { canonicalRecordHash, type ControlRecord, type CoverageRecord, type EpisodeRecord, type JobRecord, type LeaseRecord, type ProposalRecord, type TombstoneRecord } from "../../src/domain/records.js";
-import { COLLECTION_CONTROL_ID, bootstrapControlHash, controlPayload } from "../../src/qdrant/schema.js";
+import { COLLECTION_CONTROL_ID, V2_CONTRACT_HASH, bootstrapControlHash, controlPayload } from "../../src/qdrant/schema.js";
 import type { QdrantClientOptions } from "../../src/qdrant/client.js";
 import { bindQdrantDestination, createQdrantDestinationFactory, createQdrantSafeBundle, recordPayload } from "../../src/qdrant/write.js";
 import { bindEmbeddingDestination, bindEmbeddingDocumentClient, BoundEmbeddingDestination, createEmbeddingDestinationFactory, EmbeddingsClient, ValidatedEmbeddingDocumentClient } from "../../src/clients/embeddings.js";
@@ -190,7 +190,7 @@ function control(overrides: Partial<ControlRecord> = {}): ControlRecord {
   return { ...value, contentHash: canonicalRecordHash(value) } as ControlRecord;
 }
 function bootstrapControl(overrides: Partial<ControlRecord> = {}): ControlRecord {
-  const base = { ownerHost: OWNER, schemaRevision: 1 as const, createdAt: NOW, privacyEpoch: 0, processingPolicyId: "control-policy-id", expiresAt: null, recordType: "collection_control" as const, id: COLLECTION_CONTROL_ID, version: 0, activeGeneration: null, activeBaseGeneration: null, coordinationPolicyEpoch: 0, coordinationPolicyHash: POLICY_HASH, state: "active" as const, scanCursor: null, lastForgetBarrier: null, revokedDestinationIds: [], ...overrides, contentHash: "pending" };
+  const base = { ownerHost: OWNER, schemaRevision: 1 as const, createdAt: NOW, privacyEpoch: 0, processingPolicyId: V2_CONTRACT_HASH, expiresAt: null, recordType: "collection_control" as const, id: COLLECTION_CONTROL_ID, version: 0, activeGeneration: null, activeBaseGeneration: null, coordinationPolicyEpoch: 0, coordinationPolicyHash: V2_CONTRACT_HASH, state: "active" as const, scanCursor: null, lastForgetBarrier: null, revokedDestinationIds: [], ...overrides, contentHash: "pending" };
   return { ...base, contentHash: bootstrapControlHash(base) } as ControlRecord;
 }
 function lease(jobIdValue: string, overrides: Partial<LeaseRecord> = {}): LeaseRecord {

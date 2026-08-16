@@ -8,6 +8,7 @@ import { EmbeddingsClient, bindEmbeddingDestination, bindEmbeddingDocumentClient
 import { projectCurationItem } from "../../src/curation/projection.js";
 import { manifestHash } from "../../src/domain/ids.js";
 import { physicalPointIdFor } from "../../src/qdrant/client.js";
+import { bootstrapControlHash, COLLECTION_CONTROL_ID, V2_CONTRACT_HASH } from "../../src/qdrant/schema.js";
 import { recordPayload } from "../../src/qdrant/write.js";
 
 describe("guarded retrieval lane filters", () => {
@@ -114,6 +115,44 @@ function readerFixture(): { reader: MemoryReadStore; calls: { exact: ReturnType<
 }
 
 describe("MemoryRetriever guarded exact lane", () => {
+  it("refuses retrieval and embedding egress for a genuine version-0 bootstrap before activation", async () => {
+    const values = fixtures(); const base = readerFixture();
+    // A genuine bootstrap control carries exactly the contract placeholder as
+    // both policy identities; it must never authorize retrieval or query
+    // embedding before the one-time worker-policy activation binds the store.
+    const bootstrapBase = { ...values.control, id: COLLECTION_CONTROL_ID, version: 0, privacyEpoch: 0, processingPolicyId: V2_CONTRACT_HASH, activeGeneration: null, activeBaseGeneration: null, coordinationPolicyEpoch: 0, coordinationPolicyHash: V2_CONTRACT_HASH, state: "active" as const, scanCursor: null, lastForgetBarrier: null, revokedDestinationIds: [], contentHash: "pending" };
+    const bootstrap = { ...bootstrapBase, contentHash: bootstrapControlHash(bootstrapBase as ControlRecord) } as ControlRecord;
+    vi.mocked(base.reader.readControl).mockResolvedValue(bootstrap);
+    const transport = vi.fn(async () => new Response(JSON.stringify({ data: [{ embedding: VECTOR }] }), { status: 200 })); vi.stubGlobal("fetch", transport);
+    try {
+      const client = new EmbeddingsClient({ baseUrl: "http://127.0.0.1:8080/v1", model: "bge-m3", dimension: 1024, queryPrefix: "search_query: ", timeoutMs: 2500 });
+      const embeddingDestination = { id: "embed:local", residency: "local", dataUse: "memory" } as const;
+      const embedding = bindEmbeddingDestination(createEmbeddingDestinationFactory({ endpoint: "http://127.0.0.1:8080/v1", destination: embeddingDestination, client: bindEmbeddingDocumentClient({ endpoint: "http://127.0.0.1:8080/v1", client }), egressMode: "allowlist", coordinationPolicyHash: bootstrap.coordinationPolicyHash, coordinationPolicyEpoch: bootstrap.coordinationPolicyEpoch }), embeddingDestination);
+      const retriever = new MemoryRetriever({ reader: base.reader, config: { topK: 5, candidatesPerLane: 20, minScore: 0.35, projectBoost: 0, contextBudgetChars: 1200, toolResultBudgetChars: 8000, hardContextCharBudget: 16000, timeoutMs: 2500, rootScope: "project", childSearch: true }, embedding, embeddingDestination, queryPrefix: "search_query: ", maxClockSkewMs: 300_000, now: () => Date.parse(NOW) });
+      const result = await retriever.search({ query: "alpha", host: "prime", project: { id: "project-1", label: "repo", identityKind: "registered" }, isChild: false, modelDestination: { id: "provider/model", residency: "local", dataUse: "memory" }, mode: "episodes" });
+      expect(result.hits).toEqual([]);
+      expect(transport).not.toHaveBeenCalled();
+      expect(base.calls.exact).not.toHaveBeenCalled();
+      expect(base.reader.search).not.toHaveBeenCalled();
+      expect(base.reader.readControl).toHaveBeenCalledTimes(1);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it("fails closed for a forged self-hashed version-0 bootstrap identity", async () => {
+    const values = fixtures(); const base = readerFixture();
+    // Self-consistent hashing is not authentication: a v0 control naming a
+    // real policy identity instead of the contract placeholder is forged and
+    // must be rejected before any lane or egress is authorized.
+    const forgedBase = { ...values.control, id: COLLECTION_CONTROL_ID, version: 0, privacyEpoch: 0, processingPolicyId: values.activePolicy.id, activeGeneration: null, activeBaseGeneration: null, coordinationPolicyEpoch: 0, coordinationPolicyHash: values.activePolicy.id, state: "active" as const, scanCursor: null, lastForgetBarrier: null, revokedDestinationIds: [], contentHash: "pending" };
+    const forged = { ...forgedBase, contentHash: bootstrapControlHash(forgedBase as ControlRecord) } as ControlRecord;
+    vi.mocked(base.reader.readControl).mockResolvedValue(forged);
+    const retriever = new MemoryRetriever({ reader: base.reader, config: { topK: 5, candidatesPerLane: 20, minScore: 0.35, projectBoost: 0, contextBudgetChars: 1200, toolResultBudgetChars: 8000, hardContextCharBudget: 16000, timeoutMs: 2500, rootScope: "project", childSearch: true }, now: () => Date.parse(NOW) });
+    const result = await retriever.search({ query: "alpha", host: "prime", project: { id: "project-1", label: "repo", identityKind: "registered" }, isChild: false, modelDestination: { id: "provider/model", residency: "local", dataUse: "memory" }, mode: "episodes" });
+    expect(result.hits).toEqual([]);
+    expect(base.calls.exact).not.toHaveBeenCalled();
+    expect(base.reader.search).not.toHaveBeenCalled();
+  });
+
   it("returns concrete project evidence only after stable control, policy and tombstone checks", async () => {
     const { reader, calls } = readerFixture();
     const retriever = new MemoryRetriever({ reader, config: { topK: 5, candidatesPerLane: 20, minScore: 0.35, projectBoost: 0, contextBudgetChars: 1200, toolResultBudgetChars: 8000, hardContextCharBudget: 16000, timeoutMs: 2500, rootScope: "project", childSearch: true }, now: () => Date.parse(NOW) });

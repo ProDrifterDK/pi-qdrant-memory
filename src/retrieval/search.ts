@@ -10,7 +10,7 @@ import type { MemorySearchMode } from "../tool.js";
 import { fetchJson, fetchOk, MemoryClientError } from "../clients/http.js";
 import { tombstoneId } from "../domain/ids.js";
 import { expectedQdrantCollection, physicalPointIdFor, type QdrantClientOptions } from "../qdrant/client.js";
-import { COLLECTION_CONTROL_ID } from "../qdrant/schema.js";
+import { COLLECTION_CONTROL_ID, assertBootstrapControl, controlRecordFromPayload } from "../qdrant/schema.js";
 import { recordFromPayload } from "../qdrant/write.js";
 import { bindConfiguredDestination } from "../security/egress.js";
 
@@ -105,6 +105,18 @@ function tombstoneTargets(candidate: MemoryCandidate): string[] {
   return [...new Set([candidate.id, ...candidate.evidenceIds, candidate.contentId, candidate.observationId, candidate.stateKey].filter((value): value is string => typeof value === "string" && value.length > 0))].sort();
 }
 function sameControl(left: ControlRecord, right: ControlRecord): boolean { return canonicalStringify(left) === canonicalStringify(right); }
+function parseControlRecord(value: unknown, ownerHost: HostId): ControlRecord {
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    const candidate = value as Record<string, unknown>;
+    if (candidate.recordType === "collection_control" && candidate.version === 0) {
+      assertBootstrapControl(value as ControlRecord, ownerHost);
+      return value as ControlRecord;
+    }
+  }
+  const parsed = parseMemoryRecord(value, { ownerHost });
+  if (parsed.recordType !== "collection_control") throw new TypeError("Collection control is invalid");
+  return parsed;
+}
 function isExpired(expiresAt: string | null | undefined, now: number, skew: number): boolean { return expiresAt !== null && expiresAt !== undefined && Date.parse(expiresAt) <= now + skew; }
 function validProject(project: ProjectIdentity): boolean { return typeof project.id === "string" && project.id.length > 0 && project.id.length <= 512 && (project.identityKind === "registered" || project.identityKind === "local_only") && project.registrationValid !== false; }
 
@@ -118,11 +130,14 @@ export class MemoryRetriever {
     if (input.isChild && !this.dependencies.config.childSearch) return { query, hits: [] };
     try {
       const now = (this.dependencies.now ?? Date.now)();
-      const control = parseMemoryRecord(await this.dependencies.reader.readControl()) as ControlRecord;
-      if (control.recordType !== "collection_control" || control.ownerHost !== input.host || control.state !== "active") return { query, hits: [] };
+      const control = parseControlRecord(await this.dependencies.reader.readControl(), input.host);
+      // A genuine version-0 bootstrap carries only the contract placeholder
+      // identity: it must never authorize retrieval lanes or embedding egress
+      // before the one-time worker-policy activation binds the collection.
+      if (control.recordType !== "collection_control" || control.ownerHost !== input.host || control.state !== "active" || control.version === 0) return { query, hits: [] };
       const readerDestination = this.dependencies.reader.destination;
       if (control.revokedDestinationIds.includes(readerDestination.id) || control.revokedDestinationIds.includes(input.modelDestination.id)) return { query, hits: [] };
-      const preQueryControl = parseMemoryRecord(await this.dependencies.reader.readControl()); if (preQueryControl.recordType !== "collection_control" || !sameControl(control, preQueryControl)) return { query, hits: [] };
+      const preQueryControl = parseControlRecord(await this.dependencies.reader.readControl(), input.host); if (preQueryControl.recordType !== "collection_control" || !sameControl(control, preQueryControl)) return { query, hits: [] };
       const mode = input.mode ?? "all";
       const skew = this.dependencies.maxClockSkewMs ?? 0;
       const exactRecordTypes = mode === "episodes" ? ["episode"] as const : mode === "curated" ? ["curated_memory", "curated_current"] as const : ["episode", "curated_memory", "curated_current"] as const;
@@ -162,7 +177,7 @@ export class MemoryRetriever {
         });
         if (preflightAuthorized) {
           try { denseVector = await embedding.embed({ model: "bge-m3", text: `${this.dependencies.queryPrefix ?? "search_query: "}${query}`, ...(input.signal === undefined ? {} : { signal: input.signal }) }); } catch { denseVector = undefined; }
-          if (denseVector !== undefined) { const afterEmbedding = parseMemoryRecord(await this.dependencies.reader.readControl()) as ControlRecord; if (!sameControl(control, afterEmbedding)) return { query, hits: [] }; }
+          if (denseVector !== undefined) { const afterEmbedding = parseControlRecord(await this.dependencies.reader.readControl(), input.host); if (!sameControl(control, afterEmbedding)) return { query, hits: [] }; }
         }
       }
       const denseLanes: RetrievalLane[] = mode === "all" ? ["current", "historical", "episodes", "curated", "raptor"] : mode === "curated" ? ["current", "historical"] : [mode];
@@ -258,7 +273,7 @@ export class MemoryRetriever {
       const tombstones: TombstoneRecord[] = [];
       for (let index = 0; index < targets.length; index += 8192) tombstones.push(...await this.dependencies.reader.readTombstones(targets.slice(index, index + 8192)));
       if (tombstones.length > 0) return { query, hits: [] };
-      const finalControl = parseMemoryRecord(await this.dependencies.reader.readControl()) as ControlRecord;
+      const finalControl = parseControlRecord(await this.dependencies.reader.readControl(), input.host);
       if (!sameControl(control, finalControl)) return { query, hits: [] };
       const limited = authorized.slice(0, clampLimit(input.limit ?? this.dependencies.config.topK));
       return { query, hits: mode === "historical" ? limited.sort((left, right) => (left.validFrom ?? "").localeCompare(right.validFrom ?? "") || left.id.localeCompare(right.id)) : limited };
@@ -317,7 +332,9 @@ function mandatory(filter: GuardedLaneFilter, ownerHost: "pi" | "prime"): void {
   if (!has("owner_host", ownerHost) || !has("status", "active") || !has("secret_scan", "passed") || !filter.must.some((condition) => "key" in condition && condition.key === "record_type") || !filter.must.some((condition) => "key" in condition && condition.key === "privacy_epoch") || !filter.should.some((condition) => "is_null" in condition && condition.is_null.key === "expires_at") || !filter.should.some((condition) => "key" in condition && condition.key === "expires_at" && "range" in condition && typeof condition.range.gt === "string")) throw new MemoryClientError("configuration", "Guarded Qdrant filter is incomplete");
 }
 function parseBound(pointValue: WirePoint, ownerHost: "pi" | "prime"): MemoryRecord {
-  const record = recordFromPayload(pointValue.payload, ownerHost, pointValue.vector?.semantic);
+  const record = pointValue.payload.record_type === "collection_control"
+    ? controlRecordFromPayload(pointValue.payload, ownerHost)
+    : recordFromPayload(pointValue.payload, ownerHost, pointValue.vector?.semantic);
   const expected = record.recordType === "collection_control" ? record.id : physicalPointIdFor(record.recordType, record.id);
   if (expected !== pointValue.id) invalid("Qdrant point identity is mismatched");
   return record;

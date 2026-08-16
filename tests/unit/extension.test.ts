@@ -10,12 +10,12 @@ import { mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/prom
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import extension, { createMemoryExtension, type MemoryLifecycleCoordinator } from "../../src/extension.js";
+import extension, { activateBootstrapWorkerPolicy, createMemoryExtension, type MemoryLifecycleCoordinator } from "../../src/extension.js";
 import { MEMORY_CONTEXT_CUSTOM_TYPE } from "../../src/format.js";
 import { canonicalStringify, deterministicUuid, sha256Hex } from "../../src/domain/canonical.js";
 import { canonicalRecordHash, type ControlRecord, type EpisodeRecord, type ProcessingPolicyRecord } from "../../src/domain/records.js";
-import { processingPolicyHash, type ProcessingPolicy } from "../../src/domain/policy.js";
-import { COLLECTION_CONTROL_ID } from "../../src/qdrant/schema.js";
+import { processingPolicyHash, intersectPolicies, type ProcessingPolicy } from "../../src/domain/policy.js";
+import { COLLECTION_CONTROL_ID, V2_CONTRACT_HASH, bootstrapControlHash, controlPayload } from "../../src/qdrant/schema.js";
 import { physicalPointIdFor } from "../../src/qdrant/client.js";
 import { recordPayload } from "../../src/qdrant/write.js";
 import { destinationForEndpoint } from "../../src/security/egress.js";
@@ -97,19 +97,26 @@ function registeredProject(): ProjectIdentity {
   return { id: "project-id", label: "project", identityKind: "registered", registrationValid: true, canonicalPath: "/workspace/project", fingerprint: "fingerprint-project" };
 }
 
-function runtimeFetch(host: "prime" | "pi") {
+function runtimeFetch(host: "prime" | "pi", input: { bootstrap?: boolean; divergentActivation?: boolean; failWrites?: boolean; includeLlm?: boolean; originProvider?: string } = {}) {
   const calls: Array<{ url: string; body?: any }> = [];
   const collection = host === "pi" ? "pi_memory" : "prime_memory";
   const qdrantDestination = destinationForEndpoint("http://127.0.0.1:6333", "node-test", { residency: "local", dataUse: "memory" });
   const embeddingDestination = destinationForEndpoint("http://127.0.0.1:8080/v1", "node-test", { residency: "local", dataUse: "memory" });
   const llmDestination = destinationForEndpoint("http://127.0.0.1:9999/v1", "node-test", { residency: "local", dataUse: "memory" });
-  const policyBase: ProcessingPolicy = { id: "pending", ownerHost: host, destinationIds: { qdrant: qdrantDestination.id, embedding: embeddingDestination.id, llm: llmDestination.id }, originProvider: "provider", allowCrossProviderReplay: false, expiresAt: null, residency: "local", dataUse: "memory", policyRevision: "processing-policy-v1" };
+  // Mirror the session worker policy the extension derives via capturePolicy:
+  // revision capture-lifecycle-v1, and an llm destination only when the test
+  // config authorizes one (fallback or exact allowlist).
+  const policyBase: ProcessingPolicy = { id: "pending", ownerHost: host, destinationIds: { qdrant: qdrantDestination.id, embedding: embeddingDestination.id, ...(input.includeLlm === false ? {} : { llm: llmDestination.id }) }, originProvider: input.originProvider ?? "provider", allowCrossProviderReplay: false, expiresAt: null, residency: "local", dataUse: "memory", policyRevision: "capture-lifecycle-v1" };
   const policy: ProcessingPolicy = { ...policyBase, id: processingPolicyHash(policyBase) };
   const canonical = <T extends { contentHash: string }>(value: T): T => ({ ...value, contentHash: canonicalRecordHash(value as never) });
   const policyRecord = canonical<ProcessingPolicyRecord>({ recordType: "processing_policy", id: policy.id, ownerHost: host, schemaRevision: 1, createdAt: "2026-08-13T15:00:00.000Z", privacyEpoch: 0, processingPolicyId: policy.id, expiresAt: null, policy, canonicalHash: policy.id, contentHash: "pending" });
-  const control = canonical<ControlRecord>({ recordType: "collection_control", id: COLLECTION_CONTROL_ID, ownerHost: host, schemaRevision: 1, createdAt: "2026-08-13T15:00:00.000Z", privacyEpoch: 0, processingPolicyId: policy.id, expiresAt: null, version: 1, activeGeneration: null, activeBaseGeneration: null, coordinationPolicyEpoch: 1, coordinationPolicyHash: "coord-hash", state: "active", scanCursor: null, lastForgetBarrier: null, revokedDestinationIds: [], contentHash: "pending" });
-  const episode = canonical<EpisodeRecord>({ recordType: "episode", id: "11111111-1111-5111-8111-111111111111", ownerHost: host, schemaRevision: 1, createdAt: "2026-08-13T15:00:00.000Z", privacyEpoch: 0, processingPolicyId: policy.id, expiresAt: null, sourceEntryId: "entry-1", host, projectId: "project-id", projectIdentityKind: "registered", sessionId: "session-1", turnId: "turn-1", agentRole: "root", depth: 0, eventKind: "user", eventAt: "2026-08-13T15:00:00.000Z", modelId: "model", embeddingDimension: 1024, originProvider: "provider", destinationId: llmDestination.id, status: "active", redactionStatus: "unchanged", secretScan: "passed", text: "Portable recalled context for root agents", vector: Array.from({ length: 1024 }, () => Math.fround(0.1)), contentHash: "pending" });
-  const points = new Map([
+  const control = input.bootstrap === true
+    ? bootstrapControlFixture(host)
+    : canonical<ControlRecord>({ recordType: "collection_control", id: COLLECTION_CONTROL_ID, ownerHost: host, schemaRevision: 1, createdAt: "2026-08-13T15:00:00.000Z", privacyEpoch: 0, processingPolicyId: policy.id, expiresAt: null, version: 1, activeGeneration: null, activeBaseGeneration: null, coordinationPolicyEpoch: 1, coordinationPolicyHash: "coord-hash", state: "active", scanCursor: null, lastForgetBarrier: null, revokedDestinationIds: [], contentHash: "pending" });
+  const episode = canonical<EpisodeRecord>({ recordType: "episode", id: "11111111-1111-5111-8111-111111111111", ownerHost: host, schemaRevision: 1, createdAt: "2026-08-13T15:00:00.000Z", privacyEpoch: 0, processingPolicyId: policy.id, expiresAt: null, sourceEntryId: "entry-1", host, projectId: "project-id", projectIdentityKind: "registered", sessionId: "session-1", turnId: "turn-1", agentRole: "root", depth: 0, eventKind: "user", eventAt: "2026-08-13T15:00:00.000Z", modelId: "model", embeddingDimension: 1024, originProvider: input.originProvider ?? "provider", destinationId: llmDestination.id, status: "active", redactionStatus: "unchanged", secretScan: "passed", text: "Portable recalled context for root agents", vector: Array.from({ length: 1024 }, () => Math.fround(0.1)), contentHash: "pending" });
+  const points = input.bootstrap === true
+    ? new Map([[COLLECTION_CONTROL_ID, { id: COLLECTION_CONTROL_ID, payload: controlPayload(control) }]])
+    : new Map([
     [COLLECTION_CONTROL_ID, { id: COLLECTION_CONTROL_ID, payload: recordPayload(control) }],
     [physicalPointIdFor("processing_policy", policy.id), { id: physicalPointIdFor("processing_policy", policy.id), payload: recordPayload(policyRecord) }],
     [episode.id, { id: episode.id, payload: recordPayload(episode), vector: { semantic: episode.vector! } }],
@@ -135,7 +142,20 @@ function runtimeFetch(host: "prime" | "pi") {
       return new Response(JSON.stringify({ result, status: "ok" }));
     }
     if (parsedUrl.pathname.endsWith("/points") && init?.method === "PUT") {
-      for (const point of body?.points ?? []) points.set(point.id, point);
+      if (input.failWrites === true) return new Response("writes disabled", { status: 500 });
+      for (const point of body?.points ?? []) {
+        if (input.divergentActivation === true && point.payload?.record_type === "collection_control") {
+          // Simulate a divergent racer winning the activation CAS: the stored
+          // control advances to v1 bound to a DIFFERENT worker policy.
+          const divergentBase: ProcessingPolicy = { ...policyBase, expiresAt: "2030-01-01T00:00:00.000Z" };
+          const divergentPolicy: ProcessingPolicy = { ...divergentBase, id: processingPolicyHash(divergentBase) };
+          const divergentPending = { ...bootstrapControlFixture(host), version: 1, processingPolicyId: divergentPolicy.id, coordinationPolicyEpoch: 1, coordinationPolicyHash: divergentPolicy.id, contentHash: "pending" };
+          const divergent: ControlRecord = { ...divergentPending, contentHash: canonicalRecordHash(divergentPending as ControlRecord) };
+          points.set(COLLECTION_CONTROL_ID, { id: COLLECTION_CONTROL_ID, payload: recordPayload(divergent) });
+          continue;
+        }
+        points.set(point.id, point);
+      }
       return new Response(JSON.stringify({ result: { status: "acknowledged" }, status: "ok" }));
     }
     return new Response("not found", { status: 404 });
@@ -519,7 +539,7 @@ describe("autonomous lifecycle wiring", () => {
     await invokeBefore(fake.handler("before_agent_start"), "child prompt that must not recall", context.value);
     expect(await fake.handler("context")({ type: "context", messages: [user("child prompt that must not recall")] }, context.value)).toBeUndefined();
     await fake.handler("session_before_compact")({ type: "session_before_compact", branchEntries: [] }, context.value);
-    expect(lifecycle.calls.filter((call) => call.method === "scheduleRoot")).toHaveLength(0);
+    expect(lifecycle.calls.filter((call) => ["start", "capture", "deliver", "scheduleRoot"].includes(call.method))).toHaveLength(0);
     expect(runtime.calls).toHaveLength(afterHealth);
   });
 
@@ -749,7 +769,7 @@ describe("production capture coordinator", () => {
     const homeDir = await mkdtemp(join(tmpdir(), "pi-qdrant-shutdown-job-"));
     const env = { PI_CODING_AGENT_DIR: join(homeDir, ".pi", "agent"), PI_QDRANT_MEMORY_HOST: "pi" };
     const configured = JSON.parse(hostConfig(true, true)); configured.curation = { turnTrigger: 100, toolTrigger: 100 }; configured.memoryModel = { modelId: "memory-provider/memory-model", timeoutMs: 30000, maxOutputTokens: 2048 };
-    const runtime = runtimeFetch("pi"); vi.stubGlobal("fetch", runtime.fetchImpl);
+    const runtime = runtimeFetch("pi", { includeLlm: false }); vi.stubGlobal("fetch", runtime.fetchImpl);
     try {
       const api = fakeApi(); const base = Date.now(); let completions = 0;
       const factory = createMemoryExtension({ env, argv: [], homeDir, now: () => base, readTextFile: async () => JSON.stringify(configured), projectResolver: async () => registeredProject() });
@@ -769,7 +789,7 @@ describe("production capture coordinator", () => {
     const homeDir = await mkdtemp(join(tmpdir(), "pi-qdrant-privacy-recovery-"));
     const env = { PI_CODING_AGENT_DIR: join(homeDir, ".pi", "agent"), PI_QDRANT_MEMORY_HOST: "pi" };
     const configured = JSON.parse(hostConfig(true, true)); configured.curation = { turnTrigger: 1, toolTrigger: 1 }; configured.memoryModel = { modelId: "memory-provider/memory-model", timeoutMs: 30000, maxOutputTokens: 2048 };
-    const runtime = runtimeFetch("pi");
+    const runtime = runtimeFetch("pi", { includeLlm: false });
     const seededEpisode = [...runtime.points.entries()].find(([, point]) => point.payload?.record_type === "episode");
     expect(seededEpisode).toBeDefined(); runtime.points.set(seededEpisode![0], { ...seededEpisode![1], payload: { ...seededEpisode![1].payload, privacy_epoch: -1 } });
     vi.stubGlobal("fetch", runtime.fetchImpl);
@@ -792,7 +812,9 @@ describe("production capture coordinator", () => {
     const configured = JSON.parse(hostConfig(true, true)); configured.curation = { turnTrigger: 1, toolTrigger: 100 }; configured.memoryModel = { modelId: "memory-provider/memory-model", timeoutMs: 30000, maxOutputTokens: 2048 };
     const exactLlmDestination = destinationForEndpoint("http://127.0.0.1:9999/v1", "node-test", { residency: "local", dataUse: "memory" });
     configured.privacy.allowedLlmDestinations = [{ id: exactLlmDestination.id, residency: exactLlmDestination.residency, dataUse: exactLlmDestination.dataUse }];
-    const runtime = runtimeFetch("pi"); vi.stubGlobal("fetch", runtime.fetchImpl);
+    const runtime = runtimeFetch("pi", { originProvider: "memory-provider" });
+    for (const [id, point] of runtime.points) if (point.payload?.record_type === "episode") runtime.points.delete(id);
+    vi.stubGlobal("fetch", runtime.fetchImpl);
     try {
       const api = fakeApi(); const base = Date.now(); let registryCalls = 0; let registryAvailable = false; let completions = 0;
       const factory = createMemoryExtension({ env, argv: [], homeDir, now: () => base, readTextFile: async () => JSON.stringify(configured), projectResolver: async () => registeredProject() });
@@ -860,7 +882,7 @@ describe("production capture coordinator", () => {
     const homeDir = await mkdtemp(join(tmpdir(), "pi-qdrant-production-job-"));
     const env = { PI_CODING_AGENT_DIR: join(homeDir, ".pi", "agent"), PI_QDRANT_MEMORY_HOST: "pi" };
     const configured = JSON.parse(hostConfig(true, true)); configured.privacy.allowActiveModelFallback = false; configured.curation = { turnTrigger: 1, toolTrigger: 100 };
-    const runtime = runtimeFetch("pi"); vi.stubGlobal("fetch", runtime.fetchImpl);
+    const runtime = runtimeFetch("pi", { includeLlm: false }); vi.stubGlobal("fetch", runtime.fetchImpl);
     try {
       const api = fakeApi(); const base = Date.now();
       const factory = createMemoryExtension({ env, argv: [], homeDir, now: () => base, readTextFile: async () => JSON.stringify(configured), projectResolver: async () => registeredProject() });
@@ -877,4 +899,230 @@ describe("production capture coordinator", () => {
     } finally { vi.unstubAllGlobals(); }
   });
 
+  it("fails closed with one bounded warning when a divergent activation winner would rebrand this session", async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), "pi-qdrant-divergent-activation-"));
+    const env = { PI_CODING_AGENT_DIR: join(homeDir, ".pi", "agent"), PI_QDRANT_MEMORY_HOST: "pi" };
+    const configured = JSON.parse(hostConfig(true, true)); configured.curation = { turnTrigger: 1, toolTrigger: 100 };
+    const runtime = runtimeFetch("pi", { bootstrap: true, divergentActivation: true }); vi.stubGlobal("fetch", runtime.fetchImpl);
+    try {
+      const api = fakeApi(); const base = Date.now();
+      const factory = createMemoryExtension({ env, argv: [], homeDir, now: () => base, readTextFile: async () => JSON.stringify(configured), projectResolver: async () => registeredProject() });
+      await factory(api.api); const entries: any[] = []; const context = ctx({ sessionId: "session-divergent-activation", entries, header: null });
+      await api.handler("session_start")({ type: "session_start", reason: "startup" }, context.value);
+      expect(context.notifications).toEqual([{ message: "pi-qdrant-memory: worker policy activation pending; capture remains buffered locally.", type: "warning" }]);
+      await api.handler("session_start")({ type: "session_start", reason: "reload" }, context.value);
+      // The activation failure surfaces exactly once as a bounded, sanitized
+      // warning; internals never leak into the notification.
+      expect(context.notifications).toEqual([{ message: "pi-qdrant-memory: worker policy activation pending; capture remains buffered locally.", type: "warning" }]);
+      entries.push({ id: "divergent-entry", type: "message", message: { role: "user", content: "divergent winner episode", timestamp: base + 1 } });
+      await api.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
+      await api.handler("session_shutdown")({ type: "session_shutdown", reason: "quit" }, context.value);
+      // The losing session never delivers, schedules, or curates under the
+      // winner's coordination identity: nothing leaves the durable outbox.
+      const payloads = [...runtime.points.values()].map((point) => point.payload as Record<string, unknown>);
+      expect(payloads.some((payload) => payload.record_type === "episode" && payload.text === "divergent winner episode")).toBe(false);
+      expect(payloads.some((payload) => payload.record_type === "job")).toBe(false);
+      expect(payloads.some((payload) => payload.record_type === "curated_memory")).toBe(false);
+      const outboxRoot = join(env.PI_CODING_AGENT_DIR, "pi-qdrant-memory", "outbox");
+      const node = (await readdir(outboxRoot)).find((name) => name.startsWith("node-"))!;
+      const producers = (await readdir(join(outboxRoot, node))).filter((name) => !name.endsWith(".json"));
+      const jobs = (await Promise.all(producers.map((producer) => readdir(join(outboxRoot, node, producer, "jobs"))))).flat();
+      expect(jobs).toHaveLength(1);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+});
+
+function bootstrapControlFixture(host: "pi" | "prime" = "pi"): ControlRecord {
+  const base = { ownerHost: host, schemaRevision: 1 as const, createdAt: "2026-08-16T00:00:00.000Z", privacyEpoch: 0, processingPolicyId: V2_CONTRACT_HASH, expiresAt: null, recordType: "collection_control" as const, id: COLLECTION_CONTROL_ID, version: 0, activeGeneration: null, activeBaseGeneration: null, coordinationPolicyEpoch: 0, coordinationPolicyHash: V2_CONTRACT_HASH, state: "active" as const, scanCursor: null, lastForgetBarrier: null, revokedDestinationIds: [] as string[], contentHash: "pending" };
+  return { ...base, contentHash: bootstrapControlHash(base as ControlRecord) };
+}
+
+function workerPolicyFixture(host: "pi" | "prime" = "pi", expiresAt: string | null = null): ProcessingPolicy {
+  const pending: ProcessingPolicy = { id: "pending", ownerHost: host, destinationIds: { qdrant: "qdrant-dest", embedding: "embed-dest", llm: "llm-dest" }, originProvider: "provider", allowCrossProviderReplay: false, expiresAt, residency: "local", dataUse: "memory", policyRevision: "capture-lifecycle-v1" };
+  return { ...pending, id: processingPolicyHash(pending) };
+}
+
+function activationIo(control: ControlRecord, overrides: Partial<{
+  readPolicy: (id: string) => Promise<ProcessingPolicyRecord | null>;
+  insertPolicy: (record: ProcessingPolicyRecord) => Promise<unknown>;
+  activate: (workerPolicyId: string) => Promise<ControlRecord | false>;
+  readControl: () => Promise<ControlRecord>;
+}> = {}) {
+  const events: string[] = [];
+  const inserted: ProcessingPolicyRecord[] = [];
+  const activateCalls: string[] = [];
+  const winnerFor = (policyId: string): ControlRecord => {
+    const pending = { ...control, version: 1, processingPolicyId: policyId, coordinationPolicyEpoch: 1, coordinationPolicyHash: policyId, contentHash: "pending" };
+    return { ...pending, contentHash: canonicalRecordHash(pending as ControlRecord) } as ControlRecord;
+  };
+  const io = {
+    readPolicy: async (id: string) => { events.push("readPolicy"); return overrides.readPolicy === undefined ? null : overrides.readPolicy(id); },
+    insertPolicy: async (record: ProcessingPolicyRecord) => { events.push("insert"); inserted.push(record); if (overrides.insertPolicy !== undefined) return overrides.insertPolicy(record); },
+    activate: async (workerPolicyId: string) => { events.push("activate"); activateCalls.push(workerPolicyId); return overrides.activate === undefined ? winnerFor(workerPolicyId) : overrides.activate(workerPolicyId); },
+    readControl: overrides.readControl ?? (async () => { throw new Error("readControl not stubbed"); }),
+  };
+  return { events, inserted, activateCalls, winnerFor, io };
+}
+
+describe("bootstrap worker policy activation", () => {
+  it("persists the exact worker policy record before the verified activation transition", async () => {
+    const control = bootstrapControlFixture();
+    const policy = workerPolicyFixture();
+    const harness = activationIo(control);
+    const result = await activateBootstrapWorkerPolicy({ control, policy, now: () => Date.parse("2026-08-16T01:00:00.000Z"), io: harness.io });
+    expect(result).toStrictEqual(harness.winnerFor(policy.id));
+    expect(harness.events).toEqual(["readPolicy", "insert", "activate"]);
+    expect(harness.inserted).toHaveLength(1);
+    expect(harness.inserted[0]).toMatchObject({ recordType: "processing_policy", id: policy.id, ownerHost: "pi", schemaRevision: 1, createdAt: "2026-08-16T01:00:00.000Z", privacyEpoch: 0, processingPolicyId: policy.id, expiresAt: null, canonicalHash: policy.id });
+    expect(harness.inserted[0]!.policy).toEqual(policy);
+    expect(harness.inserted[0]!.contentHash).toBe(canonicalRecordHash(harness.inserted[0]!));
+    expect(harness.activateCalls).toEqual([policy.id]);
+    expect(result).toMatchObject({ id: COLLECTION_CONTROL_ID, ownerHost: "pi", version: 1, processingPolicyId: policy.id, coordinationPolicyEpoch: 1, coordinationPolicyHash: policy.id, privacyEpoch: 0, state: "active", activeGeneration: null, revokedDestinationIds: [] });
+  });
+
+  it("satisfies the admin enqueue precondition after activation", async () => {
+    const control = bootstrapControlFixture();
+    const policy = workerPolicyFixture();
+    const harness = activationIo(control);
+    const result = await activateBootstrapWorkerPolicy({ control, policy, io: harness.io });
+    // src/admin/production.ts requires the active worker policy record to exist for control.processingPolicyId.
+    expect(result.processingPolicyId).toBe(policy.id);
+    expect(harness.inserted.map((record) => record.id)).toContain(result.processingPolicyId);
+  });
+
+  it("converges without a write when the worker policy record already exists with first-writer provenance", async () => {
+    const control = bootstrapControlFixture();
+    const policy = workerPolicyFixture();
+    const pendingRecord = { recordType: "processing_policy" as const, id: policy.id, ownerHost: "pi" as const, schemaRevision: 1 as const, createdAt: "2026-08-15T00:00:30.000Z", privacyEpoch: 0, processingPolicyId: policy.id, expiresAt: null, contentHash: "pending", policy, canonicalHash: policy.id };
+    const existing: ProcessingPolicyRecord = { ...pendingRecord, contentHash: canonicalRecordHash(pendingRecord as ProcessingPolicyRecord) };
+    const harness = activationIo(control, { readPolicy: async () => existing });
+    await expect(activateBootstrapWorkerPolicy({ control, policy, io: harness.io })).resolves.toStrictEqual(harness.winnerFor(policy.id));
+    expect(harness.inserted).toHaveLength(0);
+    expect(harness.activateCalls).toEqual([policy.id]);
+  });
+
+  it("fails closed when a same-ID worker policy record has a different content hash", async () => {
+    const control = bootstrapControlFixture();
+    const policy = workerPolicyFixture();
+    const collidingPending = { recordType: "processing_policy" as const, id: policy.id, ownerHost: "pi" as const, schemaRevision: 1 as const, createdAt: "2026-08-15T00:00:30.000Z", privacyEpoch: 0, processingPolicyId: policy.id, expiresAt: null, contentHash: "pending", policy, canonicalHash: policy.id };
+    const colliding: ProcessingPolicyRecord = { ...collidingPending, contentHash: "f".repeat(64) };
+    const harness = activationIo(control, { readPolicy: async () => colliding });
+    await expect(activateBootstrapWorkerPolicy({ control, policy, io: harness.io })).rejects.toThrow(/content hash collision/i);
+    expect(harness.inserted).toHaveLength(0);
+    expect(harness.activateCalls).toHaveLength(0);
+  });
+
+  it("is idempotent for an already-activated v1 control bound to the same worker policy", async () => {
+    const policy = workerPolicyFixture();
+    const controlPending = { ...bootstrapControlFixture(), version: 1, processingPolicyId: policy.id, coordinationPolicyEpoch: 1, coordinationPolicyHash: policy.id, contentHash: "pending" };
+    const control: ControlRecord = { ...controlPending, contentHash: canonicalRecordHash(controlPending as ControlRecord) };
+    const harness = activationIo(control);
+    await expect(activateBootstrapWorkerPolicy({ control, policy, io: harness.io })).resolves.toBe(control);
+    expect(harness.events).toEqual([]);
+  });
+
+  it("fails closed when an already-activated control belongs to a divergent worker policy", async () => {
+    const policy = workerPolicyFixture();
+    const other = workerPolicyFixture("pi", "2030-01-01T00:00:00.000Z");
+    const controlPending = { ...bootstrapControlFixture(), version: 1, processingPolicyId: other.id, coordinationPolicyEpoch: 1, coordinationPolicyHash: other.id, contentHash: "pending" };
+    const control: ControlRecord = { ...controlPending, contentHash: canonicalRecordHash(controlPending as ControlRecord) };
+    const harness = activationIo(control);
+    await expect(activateBootstrapWorkerPolicy({ control, policy, io: harness.io })).rejects.toThrow(/does not match/i);
+    expect(harness.events).toEqual([]);
+  });
+
+  it("rejects an already-activated control with a forged content hash", async () => {
+    const policy = workerPolicyFixture();
+    const control = { ...activationIo(bootstrapControlFixture()).winnerFor(policy.id), contentHash: "0".repeat(64) };
+    const harness = activationIo(control);
+    await expect(activateBootstrapWorkerPolicy({ control, policy, io: harness.io })).rejects.toThrow(/does not match/i);
+    expect(harness.events).toEqual([]);
+  });
+
+  it("fails closed for a non-active v0 control instead of activating it", async () => {
+    const control: ControlRecord = { ...bootstrapControlFixture(), state: "draining" };
+    const harness = activationIo(control);
+    await expect(activateBootstrapWorkerPolicy({ control, policy: workerPolicyFixture(), io: harness.io })).rejects.toThrow(/does not match/i);
+    expect(harness.events).toEqual([]);
+  });
+
+  it("rejects a forged v0 bootstrap before any write", async () => {
+    const control: ControlRecord = { ...bootstrapControlFixture(), contentHash: "0".repeat(64) };
+    const harness = activationIo(control);
+    await expect(activateBootstrapWorkerPolicy({ control, policy: workerPolicyFixture(), io: harness.io })).rejects.toThrow(/bootstrap/i);
+    expect(harness.inserted).toHaveLength(0);
+    expect(harness.activateCalls).toHaveLength(0);
+  });
+
+  it("rejects a forged v0 bootstrap whose self-hashed identities point at a real policy", async () => {
+    const policy = workerPolicyFixture();
+    // A forged bootstrap claiming real policy identities under a self-consistent
+    // hash must fail: genuine v0 placeholders are exactly V2_CONTRACT_HASH.
+    const forgedBase = { ...bootstrapControlFixture(), processingPolicyId: policy.id, coordinationPolicyHash: policy.id, contentHash: "pending" };
+    const forged: ControlRecord = { ...forgedBase, contentHash: bootstrapControlHash(forgedBase as ControlRecord) };
+    const harness = activationIo(forged);
+    await expect(activateBootstrapWorkerPolicy({ control: forged, policy, io: harness.io })).rejects.toThrow(/bootstrap/i);
+    expect(harness.events).toEqual([]);
+  });
+
+  it("rejects a worker policy whose content does not match its address or host", async () => {
+    const control = bootstrapControlFixture();
+    const wrongHost = workerPolicyFixture("prime");
+    const harness = activationIo(control);
+    await expect(activateBootstrapWorkerPolicy({ control, policy: wrongHost, io: harness.io })).rejects.toThrow(/worker policy/i);
+    expect(harness.events).toEqual([]);
+  });
+
+  it("converges on a same-policy race winner without retrying", async () => {
+    const control = bootstrapControlFixture();
+    const policy = workerPolicyFixture();
+    const harness = activationIo(control, { activate: async () => false, readControl: async () => harness.winnerFor(policy.id) });
+    await expect(activateBootstrapWorkerPolicy({ control, policy, io: harness.io })).resolves.toMatchObject({ version: 1, processingPolicyId: policy.id, coordinationPolicyHash: policy.id });
+    expect(harness.activateCalls).toEqual([policy.id]);
+    expect(harness.inserted).toHaveLength(1);
+  });
+
+  it("fails closed on a divergent race winner instead of rebranding to it", async () => {
+    const control = bootstrapControlFixture();
+    const policy = workerPolicyFixture();
+    const other = workerPolicyFixture("pi", "2030-01-01T00:00:00.000Z");
+    const harness = activationIo(control, { activate: async () => false, readControl: async () => harness.winnerFor(other.id) });
+    await expect(activateBootstrapWorkerPolicy({ control, policy, io: harness.io })).rejects.toThrow(/did not converge/i);
+    expect(harness.activateCalls).toEqual([policy.id]);
+  });
+
+  it("fails closed on a foreign-host race winner", async () => {
+    const control = bootstrapControlFixture();
+    const policy = workerPolicyFixture();
+    const harness = activationIo(control, { activate: async () => false, readControl: async () => {
+      const pending = { ...harness.winnerFor(policy.id), ownerHost: "prime" as const, contentHash: "pending" };
+      return { ...pending, contentHash: canonicalRecordHash(pending as ControlRecord) };
+    } });
+    await expect(activateBootstrapWorkerPolicy({ control, policy, io: harness.io })).rejects.toThrow(/did not converge/i);
+  });
+
+  it("propagates policy-insert failure without attempting activation", async () => {
+    const control = bootstrapControlFixture();
+    const harness = activationIo(control, { insertPolicy: async () => { throw new Error("insert failed"); } });
+    await expect(activateBootstrapWorkerPolicy({ control, policy: workerPolicyFixture(), io: harness.io })).rejects.toThrow("insert failed");
+    expect(harness.activateCalls).toHaveLength(0);
+  });
+
+  it("propagates activation transport failure", async () => {
+    const control = bootstrapControlFixture();
+    const harness = activationIo(control, { activate: async () => { throw new Error("cas failed"); } });
+    await expect(activateBootstrapWorkerPolicy({ control, policy: workerPolicyFixture(), io: harness.io })).rejects.toThrow("cas failed");
+    expect(harness.inserted).toHaveLength(1);
+  });
+
+  it("keeps bounded retention expiry on the worker policy record and preserves intersection identity", async () => {
+    const control = bootstrapControlFixture();
+    const policy = workerPolicyFixture("pi", "2030-01-01T00:00:00.000Z");
+    const harness = activationIo(control, { activate: async () => { throw new Error("stop after insert"); } });
+    await expect(activateBootstrapWorkerPolicy({ control, policy, io: harness.io })).rejects.toThrow("stop after insert");
+    expect(harness.inserted[0]!.expiresAt).toBe("2030-01-01T00:00:00.000Z");
+    // The lifecycle drain path and the admin enqueue path must compute the same intersection identity.
+    expect(intersectPolicies([policy], policy)?.id).toBe(policy.id);
+  });
 });
