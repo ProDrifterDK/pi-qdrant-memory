@@ -38,8 +38,10 @@ function ownedCanonicalSnapshot(value, label) {
         seen.add(candidate);
         try {
             const prototype = Object.getPrototypeOf(candidate);
+            if (Object.getOwnPropertySymbols(candidate).length > 0)
+                throw new TypeError(`${label} contains symbols`);
             if (Array.isArray(candidate)) {
-                if (prototype !== Array.prototype || Object.getOwnPropertySymbols(candidate).length > 0)
+                if (prototype !== Array.prototype)
                     throw new TypeError(`${label} array is invalid`);
                 const names = Object.getOwnPropertyNames(candidate);
                 if (names.length !== candidate.length + 1 || !names.includes("length"))
@@ -85,6 +87,23 @@ function ownedDenseArray(value, label, max = MAX_MEMBERSHIP) {
     if (!Array.isArray(clone) || clone.length === 0 || clone.length > max)
         throw new TypeError(`${label} must be a bounded dense array`);
     return Object.freeze(clone.slice());
+}
+function ownedModelSnapshot(value) {
+    if (value === null || typeof value !== "object" || Array.isArray(value) || nodeTypes.isProxy(value) || Object.getOwnPropertySymbols(value).length > 0)
+        throw new TypeError("LLM model is invalid");
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null)
+        throw new TypeError("LLM model is invalid");
+    const normalized = {};
+    for (const name of Object.getOwnPropertyNames(value)) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, name);
+        if (descriptor === undefined || !("value" in descriptor) || descriptor.enumerable !== true)
+            throw new TypeError("LLM model is invalid");
+        if (descriptor.value !== undefined)
+            normalized[name] = descriptor.value;
+    }
+    const model = ownedCanonicalSnapshot(normalized, "LLM model");
+    return { canonical: canonicalStringify(model), model };
 }
 /** Read only a named own data descriptor; unknown options are never touched. */
 function ownOption(options, key, required = true) {
@@ -671,14 +690,15 @@ export async function runCurationCore(worker, input) {
             ...(typeof registryAuth === "function" ? { getApiKeyAndHeaders: registryAuth.bind(registry) } : {}),
         });
         try {
-            modelCanonical = canonicalStringify(memoryModel);
-            modelSnapshot = deepFreeze(JSON.parse(modelCanonical));
+            const ownedModel = ownedModelSnapshot(memoryModel);
+            modelCanonical = ownedModel.canonical;
+            modelSnapshot = deepFreeze(ownedModel.model);
         }
         catch {
             return await fail("LLM model snapshot is invalid");
         }
         modelStillBound = () => { try {
-            return canonicalStringify(memoryModel) === modelCanonical;
+            return ownedModelSnapshot(memoryModel).canonical === modelCanonical;
         }
         catch {
             return false;

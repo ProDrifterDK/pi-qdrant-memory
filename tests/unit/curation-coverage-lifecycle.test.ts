@@ -193,7 +193,7 @@ function baseOptions(input: BaseOptionsInput): RootCurationLifecycleInput {
     workerPolicy: input.workerPolicy, extractorRevision: EXTRACTOR,
     producerPolicies: input.producerPolicies, embedding: input.embedding,
     llm: {
-      memoryModel: { id: "provider-model", provider: "provider-local", contextWindow: 1_000_000, maxTokens: 65_536 } as never,
+      memoryModel: { id: "provider-model", provider: "provider-local", contextWindow: 1_000_000, maxTokens: 65_536, samplingParams: undefined } as never,
       modelRegistry: {
         complete: async () => {
           input.llmCallCounter && (input.llmCallCounter.count += 1);
@@ -251,6 +251,32 @@ describe("Task 9 curation coverage lifecycle — observable end-to-end", () => {
     const coverageIds = [...backend.points.values()].filter((p) => p.payload.record_type === "coverage").map((p) => p.id).sort();
     expect(new Set(coverageIds).size).toBe(coverageIds.length);
     expect(coverageIds.length).toBe(3);
+  });
+
+  it("detects a nested symbol added to the model during completion", async () => {
+    const producer = producerPolicy({ policyRevision: "coverage-lifecycle-model-symbol" });
+    const ep = episode(EP_A, producer);
+    const backend = backendWithControl(undefined);
+    seedEpisodePoint(backend, ep);
+    const rt = runtime(backend);
+    const counter: LlmCounter = { count: 0 };
+    const options = baseOptions({
+      store: rt.store, embedding: rt.embedding, membership: [EP_A],
+      producerPolicies: [producer], workerPolicy: workerPolicy("coverage-lifecycle-model-symbol"),
+      llmEvidence: EP_A, llmCallCounter: counter,
+    });
+    const nested = { mode: "default" };
+    (options.llm.memoryModel as unknown as { samplingParams: object }).samplingParams = nested;
+    const complete = options.llm.modelRegistry.complete!;
+    options.llm.modelRegistry.complete = async (...args: Parameters<typeof complete>) => {
+      const response = await complete(...args);
+      Object.defineProperty(nested, Symbol("secret"), { enumerable: true, value: "must-fail-closed" });
+      return response;
+    };
+    const result = await runOnce(options);
+    expect(result).toMatchObject({ state: "pending", reason: "model-changed" });
+    expect(counter.count).toBe(1);
+    expect([...backend.points.values()].filter((point) => point.payload.record_type === "proposal")).toHaveLength(0);
   });
 
   it("coverage cardinality omitted on write leaves the lease released-with-pair (no second LLM needed for resume)", async () => {
