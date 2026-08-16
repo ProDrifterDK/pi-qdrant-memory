@@ -165,8 +165,12 @@ function linkedSignal(source, timeoutMs) {
             source.removeEventListener("abort", onSourceAbort); },
     };
 }
-function baseOptions(input) {
-    return { maxTokens: input.maxOutputTokens, timeoutMs: input.timeoutMs, temperature: LOW_TEMPERATURE };
+function baseOptions(input, model) {
+    return {
+        maxTokens: input.maxOutputTokens,
+        timeoutMs: input.timeoutMs,
+        ...(model.api === "openai-codex-responses" ? {} : { temperature: LOW_TEMPERATURE }),
+    };
 }
 async function invokeWithinBudget(operation, linked) {
     const stopped = linked.reason();
@@ -214,7 +218,7 @@ async function completeMemorySafely(input) {
         return pending("invalid_input");
     const context = input.memoryContext;
     const registryComplete = Reflect.get(context.modelRegistry, "complete");
-    const options = baseOptions(input);
+    const options = baseOptions(input, selected.model);
     const outboundContext = envelopeContext(input.envelope);
     const linked = linkedSignal(input.signal, input.timeoutMs);
     try {

@@ -21,7 +21,7 @@ export type ResolvedRequestAuthLike =
 export interface MemoryCompletionOptions {
   signal?: AbortSignal;
   maxOutputTokens: number;
-  temperature: number;
+  temperature?: number;
 }
 
 export interface ModelRegistryLike {
@@ -112,7 +112,7 @@ interface HostCompletionOptions {
   signal: AbortSignal;
   maxTokens: number;
   timeoutMs: number;
-  temperature: typeof LOW_TEMPERATURE;
+  temperature?: typeof LOW_TEMPERATURE;
   apiKey?: string;
   headers?: Record<string, string>;
 }
@@ -269,8 +269,12 @@ function linkedSignal(source: AbortSignal | undefined, timeoutMs: number): Linke
   };
 }
 
-function baseOptions(input: CompleteMemoryInput): HostCompletionBaseOptions {
-  return { maxTokens: input.maxOutputTokens, timeoutMs: input.timeoutMs, temperature: LOW_TEMPERATURE };
+function baseOptions(input: CompleteMemoryInput, model: Model<Api>): HostCompletionBaseOptions {
+  return {
+    maxTokens: input.maxOutputTokens,
+    timeoutMs: input.timeoutMs,
+    ...(model.api === "openai-codex-responses" ? {} : { temperature: LOW_TEMPERATURE }),
+  };
 }
 
 type BoundedResult<T> = { ok: true; value: T } | { ok: false; reason: AbortReason | "failed" };
@@ -314,7 +318,7 @@ async function completeMemorySafely(input: CompleteMemoryInput): Promise<MemoryC
 
   const context = input.memoryContext;
   const registryComplete = Reflect.get(context.modelRegistry, "complete");
-  const options = baseOptions(input);
+  const options = baseOptions(input, selected.model);
   const outboundContext = envelopeContext(input.envelope);
   const linked = linkedSignal(input.signal, input.timeoutMs);
   try {

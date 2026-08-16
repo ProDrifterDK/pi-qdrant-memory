@@ -12,7 +12,7 @@ export type ResolvedRequestAuthLike = {
 export interface MemoryCompletionOptions {
     signal?: AbortSignal;
     maxOutputTokens: number;
-    temperature: number;
+    temperature?: number;
 }
 export interface ModelRegistryLike {
     getApiKeyAndHeaders?: (model: Model<Api>) => Promise<ResolvedRequestAuthLike>;

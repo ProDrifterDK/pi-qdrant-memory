@@ -80,6 +80,25 @@ describe("completeMemory reflected portable LLM bridge", () => {
     expect(complete.mock.calls[0]?.[2]).toMatchObject({ maxTokens: 256, timeoutMs: 1000, temperature: 0, signal: expect.any(AbortSignal) });
   });
 
+  it("omits temperature for OpenAI Codex Responses on Pi and Prime", async () => {
+    const complete = vi.fn(async () => message('{"items":[]}'));
+    const completeSimple = vi.fn(async () => message('{"items":[]}'));
+    const getApiKeyAndHeaders = vi.fn(async () => ({ ok: true as const }));
+    const codex = model({ api: "openai-codex-responses", provider: "openai-codex" });
+    const piResult = await completeMemory(input(codex, {
+      memoryContext: memoryContext(codex, { policy: policy("pi", { originProvider: "openai-codex" }), modelRegistry: { complete } }),
+    }));
+    const primeResult = await completeMemory(input(codex, {
+      memoryContext: memoryContext(codex, { host: "prime", policy: policy("prime", { originProvider: "openai-codex" }), modelRegistry: { getApiKeyAndHeaders } }),
+      aiNamespace: { completeSimple },
+    }));
+
+    expect(piResult).toMatchObject({ state: "completed" });
+    expect(primeResult).toMatchObject({ state: "completed" });
+    expect(complete.mock.calls[0]?.[2]).not.toHaveProperty("temperature");
+    expect(completeSimple.mock.calls[0]?.[2]).not.toHaveProperty("temperature");
+  });
+
   it("uses reflected Prime fallback only after fresh sanitized structural auth", async () => {
     const completeSimple = vi.fn(async () => message('{"items":["safe"]}'));
     const auth = { ok: true as const, apiKey: "registry-key", headers: { "x-safe": "ok", "x-drop": null } };
