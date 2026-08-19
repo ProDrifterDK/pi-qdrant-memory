@@ -1,7 +1,7 @@
 import * as PiAi from "@earendil-works/pi-ai";
 import type { Api, Context, Model } from "@earendil-works/pi-ai";
 import type { AuthorizedDestination, HostId } from "../types.js";
-import { isPolicyExpired, processingPolicyHash, type ProcessingPolicy } from "../domain/policy.js";
+import { isPolicyExpired, processingPolicyHash, PROVIDER_AGNOSTIC_ORIGIN, type ProcessingPolicy } from "../domain/policy.js";
 
 const MAX_INPUT_TOKENS = 65_536;
 const MIN_OUTPUT_TOKENS = 128;
@@ -195,7 +195,7 @@ function selectModel(input: CompleteMemoryInput): { model: Model<Api>; activeFal
 }
 
 function hasReplayPermission(context: MemoryCompletionContext, model: Model<Api>): boolean {
-  return model.provider === context.policy.originProvider ||
+  return context.policy.originProvider === PROVIDER_AGNOSTIC_ORIGIN || model.provider === context.policy.originProvider ||
     (context.allowCrossProviderReplay === true && context.policy.allowCrossProviderReplay === true);
 }
 

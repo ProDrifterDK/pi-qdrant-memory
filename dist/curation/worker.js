@@ -10,7 +10,7 @@ import { LeaseAuthority, ProductionCoordinationStore } from "../qdrant/write.js"
 import { coverageId } from "../domain/ids.js";
 import { canonicalStringify } from "../domain/canonical.js";
 import { canonicalRecordHash } from "../domain/records.js";
-import { intersectPolicies, isPolicyExpired, processingPolicyHash } from "../domain/policy.js";
+import { intersectPolicies, isPolicyExpired, processingPolicyHash, PROVIDER_AGNOSTIC_ORIGIN } from "../domain/policy.js";
 import { resolveAgentMarker } from "../capture/episode.js";
 import { completeMemory } from "./llm.js";
 import { buildCurationPrompt, CURATION_PROMPT_REVISION } from "./prompt.js";
@@ -640,7 +640,7 @@ export async function runCurationCore(worker, input) {
             if (acceptedEnvelope === null)
                 return await fail("accepted-output-binding");
             const acceptedDestinationId = group.intersection.destinationIds.llm;
-            const acceptedProviderValid = acceptedEnvelope.provenance.providerId === group.intersection.originProvider || group.intersection.allowCrossProviderReplay === true;
+            const acceptedProviderValid = group.intersection.originProvider === PROVIDER_AGNOSTIC_ORIGIN || acceptedEnvelope.provenance.providerId === group.intersection.originProvider || group.intersection.allowCrossProviderReplay === true;
             if (acceptedDestinationId === undefined || !acceptedProviderValid || !provenanceMatches(acceptedEnvelope.provenance, { host, destinationId: acceptedDestinationId, policyId: acceptedJob.policyId, policyHash: acceptedJob.policyId, policyEpoch: claim.coordinationPolicyEpoch, promptRevision: CURATION_PROMPT_REVISION }) || acceptedProposal.createdAt !== acceptedEnvelope.provenance.invokedAt)
                 return await fail("accepted-output-provenance");
             const acceptedEpisodes = await store.readEpisodes(acceptedProposal.membership, acceptedJob.privacyEpoch).catch(() => []);

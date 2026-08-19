@@ -1,5 +1,5 @@
 import * as PiAi from "@earendil-works/pi-ai";
-import { isPolicyExpired, processingPolicyHash } from "../domain/policy.js";
+import { isPolicyExpired, processingPolicyHash, PROVIDER_AGNOSTIC_ORIGIN } from "../domain/policy.js";
 const MAX_INPUT_TOKENS = 65_536;
 const MIN_OUTPUT_TOKENS = 128;
 const MAX_OUTPUT_TOKENS = 8_192;
@@ -86,7 +86,7 @@ function selectModel(input) {
     return { model: context.activeModel, activeFallback: true };
 }
 function hasReplayPermission(context, model) {
-    return model.provider === context.policy.originProvider ||
+    return context.policy.originProvider === PROVIDER_AGNOSTIC_ORIGIN || model.provider === context.policy.originProvider ||
         (context.allowCrossProviderReplay === true && context.policy.allowCrossProviderReplay === true);
 }
 /** Requires concrete host resolver evidence for this exact selected provider/model/destination tuple. */

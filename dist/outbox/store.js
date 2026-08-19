@@ -376,7 +376,7 @@ function outboxJob(input) {
         const parsed = parsePersistedMemoryRecord(cloneCanonical(candidate), { ownerHost: input.host });
         if (parsed.recordType !== "episode")
             throw new TypeError("Outbox accepts only episode records");
-        if (parsed.processingPolicyId !== policy.id || parsed.expiresAt !== policy.expiresAt || parsed.ownerHost !== policy.ownerHost || parsed.originProvider !== policy.originProvider || parsed.destinationId !== policy.destinationIds.qdrant || parsed.secretScan !== "passed" || (parsed.producerId !== undefined && parsed.producerId !== input.producerUuid) || (parsed.nodeId !== undefined && parsed.nodeId !== input.nodeId))
+        if (parsed.processingPolicyId !== policy.id || parsed.expiresAt !== policy.expiresAt || parsed.ownerHost !== policy.ownerHost || parsed.destinationId !== policy.destinationIds.qdrant || parsed.secretScan !== "passed" || (parsed.producerId !== undefined && parsed.producerId !== input.producerUuid) || (parsed.nodeId !== undefined && parsed.nodeId !== input.nodeId))
             throw new TypeError("Outbox episode policy or producer envelope is inconsistent");
         safeEpisodeMaterial(parsed, input.homeDir);
         return parsed;
@@ -410,7 +410,7 @@ export function parseOutboxJob(value, expected) {
     const episodes = rawEpisodes.map((candidate, index) => {
         const parsed = parsePersistedMemoryRecord(candidate, { ownerHost: value.ownerHost });
         const policy = value.policy;
-        if (parsed.recordType !== "episode" || parsed.id !== episodeIds[index] || parsed.ownerHost !== value.ownerHost || parsed.processingPolicyId !== value.policyId || parsed.expiresAt !== value.deadline || parsed.originProvider !== policy.originProvider || parsed.destinationId !== policy.destinationIds.qdrant || (parsed.producerId !== undefined && parsed.producerId !== value.producerUuid) || (parsed.nodeId !== undefined && parsed.nodeId !== value.nodeId) || parsed.vector !== undefined)
+        if (parsed.recordType !== "episode" || parsed.id !== episodeIds[index] || parsed.ownerHost !== value.ownerHost || parsed.processingPolicyId !== value.policyId || parsed.expiresAt !== value.deadline || parsed.destinationId !== policy.destinationIds.qdrant || (parsed.producerId !== undefined && parsed.producerId !== value.producerUuid) || (parsed.nodeId !== undefined && parsed.nodeId !== value.nodeId) || parsed.vector !== undefined)
             throw new Error("Outbox job episode is malformed");
         safeEpisodeMaterial(parsed, expected?.homeDir ?? "/");
         return parsed;

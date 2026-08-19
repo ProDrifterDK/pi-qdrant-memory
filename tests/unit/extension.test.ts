@@ -931,6 +931,38 @@ describe("production capture coordinator", () => {
     } finally { vi.unstubAllGlobals(); }
   });
 
+  it("brands a legacy provider-bound control for the provider-agnostic worker policy and keeps episode provenance", async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), "pi-qdrant-legacy-control-"));
+    const env = { PI_CODING_AGENT_DIR: join(homeDir, ".pi", "agent"), PI_QDRANT_MEMORY_HOST: "pi" };
+    const configured = JSON.parse(hostConfig(true, true)); configured.curation = { turnTrigger: 100, toolTrigger: 100 };
+    // Default fixture: control v1 bound to a legacy policy whose originProvider
+    // is a concrete provider ("provider") while destinations/revision match the
+    // session's provider-agnostic worker policy exactly.
+    const runtime = runtimeFetch("pi"); vi.stubGlobal("fetch", runtime.fetchImpl);
+    try {
+      const api = fakeApi(); const base = Date.now();
+      const factory = createMemoryExtension({ env, argv: [], homeDir, now: () => base, readTextFile: async () => JSON.stringify(configured), projectResolver: async () => registeredProject() });
+      await factory(api.api); const entries: any[] = []; const context = ctx({ sessionId: "session-legacy-control", entries, header: null });
+      await api.handler("session_start")({ type: "session_start", reason: "startup" }, context.value);
+      expect(context.notifications.some((notification) => notification.message.includes("activation pending"))).toBe(false);
+      entries.push({ id: "legacy-entry", type: "message", message: { role: "user", content: "legacy control episode", timestamp: base + 1 } });
+      await api.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
+      const payloads = [...runtime.points.values()].map((point) => point.payload as Record<string, any>);
+      // The provider-agnostic worker policy record is inserted on first delivery.
+      const agnostic = payloads.find((payload) => payload.record_type === "processing_policy" && payload.policy?.originProvider === "any");
+      expect(agnostic).toBeDefined();
+      // Provenance stays on the episode: captured provider, never the sentinel.
+      const episode = payloads.find((payload) => payload.record_type === "episode" && payload.text === "legacy control episode");
+      expect(episode).toBeDefined();
+      expect(episode.origin_provider).toBe("provider");
+      expect(episode.processing_policy_id).toBe(agnostic.id);
+      // The legacy control is never rewritten: coordination identity is stable.
+      const control = payloads.find((payload) => payload.record_type === "collection_control");
+      expect(control.version).toBe(1);
+      expect(control.processing_policy_id).not.toBe(agnostic.id);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
 });
 
 function bootstrapControlFixture(host: "pi" | "prime" = "pi"): ControlRecord {

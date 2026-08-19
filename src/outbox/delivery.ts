@@ -654,11 +654,14 @@ function policyRecord(job: OutboxJob, privacyEpoch: number, effective: Processin
   };
   return { ...pending, contentHash: canonicalRecordHash(pending) };
 }
-/** Fresh frozen material derived from the durable source under the effective policy. */
+/** Fresh frozen material derived from the durable source under the effective policy.
+ * Provenance is source truth: the episode keeps its captured origin provider
+ * while policy identity/expiry/destination are re-stamped from the effective
+ * (provider-agnostic) policy. */
 function effectiveEpisode(source: EpisodeRecord, effective: ProcessingPolicy): EpisodeRecord {
   const derived: EpisodeRecord = {
     ...source, processingPolicyId: effective.id, expiresAt: effective.expiresAt,
-    originProvider: effective.originProvider, destinationId: effective.destinationIds.qdrant, contentHash: "pending",
+    originProvider: source.originProvider, destinationId: effective.destinationIds.qdrant, contentHash: "pending",
   };
   const final = { ...derived, contentHash: canonicalRecordHash(derived) } as EpisodeRecord;
   return Object.freeze(final);
@@ -693,7 +696,7 @@ function staticIngestValidation(input: IngestInput, now: number, activeEpisodes:
     if (input.runtime.qdrant.ownerHost !== input.job.ownerHost || input.runtime.qdrant.collection !== expectedQdrantCollection(input.job.ownerHost)) return ingestResult("pending", count, "policy_unauthorized");
     if (isExpired(effective, now, input.maxClockSkewMs)) return ingestResult("quarantined", count, "expired");
     for (const episode of activeEpisodes) {
-      if (episode.recordType !== "episode" || episode.ownerHost !== input.job.ownerHost || episode.host !== input.job.ownerHost || episode.processingPolicyId !== input.job.policy.id || episode.expiresAt !== input.job.policy.expiresAt || episode.originProvider !== input.job.policy.originProvider || episode.destinationId !== input.job.policy.destinationIds.qdrant || episode.vector !== undefined || episode.secretScan !== "passed" || !finalEpisodeMaterialIsSafe(episode) || episode.contentHash !== canonicalRecordHash(episode)) return ingestResult("quarantined", count, episode.secretScan === "passed" ? "episode_invalid" : "scanner_rejected");
+      if (episode.recordType !== "episode" || episode.ownerHost !== input.job.ownerHost || episode.host !== input.job.ownerHost || episode.processingPolicyId !== input.job.policy.id || episode.expiresAt !== input.job.policy.expiresAt || episode.destinationId !== input.job.policy.destinationIds.qdrant || episode.vector !== undefined || episode.secretScan !== "passed" || !finalEpisodeMaterialIsSafe(episode) || episode.contentHash !== canonicalRecordHash(episode)) return ingestResult("quarantined", count, episode.secretScan === "passed" ? "episode_invalid" : "scanner_rejected");
     }
     return { effective };
   } catch { return ingestResult("quarantined", count, "policy_invalid"); }

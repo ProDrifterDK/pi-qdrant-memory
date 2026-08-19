@@ -18,6 +18,12 @@ export interface ProcessingPolicy {
   policyRevision: string;
 }
 
+/** Worker-policy origin for provider-agnostic capture: the session provider
+ * is volatile provenance (recorded per episode), never worker identity. The
+ * sentinel is a wildcard in every origin check below; destination allowlists
+ * remain the egress barrier. */
+export const PROVIDER_AGNOSTIC_ORIGIN = "any";
+
 function bounded(name: string, value: unknown, max: number, redact = false): asserts value is string {
   if (typeof value !== "string" || value.length === 0 || value.length > max || (redact && SECRET.test(value))) throw new TypeError(`${name} must be bounded and redacted`);
 }
@@ -83,10 +89,17 @@ export function intersectPolicies(policies: readonly ProcessingPolicy[], worker:
     if (capability === "llm" && values[0] !== undefined) destinationIds.llm = values[0];
   }
   // Producer content origin: multiple producer origins fail closed; one origin is preserved.
-  const producerOrigins = new Set(policies.map((policy) => policy.originProvider));
-  if (producerOrigins.size > 1) return null;
-  const origin = producerOrigins.size === 1 ? [...producerOrigins][0]! : worker.originProvider;
-  if (origin !== worker.originProvider && (!worker.allowCrossProviderReplay || policies.some((policy) => !policy.allowCrossProviderReplay))) return null;
+  // A provider-agnostic worker accepts every producer origin: provenance stays
+  // on the episodes/envelopes, not on the worker identity.
+  let origin: string;
+  if (worker.originProvider === PROVIDER_AGNOSTIC_ORIGIN) {
+    origin = PROVIDER_AGNOSTIC_ORIGIN;
+  } else {
+    const producerOrigins = new Set(policies.map((policy) => policy.originProvider));
+    if (producerOrigins.size > 1) return null;
+    origin = producerOrigins.size === 1 ? [...producerOrigins][0]! : worker.originProvider;
+    if (origin !== worker.originProvider && (!worker.allowCrossProviderReplay || policies.some((policy) => !policy.allowCrossProviderReplay))) return null;
+  }
   // Identical producer/worker policy converges to the unchanged policy as a
   // FRESH clone (never a caller-owned mutable alias).
   if (policies.length === 1 && policies[0]!.id === worker.id) return { ...worker, destinationIds: { ...worker.destinationIds } };

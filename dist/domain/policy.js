@@ -3,6 +3,11 @@ const MAX_ID = 256;
 const MAX_LABEL = 128;
 const SECRET = /(api[-_]?key|access[-_]?token|authorization|bearer|credential|password|secret|token)/iu;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
+/** Worker-policy origin for provider-agnostic capture: the session provider
+ * is volatile provenance (recorded per episode), never worker identity. The
+ * sentinel is a wildcard in every origin check below; destination allowlists
+ * remain the egress barrier. */
+export const PROVIDER_AGNOSTIC_ORIGIN = "any";
 function bounded(name, value, max, redact = false) {
     if (typeof value !== "string" || value.length === 0 || value.length > max || (redact && SECRET.test(value)))
         throw new TypeError(`${name} must be bounded and redacted`);
@@ -86,12 +91,20 @@ export function intersectPolicies(policies, worker) {
             destinationIds.llm = values[0];
     }
     // Producer content origin: multiple producer origins fail closed; one origin is preserved.
-    const producerOrigins = new Set(policies.map((policy) => policy.originProvider));
-    if (producerOrigins.size > 1)
-        return null;
-    const origin = producerOrigins.size === 1 ? [...producerOrigins][0] : worker.originProvider;
-    if (origin !== worker.originProvider && (!worker.allowCrossProviderReplay || policies.some((policy) => !policy.allowCrossProviderReplay)))
-        return null;
+    // A provider-agnostic worker accepts every producer origin: provenance stays
+    // on the episodes/envelopes, not on the worker identity.
+    let origin;
+    if (worker.originProvider === PROVIDER_AGNOSTIC_ORIGIN) {
+        origin = PROVIDER_AGNOSTIC_ORIGIN;
+    }
+    else {
+        const producerOrigins = new Set(policies.map((policy) => policy.originProvider));
+        if (producerOrigins.size > 1)
+            return null;
+        origin = producerOrigins.size === 1 ? [...producerOrigins][0] : worker.originProvider;
+        if (origin !== worker.originProvider && (!worker.allowCrossProviderReplay || policies.some((policy) => !policy.allowCrossProviderReplay)))
+            return null;
+    }
     // Identical producer/worker policy converges to the unchanged policy as a
     // FRESH clone (never a caller-owned mutable alias).
     if (policies.length === 1 && policies[0].id === worker.id)

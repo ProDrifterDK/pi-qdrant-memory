@@ -14,6 +14,11 @@ export interface ProcessingPolicy {
     dataUse: string;
     policyRevision: string;
 }
+/** Worker-policy origin for provider-agnostic capture: the session provider
+ * is volatile provenance (recorded per episode), never worker identity. The
+ * sentinel is a wildcard in every origin check below; destination allowlists
+ * remain the egress barrier. */
+export declare const PROVIDER_AGNOSTIC_ORIGIN = "any";
 export declare function processingPolicyHash(policy: ProcessingPolicy): string;
 /**
  * Intersect exact destination capabilities and labels across producer and

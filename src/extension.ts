@@ -15,7 +15,7 @@ import { MemoryClientError } from "./clients/http.js";
 import { destinationForEndpoint } from "./security/egress.js";
 import { canonicalStringify, deterministicUuid, sha256Hex } from "./domain/canonical.js";
 import { canonicalRecordHash, episodeSemanticProjection, type ControlRecord, type ProcessingPolicyRecord, type RaptorSummaryRecord } from "./domain/records.js";
-import { intersectPolicies, processingPolicyHash, type ProcessingPolicy } from "./domain/policy.js";
+import { intersectPolicies, processingPolicyHash, PROVIDER_AGNOSTIC_ORIGIN, type ProcessingPolicy } from "./domain/policy.js";
 import { createOutbox, resolveOutboxNodeId, type Outbox } from "./outbox/store.js";
 import { createIngestProcessor, createOutboxDelivery, type OutboxDelivery } from "./outbox/delivery.js";
 import { bindIngestRuntime } from "./coordination/ingest.js";
@@ -367,14 +367,6 @@ async function createProductionRuntime(
       control = initialControl;
     }
   }
-  // A bootstrap placeholder or a divergent activation winner never brands this
-  // session's worker policy: fail closed until activation converges on the
-  // exact local policy identity. coordinationPolicyHash is not pinned here:
-  // explicit coordination rotations legitimately advance it post-activation.
-  if (control.version === 0 || control.state !== "active" || control.processingPolicyId !== policy.id) {
-    onActivationPending?.({ category: "configuration", message: "pi-qdrant-memory: worker policy activation pending; capture remains buffered locally." });
-    throw new MemoryClientError("configuration", "Memory worker policy activation is pending");
-  }
   const bundle = createQdrantSafeBundle({
     options: { baseUrl: session.config.qdrant.url, collection: session.config.qdrant.collection, ownerHost: session.host, timeoutMs: session.config.retrieval.timeoutMs,
       readConsistency: session.config.coordination.readConsistency, maxClockSkewMs: session.config.coordination.maxClockSkewMs,
@@ -384,6 +376,28 @@ async function createProductionRuntime(
     ...(session.config.outbox.nodeId === undefined ? {} : { nodeId: session.config.outbox.nodeId }),
     coordinationPolicyHash: control.coordinationPolicyHash, coordinationPolicyEpoch: control.coordinationPolicyEpoch,
   });
+  // A provider-agnostic worker also converges with a legacy control whose
+  // activated policy is identical except for a concrete provider origin: the
+  // volatile provider binding was retired from worker identity, so the exact
+  // destination/residency/revision contract is what remains authoritative.
+  const legacyProviderBoundControlMatches = async (): Promise<boolean> => {
+    if (policy.originProvider !== PROVIDER_AGNOSTIC_ORIGIN) return false;
+    const record = await bindQdrantDestination(bundle.qdrant, qdrantDestination).retrieve("processing_policy", control.processingPolicyId).catch(() => null);
+    if (record === null || record.recordType !== "processing_policy" || record.id !== control.processingPolicyId || record.contentHash !== canonicalRecordHash(record)) return false;
+    const legacy = record.policy;
+    return legacy.ownerHost === policy.ownerHost && legacy.originProvider !== PROVIDER_AGNOSTIC_ORIGIN &&
+      legacy.destinationIds.qdrant === policy.destinationIds.qdrant && legacy.destinationIds.embedding === policy.destinationIds.embedding && legacy.destinationIds.llm === policy.destinationIds.llm &&
+      legacy.allowCrossProviderReplay === policy.allowCrossProviderReplay && legacy.expiresAt === policy.expiresAt &&
+      legacy.residency === policy.residency && legacy.dataUse === policy.dataUse && legacy.policyRevision === policy.policyRevision;
+  };
+  // A bootstrap placeholder or a divergent activation winner never brands this
+  // session's worker policy: fail closed until activation converges on the
+  // exact local policy identity. coordinationPolicyHash is not pinned here:
+  // explicit coordination rotations legitimately advance it post-activation.
+  if (control.version === 0 || control.state !== "active" || (control.processingPolicyId !== policy.id && !(await legacyProviderBoundControlMatches()))) {
+    onActivationPending?.({ category: "configuration", message: "pi-qdrant-memory: worker policy activation pending; capture remains buffered locally." });
+    throw new MemoryClientError("configuration", "Memory worker policy activation is pending");
+  }
   const qdrant = bindQdrantDestination(bundle.qdrant, qdrantDestination);
   const embeddingClient = new EmbeddingsClient({ baseUrl: session.config.embeddings.baseUrl, model: session.config.embeddings.model, dimension: 1024, queryPrefix: session.config.embeddings.queryPrefix, timeoutMs: session.config.retrieval.timeoutMs, ...(session.config.embeddings.apiKey === undefined ? {} : { apiKey: session.config.embeddings.apiKey }) });
   const validated = bindEmbeddingDocumentClient({ endpoint: session.config.embeddings.baseUrl, client: embeddingClient });
@@ -626,7 +640,7 @@ function captureExpiry(config: RuntimeConfig, eventAt: number | null): string | 
     : new Date(eventAt + config.capture.episodeRetentionDays * 86_400_000).toISOString();
 }
 
-interface CapturePolicyBinding { readonly policy: ProcessingPolicy; readonly modelId?: string; }
+interface CapturePolicyBinding { readonly policy: ProcessingPolicy; readonly modelId?: string; readonly sessionOriginProvider?: string; }
 function capturePolicy(input: MemoryLifecycleSession): CapturePolicyBinding | undefined {
   const qdrant = configuredQdrantDestination(input.config);
   const embedding = configuredEmbeddingDestination(input.config);
@@ -634,19 +648,20 @@ function capturePolicy(input: MemoryLifecycleSession): CapturePolicyBinding | un
   const authorization = snapshotLlmAuthorization(input);
   const modelDestination = authorization.destination;
   const authorizedLlm = modelDestination !== undefined && modelDestination.residency === qdrant.residency && modelDestination.dataUse === qdrant.dataUse ? modelDestination : undefined;
-  // Provenance is always the active SESSION model.  The dedicated memory
-  // model is a separate processing destination and can never rewrite origin.
+  // The worker policy is provider-agnostic: the active SESSION model is
+  // volatile provenance, recorded per episode via sessionOriginProvider, and
+  // can never rewrite the worker identity or its content-addressed hash.
   const sessionModel = input.ctx.model as Model<Api> | undefined;
   const pending: ProcessingPolicy = {
     id: "pending", ownerHost: input.host,
     destinationIds: { qdrant: qdrant.id, embedding: embedding.id, ...(authorizedLlm === undefined ? {} : { llm: authorizedLlm.id }) },
-    originProvider: sessionModel?.provider ?? "unknown",
+    originProvider: PROVIDER_AGNOSTIC_ORIGIN,
     allowCrossProviderReplay: input.config.privacy.allowCrossProviderReplay,
     expiresAt: null, residency: qdrant.residency, dataUse: qdrant.dataUse,
     policyRevision: "capture-lifecycle-v1",
   };
   const policy = Object.freeze({ ...pending, destinationIds: Object.freeze({ ...pending.destinationIds }), id: processingPolicyHash(pending) });
-  return Object.freeze({ policy, ...(sessionModel?.id === undefined ? {} : { modelId: sessionModel.id }) });
+  return Object.freeze({ policy, ...(sessionModel?.id === undefined ? {} : { modelId: sessionModel.id }), ...(sessionModel?.provider === undefined ? {} : { sessionOriginProvider: sessionModel.provider }) });
 }
 function capturePolicyForEvent(base: CapturePolicyBinding, config: RuntimeConfig, eventAt: number): CapturePolicyBinding {
   const expiresAt = captureExpiry(config, eventAt);
@@ -767,7 +782,7 @@ function createProductionLifecycleCoordinatorInternal(input: { homeDir: string; 
         projectAllowlist: value.config.capture.projectAllowlist, projectDenylist: value.config.capture.projectDenylist,
         marker: canonicalCaptureMarker(value.host, value.marker),
         policyId: currentPolicy.id, privacyEpoch: control?.privacyEpoch ?? 0, expiresAt: null,
-        originProvider: currentPolicy.originProvider,
+        originProvider: producerBinding?.sessionOriginProvider ?? "unknown",
         destinationId: currentPolicy.destinationIds.qdrant,
         nodeId: outbox.nodeId, producerId: outbox.producerUuid,
         toolArgsChars: value.config.capture.toolArgsChars, toolResultChars: value.config.capture.toolResultChars, now,
@@ -778,7 +793,7 @@ function createProductionLifecycleCoordinatorInternal(input: { homeDir: string; 
               const eventAt = Date.parse(record.eventAt); if (!Number.isFinite(eventAt)) throw new Error("capture event clock");
               const binding = producerBinding; if (binding === undefined) throw new Error("capture policy");
               const eventPolicy = capturePolicyForEvent(binding, value.config, eventAt).policy;
-              const pending: EpisodeRecord = { ...record, processingPolicyId: eventPolicy.id, originProvider: eventPolicy.originProvider,
+              const pending: EpisodeRecord = { ...record, processingPolicyId: eventPolicy.id, originProvider: binding.sessionOriginProvider ?? "unknown",
                 destinationId: eventPolicy.destinationIds.qdrant, expiresAt: eventPolicy.expiresAt,
                 ...(binding.modelId === undefined ? {} : { modelId: binding.modelId }), contentHash: "pending" };
               const episode = Object.freeze({ ...pending, contentHash: canonicalRecordHash(pending) });
