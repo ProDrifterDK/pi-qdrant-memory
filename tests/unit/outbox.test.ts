@@ -940,6 +940,49 @@ await outbox.enqueue({ episodes: [item], policy: current });
     } finally { resume?.(); await rm(homeDir, { recursive: true, force: true }); }
   }, 10_000);
 
+  it("reclaims a garbage admission lock from a dead producer when no precommit exists", async () => {
+    for (const mode of ["closed", "stale"] as const) {
+      const homeDir = await mkdtemp(join(tmpdir(), `task6-garbage-lock-${mode}-`));
+      try {
+        const producerA = await createOutbox({ host: "prime", homeDir, nodeId: `node-garbage-lock-${mode}`, producerUuid: producerId(mode === "closed" ? 400 : 401), machineId: `machine-garbage-lock-${mode}`, now: () => 1_000 });
+        const current = policy(null);
+        const reservation = reservationRecord(producerA.nodeId, producerA.producerUuid, "00000000-0000-5000-8000-000000000960", current, 100);
+        const reservations = join(producerA.root, "reservations");
+        const reservationFile = join(reservations, `${reservation.reservationId as string}.json`);
+        await nodeFs.writeFile(reservationFile, canonicalStringify(reservation), { mode: 0o600 });
+        await nodeFs.link(reservationFile, join(reservations, "admission.0000000000000000.lock"));
+        if (mode === "closed") await writeProducerState(producerA.producerPath, "closed", 1_000, 1_000);
+        const contenderNow = mode === "closed" ? 1_000 : 1_000 + 60_001;
+        const producerB = await createOutbox({ host: "prime", homeDir, nodeId: producerA.nodeId, producerUuid: producerId(mode === "closed" ? 402 : 403), machineId: `machine-garbage-lock-${mode}`, now: () => contenderNow });
+        const accepted = await producerB.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000961")], policy: current });
+        expect(await stat(accepted.file)).toBeDefined();
+        const names = await readdir(reservations);
+        expect(names).toContain("admission.0000000000000000.retired");
+        expect(activeAdmissionLockNames(names)).toEqual([]);
+        expect(activeReservationNames(names)).toEqual([]);
+      } finally { await rm(homeDir, { recursive: true, force: true }); }
+    }
+  }, 10_000);
+
+  it("keeps a garbage admission lock of a live producer and rejects after the busy deadline", async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), "task6-live-garbage-lock-"));
+    try {
+      const producerA = await createOutbox({ host: "prime", homeDir, nodeId: "node-live-garbage-lock", producerUuid: producerId(404), machineId: "machine-live-garbage-lock" });
+      const current = policy(null);
+      const reservation = reservationRecord(producerA.nodeId, producerA.producerUuid, "00000000-0000-5000-8000-000000000962", current, 100);
+      const reservations = join(producerA.root, "reservations");
+      const reservationFile = join(reservations, `${reservation.reservationId as string}.json`);
+      await nodeFs.writeFile(reservationFile, canonicalStringify(reservation), { mode: 0o600 });
+      await nodeFs.link(reservationFile, join(reservations, "admission.0000000000000000.lock"));
+      await writeProducerState(producerA.producerPath, "active", Date.now(), null);
+      const producerB = await createOutbox({ host: "prime", homeDir, nodeId: producerA.nodeId, producerUuid: producerId(405), machineId: "machine-live-garbage-lock", admissionBusyDeadlineMs: 100 });
+      await expect(producerB.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000963")], policy: current })).rejects.toThrow(/busy/u);
+      const names = await readdir(reservations);
+      expect(names).not.toContain("admission.0000000000000000.retired");
+      expect(activeAdmissionLockNames(names)).toEqual(["admission.0000000000000000.lock"]);
+    } finally { await rm(homeDir, { recursive: true, force: true }); }
+  }, 10_000);
+
   it("never reuses a retired generation while stale recovery and a capped contender interleave", async () => {
     const homeDir = await mkdtemp(join(tmpdir(), "task5-no-reuse-interleave-")); let pauseOwnerRemoval = true; let ownerPaused!: () => void; let releaseOwner!: () => void; const ownerPausedGate = new Promise<void>((resolve) => { ownerPaused = resolve; }); const releaseOwnerGate = new Promise<void>((resolve) => { releaseOwner = resolve; }); let recoveryPaused!: () => void; let releaseRecovery!: () => void; const recoveryPausedGate = new Promise<void>((resolve) => { recoveryPaused = resolve; }); const releaseRecoveryGate = new Promise<void>((resolve) => { releaseRecovery = resolve; }); let pauseRecoveryRemoval = true; const bRetirements: string[] = [];
     const ownerFs = { ...nodeFs, rm: async (path: Parameters<typeof nodeFs.rm>[0], options?: Parameters<typeof nodeFs.rm>[1]) => { if (pauseOwnerRemoval && ADMISSION_LOCK_NAME.test(String(path).split(/[\/]/u).at(-1) ?? "")) { pauseOwnerRemoval = false; ownerPaused(); await releaseOwnerGate; } return options === undefined ? nodeFs.rm(path) : nodeFs.rm(path, options); } };

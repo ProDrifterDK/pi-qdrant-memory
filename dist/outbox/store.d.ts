@@ -55,6 +55,8 @@ export interface CreateOutboxInput {
     producerUuid?: string;
     machineId?: string;
     sharedFilesystem?: boolean;
+    maxClockSkewMs?: number;
+    admissionBusyDeadlineMs?: number;
     maxJobs?: number;
     maxBytes?: number;
     now?: () => number;

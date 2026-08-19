@@ -63,6 +63,8 @@ export interface CreateOutboxInput {
   producerUuid?: string;
   machineId?: string;
   sharedFilesystem?: boolean;
+  maxClockSkewMs?: number;
+  admissionBusyDeadlineMs?: number;
   maxJobs?: number;
   maxBytes?: number;
   now?: () => number;
@@ -97,6 +99,11 @@ const LOCAL_DESTINATION = /^local:[a-f0-9]{32}$/u;
 const HASH = /^[0-9a-f]{64}$/u;
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 const MAX_EPISODES = 1024;
+/** Matches the producer-staleness convention used by session recovery: an
+ * active producer whose heartbeat is older than this (plus clock skew) is
+ * treated as dead for admission-lock garbage collection. */
+const ADMISSION_STALE_HEARTBEAT_MS = 60_000;
+const DEFAULT_ADMISSION_BUSY_DEADLINE_MS = 10_000;
 
 function record(value: unknown): value is PlainRecord { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function exactKeys(value: PlainRecord, keys: readonly string[]): boolean {
@@ -422,6 +429,9 @@ export async function createOutbox(input: CreateOutboxInput): Promise<Outbox> {
   if (!Number.isSafeInteger(maxJobs) || maxJobs < 1 || maxJobs > 100_000) throw new TypeError("outbox.maxJobs must be between 1 and 100000");
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1_048_576 || maxBytes > 1_073_741_824) throw new TypeError("outbox.maxBytes must be between 1 MiB and 1 GiB");
   if (input.producerUuid !== undefined) assertProducerUuid(input.producerUuid);
+  const maxClockSkewMs = input.maxClockSkewMs ?? 0; const admissionBusyDeadlineMs = input.admissionBusyDeadlineMs ?? DEFAULT_ADMISSION_BUSY_DEADLINE_MS;
+  if (!Number.isSafeInteger(maxClockSkewMs) || maxClockSkewMs < 0 || maxClockSkewMs > 3_600_000) throw new TypeError("outbox.maxClockSkewMs must be between 0 and 3600000");
+  if (!Number.isSafeInteger(admissionBusyDeadlineMs) || admissionBusyDeadlineMs < 1 || admissionBusyDeadlineMs > 600_000) throw new TypeError("outbox.admissionBusyDeadlineMs must be between 1 and 600000");
   const prepared = await prepareOutboxIdentity(input);
   const { fs, random, clock, setupNow, sharedFilesystem, root, reservationsDir, nodeId, nodePath, machineAuditHash } = prepared;
   const producerUuid = input.producerUuid ?? randomUuid(random); assertProducerUuid(producerUuid);
@@ -505,9 +515,22 @@ export async function createOutbox(input: CreateOutboxInput): Promise<Outbox> {
   }
   async function removeReservation(reservation: CaptureReservation): Promise<void> { try { await fs.rm(join(reservationsDir, `${reservation.reservationId}.json`)); } catch (error) { if (!errno(error, "ENOENT")) throw error; } await syncDirectory(fs, reservationsDir); }
   async function cleanupReservations(reservations: readonly CaptureReservation[]): Promise<void> { for (const reservation of reservations) if (await durableReservationJobProof(reservation) !== undefined) await removeReservation(reservation); }
+  async function abandonedAdmission(reservation: CaptureReservation): Promise<boolean> {
+    // Positive proof of death only: a live or unreadable producer, a fenced
+    // jobs namespace, or an in-flight precommit temp all keep the foreign
+    // lock for delivery-side recovery (adopt). Only a closed or
+    // heartbeat-stale producer whose job was never started is garbage here.
+    const producer = join(root, reservation.nodeId, reservation.producerUuid); assertInside(root, producer);
+    const stateValue = validateState(await readSecureJson(fs, join(producer, "state.json")));
+    const nowMs = clock();
+    if (stateValue.state !== "closed" && !(nowMs > stateValue.heartbeatAt && nowMs - stateValue.heartbeatAt > ADMISSION_STALE_HEARTBEAT_MS + maxClockSkewMs)) return false;
+    try { await fs.lstat(join(producer, "fence.json")); return false; } catch (error) { if (!errno(error, "ENOENT")) throw error; }
+    const prefix = `${reservation.jobId}.json.tmp-`;
+    return !(await fs.readdir(join(producer, "jobs"))).some((name) => name.startsWith(prefix));
+  }
   async function acquireAdmissionLock(reservation: CaptureReservation): Promise<CaptureReservation> {
     const reservationFile = join(reservationsDir, `${reservation.reservationId}.json`);
-    try { await acquireAdmissionGeneration({ fs, dir: reservationsDir, reservationFile, reservation, validateReservation, durableProof: async (existing) => await durableReservationJobProof(existing) !== undefined }); return reservation; }
+    try { await acquireAdmissionGeneration({ fs, dir: reservationsDir, reservationFile, reservation, validateReservation, durableProof: async (existing) => await durableReservationJobProof(existing) !== undefined, abandoned: async (existing) => await abandonedAdmission(existing), busyDeadlineMs: admissionBusyDeadlineMs, now: clock }); return reservation; }
     catch (error) { if (error instanceof Error && error.message === "Outbox admission is busy") throw new OutboxAdmissionBusyError(); throw error; }
   }
   async function finalizeAdmission(reservation: CaptureReservation, requireOwnership = true): Promise<void> {

@@ -280,6 +280,8 @@ export async function activeAdmissionLocks(fs, dir, validateReservation) {
 export async function acquireAdmissionGeneration(input) {
     const delay = input.busyDelayMs ?? 5;
     const attempts = input.maxAttempts ?? 400;
+    const now = input.now ?? Date.now;
+    const deadline = input.busyDeadlineMs === undefined ? undefined : now() + input.busyDeadlineMs;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
         const state = await scanAdmissionState(input.fs, input.dir, input.validateReservation);
         assertNotRetired(state, input.reservation);
@@ -329,6 +331,19 @@ export async function acquireAdmissionGeneration(input) {
             await durableRemove(input.fs, state.active.file, input.dir).catch(() => undefined);
             continue;
         }
+        let abandoned = false;
+        try {
+            abandoned = input.abandoned === undefined ? false : await input.abandoned(existing);
+        }
+        catch { /* ambiguous liveness is never reclamation authority */ }
+        if (abandoned) {
+            await publishAdmissionRetirement(input.fs, input.dir, state.active.generation, existing, input.validateReservation);
+            await durableRemove(input.fs, state.active.file, input.dir).catch(() => undefined);
+            await durableRemove(input.fs, join(input.dir, `${existing.reservationId}.json`), input.dir).catch(() => undefined);
+            continue;
+        }
+        if (deadline !== undefined && now() >= deadline)
+            break;
         await new Promise((resolveWait) => setTimeout(resolveWait, delay));
     }
     throw new Error("Outbox admission is busy");

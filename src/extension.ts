@@ -723,7 +723,7 @@ function createProductionLifecycleCoordinatorInternal(input: { homeDir: string; 
     async start(session: MemoryLifecycleSession) {
       await persistCaptureActivationFile({ host: session.host, sessionId: session.sessionId, getEntries: session.getEntries as never, env: input.env, homeDir: input.homeDir, now });
       outboxAdmissionFull = false;
-      outbox = await createOutbox({ host: session.host, homeDir: input.homeDir, env: input.env, ...(session.config.outbox.nodeId === undefined ? {} : { nodeId: session.config.outbox.nodeId }), sharedFilesystem: session.config.outbox.sharedFilesystem, maxJobs: session.config.outbox.maxJobs, maxBytes: session.config.outbox.maxBytes, now, notifyFull: () => { outboxAdmissionFull = true; } });
+      outbox = await createOutbox({ host: session.host, homeDir: input.homeDir, env: input.env, ...(session.config.outbox.nodeId === undefined ? {} : { nodeId: session.config.outbox.nodeId }), sharedFilesystem: session.config.outbox.sharedFilesystem, maxJobs: session.config.outbox.maxJobs, maxBytes: session.config.outbox.maxBytes, maxClockSkewMs: session.config.coordination.maxClockSkewMs, now, notifyFull: () => { outboxAdmissionFull = true; } });
       try {
         const effectiveSession = Object.freeze({ ...session, config: withRuntimeNodeId(session.config, outbox.nodeId) });
         const binding = capturePolicy(effectiveSession);

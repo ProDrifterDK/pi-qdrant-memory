@@ -63,8 +63,11 @@ export declare function acquireAdmissionGeneration<T extends ReservationRecord>(
     reservation: T;
     validateReservation: (value: unknown) => T;
     durableProof: (reservation: T) => Promise<boolean>;
+    abandoned?: (reservation: T) => Promise<boolean>;
     busyDelayMs?: number;
     maxAttempts?: number;
+    busyDeadlineMs?: number;
+    now?: () => number;
 }): Promise<{
     generation: number;
     file: string;

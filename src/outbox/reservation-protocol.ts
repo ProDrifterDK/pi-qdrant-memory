@@ -192,8 +192,8 @@ export async function activeAdmissionLocks<T extends ReservationRecord>(fs: Rese
   const state = await scanAdmissionState(fs, dir, validateReservation); return state.active === undefined ? [] : [state.active];
 }
 
-export async function acquireAdmissionGeneration<T extends ReservationRecord>(input: { fs: ReservationProtocolFileSystem; dir: string; reservationFile: string; reservation: T; validateReservation: (value: unknown) => T; durableProof: (reservation: T) => Promise<boolean>; busyDelayMs?: number; maxAttempts?: number }): Promise<{ generation: number; file: string; reservation: T }> {
-  const delay = input.busyDelayMs ?? 5; const attempts = input.maxAttempts ?? 400;
+export async function acquireAdmissionGeneration<T extends ReservationRecord>(input: { fs: ReservationProtocolFileSystem; dir: string; reservationFile: string; reservation: T; validateReservation: (value: unknown) => T; durableProof: (reservation: T) => Promise<boolean>; abandoned?: (reservation: T) => Promise<boolean>; busyDelayMs?: number; maxAttempts?: number; busyDeadlineMs?: number; now?: () => number }): Promise<{ generation: number; file: string; reservation: T }> {
+  const delay = input.busyDelayMs ?? 5; const attempts = input.maxAttempts ?? 400; const now = input.now ?? Date.now; const deadline = input.busyDeadlineMs === undefined ? undefined : now() + input.busyDeadlineMs;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const state = await scanAdmissionState(input.fs, input.dir, input.validateReservation); assertNotRetired(state, input.reservation);
     const generation = state.cursor; const file = join(input.dir, admissionLockName(generation));
@@ -214,6 +214,9 @@ export async function acquireAdmissionGeneration<T extends ReservationRecord>(in
     }
     let completed = false; try { completed = await input.durableProof(existing); } catch { /* ambiguous durable state is never reclamation authority */ }
     if (completed) { await publishAdmissionRetirement(input.fs, input.dir, state.active.generation, existing, input.validateReservation); await durableRemove(input.fs, state.active.file, input.dir).catch(() => undefined); continue; }
+    let abandoned = false; try { abandoned = input.abandoned === undefined ? false : await input.abandoned(existing); } catch { /* ambiguous liveness is never reclamation authority */ }
+    if (abandoned) { await publishAdmissionRetirement(input.fs, input.dir, state.active.generation, existing, input.validateReservation); await durableRemove(input.fs, state.active.file, input.dir).catch(() => undefined); await durableRemove(input.fs, join(input.dir, `${existing.reservationId}.json`), input.dir).catch(() => undefined); continue; }
+    if (deadline !== undefined && now() >= deadline) break;
     await new Promise((resolveWait) => setTimeout(resolveWait, delay));
   }
   throw new Error("Outbox admission is busy");
