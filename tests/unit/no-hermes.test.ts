@@ -38,7 +38,7 @@ describe("v2 active release surface", () => {
 
   it("pins exact release, dependency, compatibility, and tool metadata", async () => {
     const pkg = JSON.parse(await readFile("package.json", "utf8"));
-    expect(pkg.version).toBe("2.1.1"); expect(pkg.engines).toMatchObject({ node: ">=22.19", npm: ">=11.10" });
+    expect(pkg.version).toBe("2.1.2"); expect(pkg.engines).toMatchObject({ node: ">=22.19", npm: ">=11.10" });
     expect(pkg.dependencies).toEqual({ "umap-js": "1.4.0" });
     expect(pkg.peerDependencies?.["@earendil-works/pi-ai"]).toBe("*"); expect(pkg.devDependencies?.["@earendil-works/pi-ai"]).toBe("0.84.1"); expect(pkg.dependencies?.["@earendil-works/pi-ai"]).toBeUndefined();
     expect(pkg.files).toEqual(["dist", "README.md", "LICENSE", "docs/configuration.md", "docs/security.md", "compatibility.json", "src/vendor/umap-license-apache-2.0.txt"]);
