@@ -536,7 +536,11 @@ try {
   await beforeAgentStart({ type: "before_agent_start", prompt: "remember alpha architecture" }, rootContext);
   await agentEnd({ type: "agent_end", messages: [] }, rootContext);
   await beforeCompact({ type: "session_before_compact", messages: [] }, rootContext);
-  const capturedWrite = qdrantWrites.find((write) => write.recordType === "episode" && write.text?.includes("post-cutoff captured compatibility memory"));
+  let capturedWrite;
+  for (let attempt = 0; attempt < 200 && capturedWrite === undefined; attempt += 1) {
+    capturedWrite = qdrantWrites.find((write) => write.recordType === "episode" && write.text?.includes("post-cutoff captured compatibility memory"));
+    if (capturedWrite === undefined) await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+  }
   const lifecycleFiles = [];
   const collectLifecycleFiles = (path, prefix = "") => { let entries; try { entries = readdirSync(path, { withFileTypes: true }); } catch { return; } for (const entry of entries) { const relative = prefix === "" ? entry.name : `${prefix}/${entry.name}`; if (entry.isDirectory()) collectLifecycleFiles(join(path, entry.name), relative); else lifecycleFiles.push(relative); } };
   collectLifecycleFiles(tempRoot);
