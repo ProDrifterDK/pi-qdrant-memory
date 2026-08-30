@@ -183,6 +183,11 @@ async function invokeBefore(handler: Handler, prompt: string, context: Extension
   return handler({ type: "before_agent_start", prompt, systemPrompt: "", systemPromptOptions: {} }, context);
 }
 
+async function settleBackgroundMaintenance(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
 describe("portable memory extension", () => {
   it("exports an async-compatible default ExtensionFactory", () => {
     expect(extension).toBeTypeOf("function");
@@ -368,6 +373,62 @@ describe("autonomous lifecycle wiring", () => {
     return { coordinator, calls };
   }
 
+  it("returns agent_end after durable capture while remote delivery remains pending", async () => {
+    const lifecycle = lifecycleDouble({ captureEpisodes: () => [{ id: "durable-episode", processingPolicyId: "policy", eventKind: "user" }] });
+    let releaseDelivery!: () => void;
+    const deliveryPending = new Promise<void>((resolve) => { releaseDelivery = resolve; });
+    lifecycle.coordinator.deliver = async (value = {}) => { lifecycle.calls.push({ method: "deliver", value }); await deliveryPending; };
+    const runtime = runtimeFetch("pi");
+    const factory = createMemoryExtension({
+      env: { PI_QDRANT_MEMORY_HOST: "pi" }, argv: [], homeDir: "/home/test",
+      readTextFile: async () => hostConfig(true, true), fetchImpl: runtime.fetchImpl,
+      projectResolver: async () => registeredProject(), lifecycleCoordinator: lifecycle.coordinator,
+    });
+    const fake = fakeApi(); await factory(fake.api); const context = ctx({ header: { parentSession: null } });
+    await fake.handler("session_start")({ type: "session_start", reason: "startup" }, context.value);
+
+    const handler = Promise.resolve(fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value));
+    const verdict = await Promise.race([
+      handler.then(() => "resolved" as const),
+      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 25)),
+    ]);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(verdict).toBe("resolved");
+    expect(lifecycle.calls.findIndex((call) => call.method === "capture")).toBeLessThan(lifecycle.calls.findIndex((call) => call.method === "deliver"));
+    releaseDelivery();
+    await handler;
+    await fake.handler("session_shutdown")({ type: "session_shutdown", reason: "quit" }, context.value);
+  });
+
+  it("serializes maintenance and aborts it before shutdown clears lifecycle state", async () => {
+    const lifecycle = lifecycleDouble(); let activeDeliveries = 0; let maxDeliveries = 0; let aborted = false; let clearedWhileActive = false;
+    lifecycle.coordinator.deliver = async (value = {}) => {
+      lifecycle.calls.push({ method: "deliver", value }); activeDeliveries += 1; maxDeliveries = Math.max(maxDeliveries, activeDeliveries);
+      try {
+        await new Promise<void>((resolve) => {
+          if (value.signal?.aborted) { aborted = true; resolve(); return; }
+          value.signal?.addEventListener("abort", () => { aborted = true; resolve(); }, { once: true });
+        });
+      } finally { activeDeliveries -= 1; }
+    };
+    lifecycle.coordinator.clear = () => { clearedWhileActive ||= activeDeliveries > 0; lifecycle.calls.push({ method: "clear" }); };
+    const runtime = runtimeFetch("pi");
+    const factory = createMemoryExtension({ env: { PI_QDRANT_MEMORY_HOST: "pi" }, argv: [], homeDir: "/home/test", readTextFile: async () => hostConfig(true, true), fetchImpl: runtime.fetchImpl, projectResolver: async () => registeredProject(), lifecycleCoordinator: lifecycle.coordinator });
+    const fake = fakeApi(); await factory(fake.api); const context = ctx({ header: { parentSession: null } });
+    await fake.handler("session_start")({ type: "session_start", reason: "startup" }, context.value);
+    await fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
+    expect(lifecycle.calls.filter((call) => call.method === "deliver")).toHaveLength(1);
+
+    await fake.handler("session_shutdown")({ type: "session_shutdown", reason: "quit" }, context.value);
+    expect(aborted).toBe(true);
+    expect(maxDeliveries).toBe(1);
+    expect(clearedWhileActive).toBe(false);
+    expect(lifecycle.calls.filter((call) => call.method === "deliver")).toHaveLength(1);
+  });
+
   it("uses persisted getEntries at every capture event, ignores event arrays, and schedules only root work", async () => {
     const lifecycle = lifecycleDouble();
     const runtime = runtimeFetch("pi");
@@ -392,6 +453,7 @@ describe("autonomous lifecycle wiring", () => {
 
     await expect(fake.handler("agent_end")({ type: "agent_end", messages: [{ role: "user", content: "EVENT-ONLY-SECRET" }] }, context.value)).resolves.toBeUndefined();
     await expect(fake.handler("session_before_compact")({ type: "session_before_compact", branchEntries: [{ id: "event-array-must-be-ignored" }] }, context.value)).resolves.toBeUndefined();
+    await settleBackgroundMaintenance();
     await expect(fake.handler("session_shutdown")({ type: "session_shutdown", reason: "quit", messages: [{ content: "ignored" }] }, context.value)).resolves.toBeUndefined();
 
     const captureCalls = lifecycle.calls.filter((call) => call.method === "capture").map((call) => call.value as { lifecycle: string; entries: unknown[]; keys: string[] });
@@ -485,6 +547,7 @@ describe("autonomous lifecycle wiring", () => {
     await fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
     expect(lifecycle.calls.filter((call) => call.method === "scheduleRoot")).toHaveLength(0);
     await fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
+    await settleBackgroundMaintenance();
     const scheduled = lifecycle.calls.filter((call) => call.method === "scheduleRoot");
     expect(scheduled).toHaveLength(1);
     expect(scheduled[0]!.value).toMatchObject({ reason: "threshold", marker: { rootWorkAllowed: true } });
@@ -499,7 +562,8 @@ describe("autonomous lifecycle wiring", () => {
     await fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
     await fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
     await fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
-    expect(lifecycle.calls.filter((call) => call.method === "scheduleRoot")).toHaveLength(2);
+    await settleBackgroundMaintenance();
+    expect(lifecycle.calls.filter((call) => call.method === "scheduleRoot")).toHaveLength(1);
   });
 
   it("deduplicates fixed lifecycle warnings per failure kind and keeps hostile header reads fail-open", async () => {
@@ -511,6 +575,7 @@ describe("autonomous lifecycle wiring", () => {
     const fake = fakeApi(); await factory(fake.api); const context = ctx({ entries: [] });
     await fake.handler("session_start")({ type: "session_start", reason: "startup" }, context.value);
     await expect(fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value)).resolves.toBeUndefined();
+    await settleBackgroundMaintenance();
     expect(warnings).toEqual(["pi-qdrant-memory: lifecycle unavailable (delivery).", "pi-qdrant-memory: lifecycle unavailable (root)."]);
     const scheduledBeforeInvalidHeader = base.calls.filter((call) => call.method === "scheduleRoot").length;
     (context.value.sessionManager as any).getHeader = () => { throw new Error("header secret"); };
@@ -661,6 +726,7 @@ describe("autonomous lifecycle wiring", () => {
     await fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
     expect(lifecycle.calls.filter((call) => call.method === "scheduleRoot")).toHaveLength(0);
     await fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
+    await settleBackgroundMaintenance();
     expect(lifecycle.calls.filter((call) => call.method === "scheduleRoot")).toHaveLength(1);
   });
 
@@ -673,8 +739,9 @@ describe("autonomous lifecycle wiring", () => {
     await fake.handler("session_start")({ type: "session_start", reason: "startup" }, context.value);
     await fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
     await fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
+    await settleBackgroundMaintenance();
     expect(lifecycle.calls.filter((call) => call.method === "capture")).toHaveLength(2);
-    expect(lifecycle.calls.filter((call) => call.method === "deliver")).toHaveLength(2);
+    expect(lifecycle.calls.filter((call) => call.method === "deliver")).toHaveLength(1);
     expect(lifecycle.calls.filter((call) => call.method === "scheduleRoot")).toHaveLength(1);
     expect(context.notifications).toEqual([{ message: "pi-qdrant-memory: lifecycle unavailable (capture).", type: "warning" }]);
   });
@@ -688,6 +755,7 @@ describe("autonomous lifecycle wiring", () => {
     const fake = fakeApi(); await factory(fake.api); const context = ctx({ header: { parentSession: null } });
     await fake.handler("session_start")({ type: "session_start", reason: "startup" }, context.value);
     await fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
+    await settleBackgroundMaintenance();
     const batches = lifecycle.calls.filter((call) => call.method === "scheduleRoot").map((call) => (call.value as { episodes: Array<{ processingPolicyId: string }> }).episodes);
     expect(batches).toHaveLength(17);
     expect(batches.reduce((count, batch) => count + batch.length, 0)).toBe(1025);
@@ -765,7 +833,7 @@ describe("production capture coordinator", () => {
     expect(payload).not.toContain('"llm"');
   });
 
-  it("creates durable shutdown work without invoking the configured memory model", async () => {
+  it("closes durable shutdown work without remote flush or model invocation", async () => {
     const homeDir = await mkdtemp(join(tmpdir(), "pi-qdrant-shutdown-job-"));
     const env = { PI_CODING_AGENT_DIR: join(homeDir, ".pi", "agent"), PI_QDRANT_MEMORY_HOST: "pi" };
     const configured = JSON.parse(hostConfig(true, true)); configured.curation = { turnTrigger: 100, toolTrigger: 100 }; configured.memoryModel = { modelId: "memory-provider/memory-model", timeoutMs: 30000, maxOutputTokens: 2048 };
@@ -781,7 +849,13 @@ describe("production capture coordinator", () => {
       await api.handler("session_shutdown")({ type: "session_shutdown", reason: "quit" }, context.value);
       expect(completions).toBe(0);
       const payloads = [...runtime.points.values()].map((point) => point.payload as Record<string, unknown>);
-      expect(payloads.some((payload) => payload.record_type === "episode" && payload.text === "durable shutdown episode")).toBe(true);
+      expect(payloads.some((payload) => payload.record_type === "episode" && payload.text === "durable shutdown episode")).toBe(false);
+      const outboxRoot = join(env.PI_CODING_AGENT_DIR, "pi-qdrant-memory", "outbox");
+      const node = (await readdir(outboxRoot)).find((name) => name.startsWith("node-"))!;
+      const producer = (await readdir(join(outboxRoot, node))).find((name) => !name.endsWith(".json"))!;
+      const jobs = await readdir(join(outboxRoot, node, producer, "jobs"));
+      expect(jobs).toHaveLength(1);
+      expect(await readFile(join(outboxRoot, node, producer, "jobs", jobs[0]!), "utf8")).toContain("durable shutdown episode");
     } finally { vi.unstubAllGlobals(); }
   });
 
@@ -840,12 +914,12 @@ describe("production capture coordinator", () => {
       expect(registryCalls).toBe(0);
       manager.appendMessage(user("durable before registry", base + 1));
       await api.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
-      expect(registryCalls).toBe(1);
+      await vi.waitFor(() => expect(registryCalls).toBe(1));
       expect([...runtime.points.values()].some((point) => point.payload?.record_type === "job")).toBe(true);
       expect(completions).toBe(0);
       registryAvailable = true;
       await api.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
-      expect(registryCalls).toBe(2);
+      await vi.waitFor(() => expect(registryCalls).toBe(2));
       expect(completions).toBe(1);
       expect([...runtime.points.values()].some((point) => point.payload?.record_type === "curated_memory")).toBe(true);
       await api.handler("session_shutdown")({ type: "session_shutdown", reason: "quit" }, context.value);
@@ -872,9 +946,11 @@ describe("production capture coordinator", () => {
     (context.value as any).modelRegistry = { getAvailable: () => [{ id: "memory-model", provider: "provider", baseUrl: "http://127.0.0.1:9999/v1", contextWindow: 100000, maxTokens: 8192 }], getApiKeyAndHeaders: async () => ({ ok: true }), complete: async () => { completionCount += 1; if (completionCount === 1) { const job = [...runtime.points.values()].find((point) => point.payload?.record_type === "job"); const evidence = job?.payload?.membership?.[0]; return { content: [{ type: "text", text: JSON.stringify({ items: [{ category: "fact", scope: "project", subject: "background", predicate: "curated", value: true, evidence: [evidence] }] }) }] }; } return await new Promise<never>(() => undefined); } };
     await api.handler("session_start")({ type: "session_start", reason: "startup" }, context.value); for (const point of seedPoints) runtime.points.set(point.id, point); manager.appendMessage(user("trigger background raptor", base + 1));
     const handlerResult = await api.handler("agent_end")({ type: "agent_end", messages: [] }, context.value); const completionsAtHandlerReturn = completionCount;
-    // Curation completed, while the admitted full-corpus RAPTOR generation has
-    // neither published nor added a second awaited completion to this turn.
-    expect(handlerResult).toBeUndefined(); expect(completionsAtHandlerReturn).toBe(1); expect([...runtime.points.values()].some((point) => point.payload?.record_type === "raptor_manifest")).toBe(false);
+    expect(handlerResult).toBeUndefined(); expect(completionsAtHandlerReturn).toBe(0);
+    await vi.waitFor(() => expect(completionCount).toBe(1));
+    // Curation completed in the maintenance lane while the admitted full-corpus
+    // RAPTOR generation remains independently abortable.
+    expect([...runtime.points.values()].some((point) => point.payload?.record_type === "raptor_manifest")).toBe(false);
     await api.handler("session_shutdown")({ type: "session_shutdown", reason: "quit" }, context.value); expect([...runtime.points.values()].some((point) => point.payload?.record_type === "raptor_manifest")).toBe(false); vi.unstubAllGlobals();
   }, 15_000);
 
@@ -890,8 +966,8 @@ describe("production capture coordinator", () => {
       await api.handler("session_start")({ type: "session_start", reason: "startup" }, context.value);
       entries.push({ id: "production-entry", type: "message", message: { role: "user", content: "durable without a generation model", timestamp: base + 1 } });
       await api.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
+      await vi.waitFor(() => expect([...runtime.points.values()].some((point) => point.payload?.record_type === "episode" && point.payload?.text === "durable without a generation model")).toBe(true));
       const payloads = [...runtime.points.values()].map((point) => point.payload as Record<string, unknown>);
-      expect(payloads.some((payload) => payload.record_type === "episode" && payload.text === "durable without a generation model")).toBe(true);
       expect(payloads.some((payload) => payload.record_type === "processing_policy")).toBe(true);
       expect(payloads.some((payload) => payload.record_type === "job" && Array.isArray(payload.membership) && payload.membership.length === 1)).toBe(true);
       expect(runtime.calls.some((call) => new URL(call.url).pathname.endsWith("/points") && call.body?.points?.some((point: any) => point.payload?.record_type === "job"))).toBe(true);
@@ -947,6 +1023,7 @@ describe("production capture coordinator", () => {
       expect(context.notifications.some((notification) => notification.message.includes("activation pending"))).toBe(false);
       entries.push({ id: "legacy-entry", type: "message", message: { role: "user", content: "legacy control episode", timestamp: base + 1 } });
       await api.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
+      await vi.waitFor(() => expect([...runtime.points.values()].some((point) => point.payload?.record_type === "episode" && point.payload?.text === "legacy control episode")).toBe(true));
       const payloads = [...runtime.points.values()].map((point) => point.payload as Record<string, any>);
       // The provider-agnostic worker policy record is inserted on first delivery.
       const agnostic = payloads.find((payload) => payload.record_type === "processing_policy" && payload.policy?.originProvider === "any");

@@ -237,6 +237,7 @@ export async function runCurationFromLifecycle(sessionManager: SessionManager, i
   const leaseMs = input.leaseMs;
   const maxClockSkewMs = input.maxClockSkewMs;
   const clock = input.clock;
+  const signal = input.signal;
   const extractorRevision = input.extractorRevision;
   const embedding = input.embedding;
   // Keep mutable fresh-call seams behind one lazy thunk. Core invokes this only
@@ -254,7 +255,7 @@ export async function runCurationFromLifecycle(sessionManager: SessionManager, i
   // untrusted marker/header into a worker authority.  hostContext is ignored:
   // the worker creates a fresh empty context at the egress boundary.
   return runCurationCore(worker, {
-    host, store, nodeId, leaseMs, maxClockSkewMs, ...(clock === undefined ? {} : { clock }),
+    host, store, nodeId, leaseMs, maxClockSkewMs, ...(clock === undefined ? {} : { clock }), ...(signal === undefined ? {} : { signal }),
     workerPolicy, extractorRevision, producerPolicies,
     embedding, freshOptionsProvider,
     membership,

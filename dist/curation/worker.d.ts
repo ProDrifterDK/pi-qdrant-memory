@@ -51,6 +51,7 @@ export interface CurationWorkerInput {
     leaseMs: number;
     maxClockSkewMs: number;
     clock?: () => number;
+    signal?: AbortSignal;
     workerPolicy: ProcessingPolicy;
     extractorRevision: string;
     producerPolicies: readonly ProcessingPolicy[];

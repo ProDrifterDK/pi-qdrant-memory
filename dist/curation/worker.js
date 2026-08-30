@@ -336,6 +336,9 @@ export async function runCurationCore(worker, input) {
     const leaseMs = ownOption(input, "leaseMs");
     const maxClockSkewMs = ownOption(input, "maxClockSkewMs");
     const clock = ownOption(input, "clock", false);
+    const signal = ownOption(input, "signal", false);
+    if (signal !== undefined && !(signal instanceof AbortSignal))
+        throw new TypeError("Curation signal is invalid");
     const workerPolicy = snapshotProcessingPolicy(ownedCanonicalSnapshot(ownOption(input, "workerPolicy"), "Curation worker policy"));
     const extractorRevision = ownOption(input, "extractorRevision");
     const producerPolicies = Object.freeze(ownedDenseArray(ownOption(input, "producerPolicies"), "Curation producer policies", 64).map((policy) => snapshotProcessingPolicy(policy)));
@@ -377,7 +380,11 @@ export async function runCurationCore(worker, input) {
     // snapshotted configuration to the nominal worker before any store read.
     if (worker.host !== host || worker.nodeId !== nodeId || worker.leaseMs !== leaseMs || worker.maxClockSkewMs !== maxClockSkewMs)
         return Object.freeze({ state: "child" });
+    if (signal?.aborted)
+        return Object.freeze({ state: "pending", reason: "aborted" });
     const control = await readControl(store);
+    if (signal?.aborted)
+        return Object.freeze({ state: "pending", reason: "aborted" });
     if (control.state !== "active")
         return Object.freeze({ state: "pending", reason: "control-not-active" });
     if (control.revokedDestinationIds.includes(embeddingDestination.id))
@@ -385,6 +392,8 @@ export async function runCurationCore(worker, input) {
     const now = worker.now();
     validateWorkerPolicies(workerPolicy, producerPolicies, host, now, maxClockSkewMs);
     const episodes = await store.readEpisodes(membership, control.privacyEpoch).catch(() => []);
+    if (signal?.aborted)
+        return Object.freeze({ state: "pending", reason: "aborted" });
     if (episodes.length !== membership.length)
         return Object.freeze({ state: "pending", reason: "membership-missing" });
     const episodeById = new Map(episodes.map((episode) => [episode.id, episode]));
@@ -436,6 +445,8 @@ export async function runCurationCore(worker, input) {
         const seenJobIds = new Set();
         let lastJobId;
         do {
+            if (signal?.aborted)
+                return Object.freeze({ state: "pending", reason: "aborted" });
             if (++discoveryPages > 16)
                 throw new TypeError("Curation job discovery exceeded bounded pages");
             if (jobCursor !== undefined) {
@@ -610,6 +621,8 @@ export async function runCurationCore(worker, input) {
         // canonical episode rather than a per-run mutable clock getter.
         createdAt: episodeById.get(group.episodes[0]).createdAt,
     })).id;
+    if (signal?.aborted)
+        return Object.freeze({ state: "pending", reason: "aborted", jobId: jobIdValue });
     const claim = await claimLease(store, worker, { jobId: jobIdValue, policyEpoch: control.coordinationPolicyEpoch, policyHash: control.coordinationPolicyHash, privacyEpoch: control.privacyEpoch });
     if (claim === null)
         return Object.freeze({ state: "no_claim", jobId: jobIdValue });
@@ -722,9 +735,11 @@ export async function runCurationCore(worker, input) {
         });
         if (!modelStillBound())
             return await fail("model-changed");
+        if (signal?.aborted)
+            return await fail("aborted");
         const completion = await completeMemory({
             envelope: prompt.envelope, model: modelSnapshot, hostContext: { messages: [] },
-            maxInputTokens: prompt.maxInputTokens, maxOutputTokens, timeoutMs,
+            maxInputTokens: prompt.maxInputTokens, maxOutputTokens, timeoutMs, ...(signal === undefined ? {} : { signal }),
             memoryContext: {
                 host, modelRegistry, memoryModel: modelSnapshot, policy: group.intersection, llmDestination,
                 llmDestinationBinding, policyEpoch: claim.coordinationPolicyEpoch, policyHash: group.intersection.id,
@@ -732,6 +747,8 @@ export async function runCurationCore(worker, input) {
             },
             promptRevision: prompt.promptRevision,
         });
+        if (signal?.aborted)
+            return await fail("aborted");
         if (completion.state !== "completed")
             return await fail(`llm-${completion.reason}`);
         if (!modelStillBound())

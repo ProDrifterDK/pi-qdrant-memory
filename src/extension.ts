@@ -68,6 +68,7 @@ export interface MemoryLifecycleSession {
   readonly marker: AgentMarker;
   readonly getEntries: () => readonly unknown[];
   readonly ctx: ExtensionContext;
+  readonly signal?: AbortSignal;
 }
 export interface MemoryLifecycleCaptureInput extends MemoryLifecycleSession {
   readonly lifecycle: MemoryCaptureLifecycle;
@@ -814,7 +815,7 @@ function createProductionLifecycleCoordinatorInternal(input: { homeDir: string; 
     },
     async scheduleRoot(value) {
       const activeRuntime = runtime; const runtimeSession = active;
-      if (activeRuntime === undefined || runtimeSession === undefined || runtimeSession.sessionId !== value.sessionId || !value.marker.rootWorkAllowed || value.episodes.length === 0 || value.episodes.length > 1024 || outbox === undefined) return false;
+      if (activeRuntime === undefined || runtimeSession === undefined || runtimeSession.sessionId !== value.sessionId || !value.marker.rootWorkAllowed || value.episodes.length === 0 || value.episodes.length > 1024 || outbox === undefined || value.signal?.aborted) return false;
       const runtimeConfig = runtimeSession.config; const manager = value.ctx.sessionManager as unknown as SessionManager;
       const control = await activeRuntime.store.readControl().catch(() => null); if (control === null || control.state !== "active") return false;
       const inputMembership = Object.freeze(value.episodes.map((episode) => episode.id).sort()); const delivered = await episodesForIds(activeRuntime, inputMembership, control); if (delivered === undefined) return false;
@@ -843,13 +844,14 @@ function createProductionLifecycleCoordinatorInternal(input: { homeDir: string; 
       } catch { return Object.freeze({ completedEpisodeIds: Object.freeze([]) }); }
       if (model === undefined || llmDestination === undefined || binding === undefined) return Object.freeze({ completedEpisodeIds: Object.freeze([]) });
       for (const group of durableGroups) {
+        if (value.signal?.aborted) return Object.freeze({ completedEpisodeIds: Object.freeze([...completed].sort()) });
         if (group.intersection.destinationIds.llm !== llmDestination.id) continue;
         await runCurationFromLifecycle(manager, {
           host: value.host, store: activeRuntime.store, nodeId: `${outbox.nodeId}-lifecycle`, leaseMs: runtimeConfig.coordination.leaseMs,
           maxClockSkewMs: runtimeConfig.coordination.maxClockSkewMs, clock: now, workerPolicy: activeRuntime.workerPolicy,
           extractorRevision: "curation-v1", producerPolicies: group.producerPolicies, embedding: activeRuntime.embedding, membership: group.membership,
           llm: { memoryModel: model, modelRegistry: value.ctx.modelRegistry, llmDestination, llmDestinationBinding: binding },
-          maxOutputTokens: runtimeConfig.memoryModel.maxOutputTokens, timeoutMs: runtimeConfig.memoryModel.timeoutMs, env: input.env,
+          maxOutputTokens: runtimeConfig.memoryModel.maxOutputTokens, timeoutMs: runtimeConfig.memoryModel.timeoutMs, env: input.env, ...(value.signal === undefined ? {} : { signal: value.signal }),
         }).catch(() => undefined);
       }
       // RAPTOR is admitted only after the exact durable curation job/readback,
@@ -901,29 +903,32 @@ function createProductionLifecycleCoordinatorInternal(input: { homeDir: string; 
     },
     async drainAdminJobs(value: MemoryLifecycleSession) {
       const activeRuntime = runtime; const runtimeSession = active;
-      if (activeRuntime === undefined || runtimeSession === undefined || runtimeSession.sessionId !== value.sessionId || !value.marker.rootWorkAllowed || raptorTask !== undefined) return;
-      const control = await activeRuntime.store.readControl().catch(() => null); if (control === null || control.state !== "active") return;
+      if (activeRuntime === undefined || runtimeSession === undefined || runtimeSession.sessionId !== value.sessionId || !value.marker.rootWorkAllowed || raptorTask !== undefined || value.signal?.aborted) return;
+      // A statically unavailable model needs no registry access or queue scan.
+      const runtimeConfig = runtimeSession.config; const manager = value.ctx.sessionManager as unknown as SessionManager;
+      if (runtimeConfig.memoryModel.modelId === undefined && !runtimeConfig.privacy.allowActiveModelFallback) return;
+      const control = await activeRuntime.store.readControl().catch(() => null); if (control === null || control.state !== "active" || value.signal?.aborted) return;
       const jobs: Array<Awaited<ReturnType<ProductionCoordinationStore["scrollJobs"]>>["jobs"][number]> = []; const seen = new Set<string>(); const cursors = new Set<string>(); let offset: string | undefined;
       for (let page = 0; page < 16; page += 1) {
-        const slice = await activeRuntime.store.scrollJobs(offset, 256).catch(() => undefined); if (slice === undefined) return;
+        if (value.signal?.aborted) return;
+        const slice = await activeRuntime.store.scrollJobs(offset, 256).catch(() => undefined); if (slice === undefined || value.signal?.aborted) return;
         if (slice.jobs.some(job => seen.has(job.id))) return;
         for (const job of slice.jobs) { seen.add(job.id); if (job.ownerHost === value.host && (job.extractorRevision === "curation-v1" || job.extractorRevision === "admin-raptor-v1")) jobs.push(job); }
         if (slice.nextOffset === undefined) break;
         if (slice.jobs.length === 0 || cursors.has(slice.nextOffset)) return; cursors.add(slice.nextOffset); offset = slice.nextOffset;
       }
-      if (jobs.length === 0) return;
-      // Queue records are durable before this model-registry lookup. A missing
-      // model or destination leaves them claimable and retryable.
-      const runtimeConfig = runtimeSession.config; const manager = value.ctx.sessionManager as unknown as SessionManager;
+      if (jobs.length === 0 || value.signal?.aborted) return;
+      // Queue records remain durable before the model registry is consulted.
       let model: Model<Api> | undefined; let llmDestination: AuthorizedDestination | undefined; let binding: LlmDestinationModelBinding | undefined;
       try {
         model = selectedMemoryModel(value.ctx, runtimeConfig); llmDestination = model === undefined ? undefined : destinationForModel(model, runtimeConfig);
         binding = model === undefined || llmDestination === undefined ? undefined : Object.freeze({ providerId: model.provider, modelId: model.id, destinationId: llmDestination.id });
       } catch { return; }
-      if (model === undefined || llmDestination === undefined || binding === undefined) return;
+      if (model === undefined || llmDestination === undefined || binding === undefined || value.signal?.aborted) return;
       const ordered = jobs.sort((left, right) => left.id.localeCompare(right.id)).slice(0, 16);
       for (const job of ordered) {
-        const lease = await activeRuntime.store.readLease(job.id).catch(() => undefined); if (lease === undefined || lease?.state === "completed") continue;
+        if (value.signal?.aborted) return;
+        const lease = await activeRuntime.store.readLease(job.id).catch(() => undefined); if (lease === undefined || lease?.state === "completed" || value.signal?.aborted) continue;
         const stored = await episodesForIds(activeRuntime, job.membership, control); if (stored === undefined) continue;
         const producerPolicies = await policiesForEpisodes(activeRuntime, stored, control); if (producerPolicies === undefined) continue;
         const intersection = intersectPolicies(producerPolicies, activeRuntime.workerPolicy);
@@ -936,7 +941,7 @@ function createProductionLifecycleCoordinatorInternal(input: { homeDir: string; 
             maxClockSkewMs: runtimeConfig.coordination.maxClockSkewMs, clock: now, workerPolicy: activeRuntime.workerPolicy,
             extractorRevision: job.extractorRevision, producerPolicies, embedding: activeRuntime.embedding, membership: job.membership,
             llm: { memoryModel: model, modelRegistry: value.ctx.modelRegistry, llmDestination, llmDestinationBinding: binding },
-            maxOutputTokens: runtimeConfig.memoryModel.maxOutputTokens, timeoutMs: runtimeConfig.memoryModel.timeoutMs, env: input.env,
+            maxOutputTokens: runtimeConfig.memoryModel.maxOutputTokens, timeoutMs: runtimeConfig.memoryModel.timeoutMs, env: input.env, ...(value.signal === undefined ? {} : { signal: value.signal }),
           }).catch(() => undefined);
           continue;
         }
@@ -945,11 +950,11 @@ function createProductionLifecycleCoordinatorInternal(input: { homeDir: string; 
         if (leaves.some(leaf => leaf.policy === undefined || leaf.vector.length !== 1024)) continue;
         const reuseCandidates = await previousRaptorSummaries(activeRuntime, control); if (reuseCandidates === undefined) continue;
         const registry = snapshotCompletionRegistry(value.ctx.modelRegistry); if (registry === undefined) continue;
-        const controller = new AbortController();
+        const controller = new AbortController(); const signal = value.signal ?? controller.signal;
         await runRaptorFromLifecycle(manager, {
           host: value.host, store: activeRuntime.store, env: input.env, nodeId: `${outbox?.nodeId ?? "admin"}-admin-raptor`, leaseMs: runtimeConfig.coordination.leaseMs,
           maxClockSkewMs: runtimeConfig.coordination.maxClockSkewMs, extractorRevision: job.extractorRevision, jobId: job.id, clock: now,
-          workerPolicy: activeRuntime.workerPolicy, leaves, embedding: activeRuntime.embedding, signal: controller.signal,
+          workerPolicy: activeRuntime.workerPolicy, leaves, embedding: activeRuntime.embedding, signal,
           llm: { destination: llmDestination, complete: async ({ envelope, signal }) => {
             const result = await completeMemory({ envelope, model, hostContext: { messages: [] } as unknown as Context, maxInputTokens: runtimeConfig.raptor.summaryInputTokens, maxOutputTokens: runtimeConfig.memoryModel.maxOutputTokens, timeoutMs: runtimeConfig.memoryModel.timeoutMs, ...(signal === undefined ? {} : { signal }), memoryContext: { host: value.host, modelRegistry: registry, memoryModel: model, policy: intersection, llmDestination, llmDestinationBinding: binding, allowCrossProviderReplay: intersection.allowCrossProviderReplay }, promptRevision: RAPTOR_PROMPT_REVISION });
             if (result.state !== "completed") throw new Error("RAPTOR completion pending"); return result.text;
@@ -961,13 +966,12 @@ function createProductionLifecycleCoordinatorInternal(input: { homeDir: string; 
         }).catch(() => undefined);
       }
     },
-    async shutdown(shutdownInput) {
+    async shutdown() {
       raptorController?.abort();
       await outbox?.heartbeat().catch(() => undefined);
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), Math.min(5_000, shutdownInput.config.memoryModel.timeoutMs)); timer.unref?.();
-      try { await runtime?.delivery.shutdown({ signal: controller.signal, maxJobs: shutdownInput.config.outbox.maxJobs }); } catch { /* pending files remain durable */ }
-      finally { clearTimeout(timer); await outbox?.closeProducer().catch(() => undefined); }
+      // Remote delivery is recoverable from the durable closed producer and
+      // must not extend interactive or headless shutdown.
+      await outbox?.closeProducer().catch(() => undefined);
     },
     clear() { raptorController?.abort(); raptorController = undefined; raptorTask = undefined; active = undefined; outbox = undefined; runtime = undefined; policy = undefined; producerBinding = undefined; outboxAdmissionFull = false; },
   };
@@ -1015,6 +1019,12 @@ export function createMemoryExtension(
     let rootTurns = 0;
     let rootToolCalls = 0;
     let pendingRootEpisodes: EpisodeRecord[] = [];
+    let maintenanceTask: Promise<void> | undefined;
+    let maintenanceController: AbortController | undefined;
+    let maintenanceRequested = false;
+    let maintenanceReason: "threshold" | "compact" = "threshold";
+    let maintenanceContext: ExtensionContext | undefined;
+    let maintenanceClosing = false;
     const appendPendingRootEpisodes = (episodes: readonly EpisodeRecord[]): void => {
       pendingRootEpisodes = [...new Map([...pendingRootEpisodes, ...episodes].map((episode) => [episode.id, episode])).values()].slice(0, RAPTOR_MAX_LEAVES);
     };
@@ -1027,19 +1037,64 @@ export function createMemoryExtension(
       }
       return Object.freeze(batch);
     };
-    const drainRootBatches = async (ctx: ExtensionContext, reason: "threshold" | "compact" | "shutdown" | "recovery"): Promise<boolean> => {
-      if (sessionState === undefined || host === undefined || config === undefined) return false;
+    const drainRootBatches = async (ctx: ExtensionContext, reason: "threshold" | "compact" | "shutdown" | "recovery", signal?: AbortSignal): Promise<boolean> => {
+      if (sessionState === undefined || host === undefined || config === undefined || signal?.aborted) return false;
       const maxAttempts = reason === "shutdown" ? 1 : LIFECYCLE_RECOVERY_PRODUCERS;
-      for (let attempt = 0; attempt < maxAttempts && pendingRootEpisodes.length > 0; attempt += 1) {
+      for (let attempt = 0; attempt < maxAttempts && pendingRootEpisodes.length > 0 && !signal?.aborted; attempt += 1) {
         const batch = nextRootBatch(); if (batch.length === 0) return false;
-        const scheduled = await lifecycle.scheduleRoot({ host, config, sessionId: sessionState.sessionId, cwd: ctx.cwd, project: sessionState.project, marker: sessionState.marker, getEntries: sessionEntries(ctx), ctx, episodes: batch, reason });
-        if (scheduled === false) return false;
+        const scheduled = await lifecycle.scheduleRoot({ host, config, sessionId: sessionState.sessionId, cwd: ctx.cwd, project: sessionState.project, marker: sessionState.marker, getEntries: sessionEntries(ctx), ctx, episodes: batch, reason, ...(signal === undefined ? {} : { signal }) });
+        if (scheduled === false || signal?.aborted) return false;
         const requested = new Set(batch.map((episode) => episode.id));
         const completedIds = typeof scheduled === "object" && scheduled !== null && Array.isArray(scheduled.completedEpisodeIds) ? scheduled.completedEpisodeIds : batch.map((episode) => episode.id);
         if (completedIds.length === 0 || completedIds.some((id) => !requested.has(id))) return false;
         const completed = new Set(completedIds); pendingRootEpisodes = pendingRootEpisodes.filter((episode) => !completed.has(episode.id));
       }
       return pendingRootEpisodes.length === 0;
+    };
+    const runMaintenance = async (ctx: ExtensionContext, reason: "threshold" | "compact", signal: AbortSignal): Promise<void> => {
+      try { await lifecycle.deliver({ signal }); }
+      catch { if (!signal.aborted) warnOnce(lifecycleWarning("delivery"), ctx, "lifecycle:delivery"); }
+      if (signal.aborted || sessionState === undefined || host === undefined || config === undefined || !sessionState.marker.rootWorkAllowed) return;
+      const rootAttempted = pendingRootEpisodes.length > 0 && (reason === "compact" || rootTurns >= config.curation.turnTrigger || rootToolCalls >= config.curation.toolTrigger);
+      if (rootAttempted) {
+        try { if (await drainRootBatches(ctx, reason, signal) && !signal.aborted) { rootTurns = 0; rootToolCalls = 0; } }
+        catch { if (!signal.aborted) warnOnce(lifecycleWarning("root"), ctx, "lifecycle:root"); }
+        return;
+      }
+      try {
+        await lifecycle.drainAdminJobs?.({ host, config, sessionId: sessionState.sessionId, cwd: ctx.cwd, project: sessionState.project, marker: sessionState.marker, getEntries: sessionEntries(ctx), ctx, signal });
+      } catch { if (!signal.aborted) warnOnce(lifecycleWarning("root"), ctx, "lifecycle:admin"); }
+    };
+    const launchMaintenance = (): void => {
+      if (maintenanceTask !== undefined || maintenanceClosing || !maintenanceRequested || maintenanceContext === undefined) return;
+      const controller = new AbortController(); maintenanceController = controller;
+      const task = (async (): Promise<void> => {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        while (!controller.signal.aborted && maintenanceRequested) {
+          maintenanceRequested = false;
+          const ctx = maintenanceContext;
+          const reason = maintenanceReason; maintenanceReason = "threshold";
+          if (ctx === undefined) return;
+          await runMaintenance(ctx, reason, controller.signal);
+        }
+      })().catch(() => undefined);
+      maintenanceTask = task;
+      void task.then(() => {
+        if (maintenanceTask !== task) return;
+        maintenanceTask = undefined; maintenanceController = undefined;
+        if (maintenanceRequested && !maintenanceClosing) launchMaintenance();
+      });
+    };
+    const requestMaintenance = (ctx: ExtensionContext, reason: "threshold" | "compact"): void => {
+      if (maintenanceClosing) return;
+      maintenanceContext = ctx; maintenanceRequested = true;
+      if (reason === "compact") maintenanceReason = "compact";
+      launchMaintenance();
+    };
+    const stopMaintenance = async (): Promise<void> => {
+      maintenanceClosing = true; maintenanceRequested = false; maintenanceController?.abort();
+      await maintenanceTask?.catch(() => undefined);
+      maintenanceTask = undefined; maintenanceController = undefined; maintenanceContext = undefined; maintenanceReason = "threshold";
     };
 
     if (!detection.ok) {
@@ -1173,6 +1228,7 @@ export function createMemoryExtension(
     };
 
     pi.on("session_start", async (_event, ctx) => {
+      await stopMaintenance(); maintenanceClosing = false;
       try { service?.clear(); } catch { /* cache reset is best effort */ }
       try { lifecycle.clear(); } catch { warnOnce(lifecycleWarning("start"), ctx, "lifecycle:start"); }
       sessionState = undefined; captureEnabled = false; rootTurns = 0; rootToolCalls = 0; pendingRootEpisodes = [];
@@ -1206,44 +1262,28 @@ export function createMemoryExtension(
     pi.on("agent_end", async (_event, ctx) => {
       const episodes = await captureFor("agent_end", ctx);
       if (sessionState === undefined || host === undefined || config === undefined) return;
-      try { await lifecycle.deliver({ ...(ctx.signal === undefined ? {} : { signal: ctx.signal }) }); }
-      catch { warnOnce(lifecycleWarning("delivery"), ctx, "lifecycle:delivery"); }
-      if (!sessionState.marker.rootWorkAllowed) return;
-      if (episodes.length > 0) appendPendingRootEpisodes(episodes);
-      rootTurns += 1;
-      rootToolCalls += episodes.filter((episode) => episode.eventKind === "tool_call").length;
-      const rootAttempted = pendingRootEpisodes.length > 0 && (rootTurns >= config.curation.turnTrigger || rootToolCalls >= config.curation.toolTrigger);
-      if (rootAttempted) {
-        try { if (await drainRootBatches(ctx, "threshold")) { rootTurns = 0; rootToolCalls = 0; } }
-        catch { warnOnce(lifecycleWarning("root"), ctx, "lifecycle:root"); }
-      } else {
-        try { await lifecycle.drainAdminJobs?.({ host, config, sessionId: sessionState.sessionId, cwd: ctx.cwd, project: sessionState.project, marker: sessionState.marker, getEntries: sessionEntries(ctx), ctx }); }
-        catch { warnOnce(lifecycleWarning("root"), ctx, "lifecycle:admin"); }
+      if (sessionState.marker.rootWorkAllowed) {
+        if (episodes.length > 0) appendPendingRootEpisodes(episodes);
+        rootTurns += 1;
+        rootToolCalls += episodes.filter((episode) => episode.eventKind === "tool_call").length;
       }
+      requestMaintenance(ctx, "threshold");
     });
 
     pi.on("session_before_compact", async (_event, ctx) => {
       const episodes = await captureFor("session_before_compact", ctx);
       if (sessionState === undefined || host === undefined || config === undefined) return;
-      try { await lifecycle.deliver({ ...(ctx.signal === undefined ? {} : { signal: ctx.signal }) }); }
-      catch { warnOnce(lifecycleWarning("delivery"), ctx, "lifecycle:delivery"); }
-      if (!sessionState.marker.rootWorkAllowed) return;
-      if (episodes.length > 0) appendPendingRootEpisodes(episodes);
-      const rootAttempted = pendingRootEpisodes.length > 0;
-      try { if (await drainRootBatches(ctx, "compact")) { rootTurns = 0; rootToolCalls = 0; } }
-      catch { warnOnce(lifecycleWarning("root"), ctx, "lifecycle:root"); }
-      if (!rootAttempted) {
-        try { await lifecycle.drainAdminJobs?.({ host, config, sessionId: sessionState.sessionId, cwd: ctx.cwd, project: sessionState.project, marker: sessionState.marker, getEntries: sessionEntries(ctx), ctx }); }
-        catch { warnOnce(lifecycleWarning("root"), ctx, "lifecycle:admin"); }
-      }
+      if (sessionState.marker.rootWorkAllowed && episodes.length > 0) appendPendingRootEpisodes(episodes);
+      requestMaintenance(ctx, "compact");
     });
 
     pi.on("session_shutdown", async (_event, ctx) => {
       try {
+        await stopMaintenance();
         await captureFor("session_shutdown", ctx);
         if (captureEnabled && sessionState !== undefined && host !== undefined && config !== undefined) {
-          // The coordinator owns the sole bounded final flush. Root work is
-          // recovered from durable outbox/Qdrant episodes on the next start;
+          // The coordinator closes the durable producer without remote work.
+          // Delivery and root work recover from the outbox/Qdrant next start;
           // shutdown never enters registry, curation, or RAPTOR paths.
           try {
             await lifecycle.shutdown({ host, config, sessionId: sessionState.sessionId, cwd: ctx.cwd, project: sessionState.project, marker: sessionState.marker, getEntries: sessionEntries(ctx), ctx, lifecycle: "session_shutdown" });

@@ -17,6 +17,7 @@ export interface MemoryLifecycleSession {
     readonly marker: AgentMarker;
     readonly getEntries: () => readonly unknown[];
     readonly ctx: ExtensionContext;
+    readonly signal?: AbortSignal;
 }
 export interface MemoryLifecycleCaptureInput extends MemoryLifecycleSession {
     readonly lifecycle: MemoryCaptureLifecycle;
