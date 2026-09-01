@@ -420,7 +420,9 @@ export async function resolveOutboxNodeId(input: Omit<CreateOutboxInput, "produc
 }
 
 export class OutboxCapacityError extends Error { constructor() { super("Outbox capacity reached; new capture was not accepted"); this.name = "OutboxCapacityError"; } }
-class OutboxAdmissionBusyError extends Error { constructor() { super("Outbox admission is busy"); this.name = "OutboxAdmissionBusyError"; } }
+export class OutboxAdmissionBusyError extends Error { constructor() { super("Outbox admission is busy"); this.name = "OutboxAdmissionBusyError"; } }
+export class OutboxProducerFencedError extends Error { constructor() { super("Outbox producer jobs namespace is fenced"); this.name = "OutboxProducerFencedError"; } }
+export class OutboxProducerClosedError extends Error { constructor() { super("Outbox producer is closed"); this.name = "OutboxProducerClosedError"; } }
 
 export async function createOutbox(input: CreateOutboxInput): Promise<Outbox> {
   assertHost(input.host);
@@ -543,7 +545,7 @@ export async function createOutbox(input: CreateOutboxInput): Promise<Outbox> {
     try { await atomicWrite(fs, prepared, reservation, random); try { await fs.link(prepared, file); await syncDirectory(fs, reservationsDir); } catch (error) { if (!errno(error, "EEXIST")) throw error; const existing = validateReservation(await readSecureJson(fs, file)); if (canonicalStringify(existing) !== canonicalStringify(reservation)) throw new Error("Outbox reservation collision"); } }
     finally { await fs.rm(prepared, { force: true }).then(() => syncDirectory(fs, reservationsDir)).catch(() => undefined); }
   }
-  async function assertProducerUnfenced(): Promise<void> { try { await fs.lstat(join(producerPath, "fence.json")); throw new Error("Outbox producer jobs namespace is fenced"); } catch (error) { if (!errno(error, "ENOENT")) throw error; } const info = await fs.lstat(jobsDir); if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o077) !== 0 || await fs.realpath(jobsDir) !== jobsDir) throw new Error("Outbox producer jobs namespace is fenced or unsafe"); }
+  async function assertProducerUnfenced(): Promise<void> { try { await fs.lstat(join(producerPath, "fence.json")); throw new OutboxProducerFencedError(); } catch (error) { if (!errno(error, "ENOENT")) throw error; } const info = await fs.lstat(jobsDir); if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o077) !== 0 || await fs.realpath(jobsDir) !== jobsDir) throw new OutboxProducerFencedError(); }
   async function writeState(next: ProducerState): Promise<void> { const validated = validateState(next); await atomicWrite(fs, stateFile, validated, random); state = validateState(await readSecureJson(fs, stateFile)); }
   async function controlAttempts(id: string): Promise<number> {
     try { const value = await readSecureJson(fs, join(controlDir, `${id}.json`)); return record(value) && Number.isSafeInteger(value.attempts) && (value.attempts as number) >= 0 ? value.attempts as number : 0; } catch { return 0; }
@@ -551,7 +553,7 @@ export async function createOutbox(input: CreateOutboxInput): Promise<Outbox> {
   const api: Outbox = {
     root, producerPath, nodeId, producerUuid,
     enqueue: (enqueueInput) => serialized(async () => {
-      const acceptedAt = clock(); await assertProducerUnfenced(); state = validateState(await readSecureJson(fs, stateFile)); if (state.state !== "active") throw new Error("Outbox producer is closed");
+      const acceptedAt = clock(); await assertProducerUnfenced(); state = validateState(await readSecureJson(fs, stateFile)); if (state.state !== "active") throw new OutboxProducerClosedError();
       const job = outboxJob({ host: input.host, nodeId, producerUuid, now: acceptedAt, policy: enqueueInput.policy, episodes: enqueueInput.episodes, homeDir: input.homeDir });
       const file = join(jobsDir, `${job.id}.json`); const bodyBytes = Buffer.byteLength(canonicalStringify(job), "utf8"); const reservation = captureReservation(job, bodyBytes);
       let canonicalInfo; try { canonicalInfo = await fs.lstat(file); } catch (error) { if (!errno(error, "ENOENT")) throw error; }
@@ -597,7 +599,7 @@ export async function createOutbox(input: CreateOutboxInput): Promise<Outbox> {
       const quarantineProof = await durableReservationJobProof(currentReservation); if (quarantineProof === undefined || canonicalStringify(quarantineProof) !== canonicalStringify(current)) throw new Error("Quarantine lacks durable accepted proof"); await finalizeAdmission(currentReservation, false);
       await fs.rm(join(controlDir, `${id}.json`), { force: true }); await syncDirectory(fs, controlDir);
     }),
-    heartbeat: () => serialized(async () => { const heartbeatNow = clock(); await assertProducerUnfenced(); state = validateState(await readSecureJson(fs, stateFile)); if (state.state !== "active") throw new Error("Outbox producer is closed"); await writeState(producerState({ version: 1, state: "active", heartbeatAt: Math.max(state.heartbeatAt, heartbeatNow), closedAt: null })); }),
+    heartbeat: () => serialized(async () => { const heartbeatNow = clock(); await assertProducerUnfenced(); state = validateState(await readSecureJson(fs, stateFile)); if (state.state !== "active") throw new OutboxProducerClosedError(); await writeState(producerState({ version: 1, state: "active", heartbeatAt: Math.max(state.heartbeatAt, heartbeatNow), closedAt: null })); }),
     closeProducer: () => serialized(async () => { const closeNow = clock(); await assertProducerUnfenced(); state = validateState(await readSecureJson(fs, stateFile)); if (state.state === "closed") return; const closedAt = Math.max(state.heartbeatAt, closeNow); await writeState(producerState({ version: 1, state: "closed", heartbeatAt: state.heartbeatAt, closedAt })); }),
     outboxStatus: () => serialized(async () => {
       clock(); await assertProducerUnfenced(); state = validateState(await readSecureJson(fs, stateFile)); const localJobs = await localPending(); let failedAttempts = 0;

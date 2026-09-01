@@ -32,6 +32,10 @@ export interface MemoryRootScheduleResult {
 }
 export interface MemoryLifecycleCoordinator {
     start(input: MemoryLifecycleSession): Promise<void>;
+    /** Refreshes the local producer lease without remote delivery or model work. */
+    heartbeat?(input?: {
+        readonly signal?: AbortSignal;
+    }): Promise<void>;
     recover?(producerPaths: readonly string[]): Promise<readonly EpisodeRecord[] | void>;
     capture(input: MemoryLifecycleCaptureInput): Promise<readonly EpisodeRecord[]>;
     deliver(input?: {

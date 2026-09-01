@@ -75,4 +75,13 @@ export declare function resolveOutboxNodeId(input: Omit<CreateOutboxInput, "prod
 export declare class OutboxCapacityError extends Error {
     constructor();
 }
+export declare class OutboxAdmissionBusyError extends Error {
+    constructor();
+}
+export declare class OutboxProducerFencedError extends Error {
+    constructor();
+}
+export declare class OutboxProducerClosedError extends Error {
+    constructor();
+}
 export declare function createOutbox(input: CreateOutboxInput): Promise<Outbox>;

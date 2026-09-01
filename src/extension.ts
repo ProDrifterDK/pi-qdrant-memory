@@ -16,7 +16,15 @@ import { destinationForEndpoint } from "./security/egress.js";
 import { canonicalStringify, deterministicUuid, sha256Hex } from "./domain/canonical.js";
 import { canonicalRecordHash, episodeSemanticProjection, type ControlRecord, type ProcessingPolicyRecord, type RaptorSummaryRecord } from "./domain/records.js";
 import { intersectPolicies, processingPolicyHash, PROVIDER_AGNOSTIC_ORIGIN, type ProcessingPolicy } from "./domain/policy.js";
-import { createOutbox, resolveOutboxNodeId, type Outbox } from "./outbox/store.js";
+import {
+  createOutbox,
+  OutboxAdmissionBusyError,
+  OutboxCapacityError,
+  OutboxProducerClosedError,
+  OutboxProducerFencedError,
+  resolveOutboxNodeId,
+  type Outbox,
+} from "./outbox/store.js";
 import { createIngestProcessor, createOutboxDelivery, type OutboxDelivery } from "./outbox/delivery.js";
 import { bindIngestRuntime } from "./coordination/ingest.js";
 import { runCurationFromLifecycle, runRaptorFromLifecycle } from "./coordination/root.js";
@@ -44,6 +52,7 @@ const HARD_CONTEXT_BUDGET = 16000;
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const CACHE_MAX_ENTRIES = 32;
 const LIFECYCLE_DELIVERY_BATCH = 64;
+const LIFECYCLE_HEARTBEAT_INTERVAL_MS = 15_000;
 const LIFECYCLE_RECOVERY_PRODUCERS = 64;
 const LIFECYCLE_RECOVERY_NODES = 512;
 const RECOVERY_SCAN_ENTRIES = 512;
@@ -83,6 +92,8 @@ export interface MemoryRootScheduleResult {
 }
 export interface MemoryLifecycleCoordinator {
   start(input: MemoryLifecycleSession): Promise<void>;
+  /** Refreshes the local producer lease without remote delivery or model work. */
+  heartbeat?(input?: { readonly signal?: AbortSignal }): Promise<void>;
   recover?(producerPaths: readonly string[]): Promise<readonly EpisodeRecord[] | void>;
   capture(input: MemoryLifecycleCaptureInput): Promise<readonly EpisodeRecord[]>;
   deliver(input?: { readonly signal?: AbortSignal; readonly maxJobs?: number }): Promise<unknown>;
@@ -622,8 +633,27 @@ async function closedProducerPaths(host: HostId, homeDir: string, env: Environme
   return Object.freeze(candidates.slice(0, LIFECYCLE_RECOVERY_PRODUCERS).map((candidate) => candidate.path));
 }
 
-function lifecycleWarning(category: "start" | "capture" | "delivery" | "root" | "shutdown"): MemoryWarning {
-  return { category: "internal", message: `pi-qdrant-memory: lifecycle unavailable (${category}).` };
+type LifecycleWarningReason =
+  | "start"
+  | "capture"
+  | "delivery"
+  | "root"
+  | "shutdown"
+  | "project_identity"
+  | "producer_fenced"
+  | "admission_busy"
+  | "capacity"
+  | "shutdown_close";
+
+function lifecycleWarning(reason: LifecycleWarningReason): MemoryWarning {
+  return { category: "internal", message: `pi-qdrant-memory: lifecycle unavailable (${reason}).` };
+}
+
+function lifecycleWarningReason(error: unknown, fallback: LifecycleWarningReason): LifecycleWarningReason {
+  if (error instanceof OutboxCapacityError) return "capacity";
+  if (error instanceof OutboxAdmissionBusyError) return "admission_busy";
+  if (error instanceof OutboxProducerFencedError || error instanceof OutboxProducerClosedError) return "producer_fenced";
+  return fallback;
 }
 
 interface ProductionLifecycleRuntime {
@@ -752,6 +782,10 @@ function createProductionLifecycleCoordinatorInternal(input: { homeDir: string; 
         throw error;
       }
     },
+    async heartbeat(value = {}) {
+      if (value.signal?.aborted) return;
+      await outbox?.heartbeat();
+    },
     async recover(producerPaths) {
       if (runtime === undefined || active === undefined) return;
       for (const path of producerPaths.slice(0, LIFECYCLE_RECOVERY_PRODUCERS)) {
@@ -771,7 +805,7 @@ function createProductionLifecycleCoordinatorInternal(input: { homeDir: string; 
       const currentPolicy = policy; if (currentPolicy === undefined) return Object.freeze([]);
       const control = runtime === undefined ? undefined : await runtime.store.readControl().catch(() => undefined);
       if (runtime !== undefined && (control === undefined || control.state !== "active")) return Object.freeze([]);
-      let acceptedRecords: readonly EpisodeRecord[] | undefined; let acceptanceFailed = false; outboxAdmissionFull = false;
+      let acceptedRecords: readonly EpisodeRecord[] | undefined; let acceptanceFailed = false; let acceptanceError: unknown; outboxAdmissionFull = false;
       const episodes = await capturePersistedEntries({
         sessionId: value.sessionId, lifecycle: value.lifecycle, getEntries: value.getEntries as never,
         activationDir: await (async () => {
@@ -803,10 +837,10 @@ function createProductionLifecycleCoordinatorInternal(input: { homeDir: string; 
               await outbox!.enqueue({ episodes: Object.freeze([episode]), policy: eventPolicy }); bound.push(episode);
             }
             acceptedRecords = Object.freeze(bound);
-          } catch (error) { acceptanceFailed = true; throw error; }
+          } catch (error) { acceptanceFailed = true; acceptanceError = error; throw error; }
         },
       });
-      if (acceptanceFailed || outboxAdmissionFull) throw new Error("capture acceptance unavailable");
+      if (acceptanceFailed || outboxAdmissionFull) throw acceptanceError ?? new Error("capture acceptance unavailable");
       return acceptedRecords ?? (episodes.length === 0 ? episodes : Object.freeze([]));
     },
     async deliver(deliveryInput = {}) {
@@ -1025,6 +1059,53 @@ export function createMemoryExtension(
     let maintenanceReason: "threshold" | "compact" = "threshold";
     let maintenanceContext: ExtensionContext | undefined;
     let maintenanceClosing = false;
+    let heartbeatTask: Promise<void> | undefined;
+    let heartbeatController: AbortController | undefined;
+    let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+    let heartbeatClosing = false;
+    const runHeartbeat = (): Promise<void> => {
+      const heartbeat = lifecycle.heartbeat;
+      if (heartbeat === undefined || heartbeatClosing) return Promise.resolve();
+      if (heartbeatTask !== undefined) return heartbeatTask;
+      const signal = heartbeatController?.signal;
+      let task: Promise<void>;
+      try { task = Promise.resolve(heartbeat(signal === undefined ? {} : { signal })); }
+      catch (error: unknown) { task = Promise.reject(error); }
+      heartbeatTask = task;
+      void task.then(
+        () => { if (heartbeatTask === task) heartbeatTask = undefined; },
+        () => { if (heartbeatTask === task) heartbeatTask = undefined; },
+      );
+      return task;
+    };
+    const tickHeartbeat = (ctx: ExtensionContext): void => {
+      if (heartbeatClosing || heartbeatController?.signal.aborted) return;
+      void runHeartbeat().catch((error: unknown) => {
+        if (!heartbeatClosing && !heartbeatController?.signal.aborted) {
+          const reason = lifecycleWarningReason(error, "capture");
+          warnOnce(lifecycleWarning(reason), ctx, `lifecycle:${reason}`);
+        }
+      });
+    };
+    const startHeartbeat = (ctx: ExtensionContext): void => {
+      if (lifecycle.heartbeat === undefined) return;
+      heartbeatClosing = false;
+      heartbeatController = new AbortController();
+      const timer = setInterval(() => tickHeartbeat(ctx), LIFECYCLE_HEARTBEAT_INTERVAL_MS);
+      timer.unref?.();
+      heartbeatTimer = timer;
+    };
+    const stopHeartbeat = async (): Promise<void> => {
+      heartbeatClosing = true;
+      if (heartbeatTimer !== undefined) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = undefined;
+      }
+      heartbeatController?.abort();
+      heartbeatController = undefined;
+      await heartbeatTask?.catch(() => undefined);
+      heartbeatTask = undefined;
+    };
     const appendPendingRootEpisodes = (episodes: readonly EpisodeRecord[]): void => {
       pendingRootEpisodes = [...new Map([...pendingRootEpisodes, ...episodes].map((episode) => [episode.id, episode])).values()].slice(0, RAPTOR_MAX_LEAVES);
     };
@@ -1053,17 +1134,17 @@ export function createMemoryExtension(
     };
     const runMaintenance = async (ctx: ExtensionContext, reason: "threshold" | "compact", signal: AbortSignal): Promise<void> => {
       try { await lifecycle.deliver({ signal }); }
-      catch { if (!signal.aborted) warnOnce(lifecycleWarning("delivery"), ctx, "lifecycle:delivery"); }
+      catch (error: unknown) { if (!signal.aborted) { const reason = lifecycleWarningReason(error, "delivery"); warnOnce(lifecycleWarning(reason), ctx, `lifecycle:${reason}`); } }
       if (signal.aborted || sessionState === undefined || host === undefined || config === undefined || !sessionState.marker.rootWorkAllowed) return;
       const rootAttempted = pendingRootEpisodes.length > 0 && (reason === "compact" || rootTurns >= config.curation.turnTrigger || rootToolCalls >= config.curation.toolTrigger);
       if (rootAttempted) {
         try { if (await drainRootBatches(ctx, reason, signal) && !signal.aborted) { rootTurns = 0; rootToolCalls = 0; } }
-        catch { if (!signal.aborted) warnOnce(lifecycleWarning("root"), ctx, "lifecycle:root"); }
+        catch (error: unknown) { if (!signal.aborted) { const warningReason = lifecycleWarningReason(error, "root"); warnOnce(lifecycleWarning(warningReason), ctx, `lifecycle:${warningReason}`); } }
         return;
       }
       try {
         await lifecycle.drainAdminJobs?.({ host, config, sessionId: sessionState.sessionId, cwd: ctx.cwd, project: sessionState.project, marker: sessionState.marker, getEntries: sessionEntries(ctx), ctx, signal });
-      } catch { if (!signal.aborted) warnOnce(lifecycleWarning("root"), ctx, "lifecycle:admin"); }
+      } catch (error: unknown) { if (!signal.aborted) { const warningReason = lifecycleWarningReason(error, "root"); warnOnce(lifecycleWarning(warningReason), ctx, `lifecycle:${warningReason}`); } }
     };
     const launchMaintenance = (): void => {
       if (maintenanceTask !== undefined || maintenanceClosing || !maintenanceRequested || maintenanceContext === undefined) return;
@@ -1211,26 +1292,31 @@ export function createMemoryExtension(
         sessionState = { ...sessionState, project, marker };
       } catch {
         sessionState = { ...sessionState, marker: Object.freeze({ role: "child", depth: 1, valid: false, rootWorkAllowed: false }) };
-        warnOnce(lifecycleWarning("capture"), ctx, "lifecycle:capture"); return Object.freeze([]);
+        warnOnce(lifecycleWarning("project_identity"), ctx, "lifecycle:project_identity"); return Object.freeze([]);
       }
       try {
+        await runHeartbeat();
         const episodes = await lifecycle.capture({
           host, config, sessionId: sessionState.sessionId, cwd: ctx.cwd,
           project: sessionState.project, marker, getEntries: sessionEntries(ctx), ctx,
           lifecycle: lifecycleName,
         });
         return Object.freeze([...episodes]);
-      } catch {
+      } catch (error: unknown) {
         // Downstream admission can recover after bounded delivery; do not
         // rewrite a genuine root marker into a permanent invalid child.
-        warnOnce(lifecycleWarning("capture"), ctx, "lifecycle:capture"); return Object.freeze([]);
+        const reason = lifecycleWarningReason(error, "capture");
+        warnOnce(lifecycleWarning(reason), ctx, `lifecycle:${reason}`); return Object.freeze([]);
       }
     };
 
     pi.on("session_start", async (_event, ctx) => {
-      await stopMaintenance(); maintenanceClosing = false;
+      await stopMaintenance();
+      await stopHeartbeat();
+      maintenanceClosing = false;
       try { service?.clear(); } catch { /* cache reset is best effort */ }
-      try { lifecycle.clear(); } catch { warnOnce(lifecycleWarning("start"), ctx, "lifecycle:start"); }
+      try { lifecycle.clear(); }
+      catch (error: unknown) { const reason = lifecycleWarningReason(error, "start"); warnOnce(lifecycleWarning(reason), ctx, `lifecycle:${reason}`); }
       sessionState = undefined; captureEnabled = false; rootTurns = 0; rootToolCalls = 0; pendingRootEpisodes = [];
       if (disabledWarning !== undefined) warnOnce(disabledWarning, ctx);
       await service?.checkHealth(ctx);
@@ -1244,18 +1330,23 @@ export function createMemoryExtension(
         const state = { sessionId, project, marker } satisfies SessionLifecycleState;
         const recovery = await closedProducerPaths(host, dependencies.homeDir ?? homedir(), env, (dependencies.now ?? Date.now)(), config.coordination.maxClockSkewMs);
         await lifecycle.start({ host, config, sessionId, cwd: ctx.cwd, project, marker, getEntries: sessionEntries(ctx), ctx });
+        startHeartbeat(ctx);
         const recovered = await lifecycle.recover?.(recovery);
         sessionState = state; captureEnabled = true;
         if (marker.rootWorkAllowed && Array.isArray(recovered) && recovered.length > 0) {
           appendPendingRootEpisodes(recovered);
-          try { await drainRootBatches(ctx, "recovery"); } catch { warnOnce(lifecycleWarning("root"), ctx, "lifecycle:root"); }
+          try { await drainRootBatches(ctx, "recovery"); }
+          catch (error: unknown) { const reason = lifecycleWarningReason(error, "root"); warnOnce(lifecycleWarning(reason), ctx, `lifecycle:${reason}`); }
         }
         if (marker.rootWorkAllowed) {
           try { await lifecycle.drainAdminJobs?.({ host, config, sessionId, cwd: ctx.cwd, project, marker, getEntries: sessionEntries(ctx), ctx }); }
-          catch { warnOnce(lifecycleWarning("root"), ctx, "lifecycle:admin"); }
+          catch (error: unknown) { const reason = lifecycleWarningReason(error, "root"); warnOnce(lifecycleWarning(reason), ctx, `lifecycle:${reason}`); }
         }
-      } catch {
-        captureEnabled = false; sessionState = undefined; warnOnce(lifecycleWarning("start"), ctx, "lifecycle:start");
+      } catch (error: unknown) {
+        await stopHeartbeat();
+        captureEnabled = false; sessionState = undefined;
+        const reason = lifecycleWarningReason(error, "start");
+        warnOnce(lifecycleWarning(reason), ctx, `lifecycle:${reason}`);
       }
     });
 
@@ -1281,18 +1372,23 @@ export function createMemoryExtension(
       try {
         await stopMaintenance();
         await captureFor("session_shutdown", ctx);
+        await stopHeartbeat();
         if (captureEnabled && sessionState !== undefined && host !== undefined && config !== undefined) {
           // The coordinator closes the durable producer without remote work.
           // Delivery and root work recover from the outbox/Qdrant next start;
           // shutdown never enters registry, curation, or RAPTOR paths.
           try {
             await lifecycle.shutdown({ host, config, sessionId: sessionState.sessionId, cwd: ctx.cwd, project: sessionState.project, marker: sessionState.marker, getEntries: sessionEntries(ctx), ctx, lifecycle: "session_shutdown" });
-          } catch { warnOnce(lifecycleWarning("shutdown"), ctx, "lifecycle:shutdown"); }
+          } catch (error: unknown) {
+            const reason = lifecycleWarningReason(error, "shutdown_close");
+            warnOnce(lifecycleWarning(reason), ctx, `lifecycle:${reason}`);
+          }
         }
       } finally {
+        await stopHeartbeat();
         captureEnabled = false; sessionState = undefined; rootTurns = 0; rootToolCalls = 0; pendingRootEpisodes = [];
         try { service?.clear(); } catch { /* cache reset is best effort */ }
-        try { lifecycle.clear(); } catch { warnOnce(lifecycleWarning("shutdown"), ctx, "lifecycle:shutdown"); }
+        try { lifecycle.clear(); } catch { warnOnce(lifecycleWarning("shutdown_close"), ctx, "lifecycle:shutdown_close"); }
       }
     });
   };

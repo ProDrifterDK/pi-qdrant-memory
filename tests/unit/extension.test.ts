@@ -6,7 +6,7 @@ import {
   type ExtensionFactory,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -19,6 +19,8 @@ import { COLLECTION_CONTROL_ID, V2_CONTRACT_HASH, bootstrapControlHash, controlP
 import { physicalPointIdFor } from "../../src/qdrant/client.js";
 import { recordPayload } from "../../src/qdrant/write.js";
 import { destinationForEndpoint } from "../../src/security/egress.js";
+import { createOutbox, OutboxAdmissionBusyError, OutboxCapacityError, OutboxProducerFencedError } from "../../src/outbox/store.js";
+import { createOutboxDelivery } from "../../src/outbox/delivery.js";
 import type { ProjectIdentity } from "../../src/project.js";
 
 type Handler = (event: any, ctx: ExtensionContext) => unknown;
@@ -373,6 +375,61 @@ describe("autonomous lifecycle wiring", () => {
     return { coordinator, calls };
   }
 
+  it("keeps session heartbeats single-flight and stops them on shutdown", async () => {
+    vi.useFakeTimers();
+    const lifecycle = lifecycleDouble(); let calls = 0; let active = 0; let maximum = 0; let release!: () => void; let aborted = false;
+    lifecycle.coordinator.heartbeat = async (value = {}) => {
+      calls += 1;
+      if (calls === 3) return;
+      active += 1; maximum = Math.max(maximum, active);
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = () => { if (settled) return; settled = true; active -= 1; resolve(); };
+        release = finish;
+        value.signal?.addEventListener("abort", () => { aborted = true; finish(); }, { once: true });
+      });
+    };
+    const runtime = runtimeFetch("pi");
+    const factory = createMemoryExtension({ env: { PI_QDRANT_MEMORY_HOST: "pi" }, argv: [], homeDir: "/home/test", readTextFile: async () => hostConfig(true, true), fetchImpl: runtime.fetchImpl, projectResolver: async () => registeredProject(), lifecycleCoordinator: lifecycle.coordinator });
+    const fake = fakeApi(); const context = ctx({ header: { parentSession: null } });
+    try {
+      await factory(fake.api);
+      await fake.handler("session_start")({ type: "session_start", reason: "startup" }, context.value);
+      await vi.advanceTimersByTimeAsync(45_000);
+      expect(calls).toBe(1);
+      expect(maximum).toBe(1);
+      release();
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(calls).toBe(2);
+      expect(maximum).toBe(1);
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+      await fake.handler("session_shutdown")({ type: "session_shutdown", reason: "quit" }, context.value);
+      expect(active).toBe(0);
+      expect(aborted).toBe(true);
+      const settledCalls = calls;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(calls).toBe(settledCalls);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("heartbeats immediately before each capture admission", async () => {
+    const lifecycle = lifecycleDouble(); const order: string[] = [];
+    lifecycle.coordinator.heartbeat = async () => { order.push("heartbeat"); };
+    lifecycle.coordinator.capture = async (value) => { order.push(`capture:${value.lifecycle}`); return []; };
+    const runtime = runtimeFetch("pi"); const factory = createMemoryExtension({
+      env: { PI_QDRANT_MEMORY_HOST: "pi" }, argv: [], homeDir: "/home/test",
+      readTextFile: async () => hostConfig(true, true), fetchImpl: runtime.fetchImpl,
+      projectResolver: async () => registeredProject(), lifecycleCoordinator: lifecycle.coordinator,
+    });
+    const fake = fakeApi(); const context = ctx({ header: { parentSession: null } });
+    await factory(fake.api);
+    await fake.handler("session_start")({ type: "session_start", reason: "startup" }, context.value);
+    await fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
+    expect(order.slice(0, 2)).toEqual(["heartbeat", "capture:agent_end"]);
+    await fake.handler("session_shutdown")({ type: "session_shutdown", reason: "quit" }, context.value);
+  });
+
   it("returns agent_end after durable capture while remote delivery remains pending", async () => {
     const lifecycle = lifecycleDouble({ captureEpisodes: () => [{ id: "durable-episode", processingPolicyId: "policy", eventKind: "user" }] });
     let releaseDelivery!: () => void;
@@ -427,6 +484,37 @@ describe("autonomous lifecycle wiring", () => {
     expect(maxDeliveries).toBe(1);
     expect(clearedWhileActive).toBe(false);
     expect(lifecycle.calls.filter((call) => call.method === "deliver")).toHaveLength(1);
+  });
+
+  it("keeps a live idle producer fresh enough to reject stale adoption", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const homeDir = await mkdtemp(join(tmpdir(), "pi-qdrant-idle-heartbeat-"));
+    const agentDir = join(homeDir, ".pi", "agent");
+    const env = { PI_QDRANT_MEMORY_HOST: "pi", PI_CODING_AGENT_DIR: agentDir };
+    const base = Date.parse("2029-01-01T00:00:00.000Z"); let now = base;
+    const runtime = runtimeFetch("pi"); const api = fakeApi();
+    try {
+      const factory = createMemoryExtension({ env, argv: [], homeDir, now: () => now, readTextFile: async () => hostConfig(true, true), fetchImpl: runtime.fetchImpl, projectResolver: async () => registeredProject() });
+      await factory(api.api);
+      const context = ctx({ sessionId: "session-idle-heartbeat", entries: [], header: null });
+      await api.handler("session_start")({ type: "session_start", reason: "startup" }, context.value);
+      const outboxRoot = join(agentDir, "pi-qdrant-memory", "outbox");
+      const node = (await readdir(outboxRoot)).find((name) => name.startsWith("node-"))!;
+      const producer = (await readdir(join(outboxRoot, node))).find((name) => !name.endsWith(".json"))!;
+      const producerPath = join(outboxRoot, node, producer);
+      now = base + 61_000;
+      await vi.advanceTimersByTimeAsync(15_000);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      expect(JSON.parse(await readFile(join(producerPath, "state.json"), "utf8"))).toMatchObject({ heartbeatAt: now, state: "active" });
+
+      const contender = await createOutbox({ host: "pi", homeDir, env, nodeId: "node-test", producerUuid: "22222222-2222-4222-8222-222222222222", now: () => now });
+      try {
+        const delivery = createOutboxDelivery({ outboxRoot: contender.root, producerPath: contender.producerPath, processor: { process: vi.fn() }, now: () => now + 1, heartbeatTimeoutMs: 60_000, maxClockSkewMs: 0 });
+        await expect(delivery.adopt(producerPath)).rejects.toThrow(/still active/u);
+      } finally { await contender.closeProducer(); }
+      await api.handler("session_shutdown")({ type: "session_shutdown", reason: "quit" }, context.value);
+    } finally { vi.useRealTimers(); await rm(homeDir, { recursive: true, force: true }); }
   });
 
   it("uses persisted getEntries at every capture event, ignores event arrays, and schedules only root work", async () => {
@@ -581,7 +669,31 @@ describe("autonomous lifecycle wiring", () => {
     (context.value.sessionManager as any).getHeader = () => { throw new Error("header secret"); };
     await expect(fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value)).resolves.toBeUndefined();
     expect(base.calls.filter((call) => call.method === "scheduleRoot")).toHaveLength(scheduledBeforeInvalidHeader);
-    expect(warnings.at(-1)).toBe("pi-qdrant-memory: lifecycle unavailable (capture).");
+    expect(warnings.at(-1)).toBe("pi-qdrant-memory: lifecycle unavailable (project_identity).");
+    expect(warnings.join(" ")).not.toContain("secret");
+  });
+
+  it("maps typed lifecycle failures to bounded reason codes", async () => {
+    const base = lifecycleDouble(); const runtime = runtimeFetch("pi"); const warnings: string[] = []; let captures = 0;
+    base.coordinator.capture = async () => { captures += 1; throw captures === 1 ? new OutboxCapacityError() : new OutboxProducerFencedError(); };
+    base.coordinator.deliver = async () => { throw new OutboxAdmissionBusyError(); };
+    base.coordinator.shutdown = async () => { throw new Error("shutdown secret"); };
+    const factory = createMemoryExtension({
+      env: { PI_QDRANT_MEMORY_HOST: "pi" }, argv: [], homeDir: "/home/test",
+      readTextFile: async () => hostConfig(true, true), fetchImpl: runtime.fetchImpl,
+      projectResolver: async () => registeredProject(), lifecycleCoordinator: base.coordinator,
+      warningSink: (warning) => warnings.push(warning.message),
+    });
+    const fake = fakeApi(); const context = ctx({ entries: [] }); await factory(fake.api);
+    await fake.handler("session_start")({ type: "session_start", reason: "startup" }, context.value);
+    await fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value); await settleBackgroundMaintenance();
+    await fake.handler("session_shutdown")({ type: "session_shutdown", reason: "quit" }, context.value);
+    expect(warnings).toEqual([
+      "pi-qdrant-memory: lifecycle unavailable (capacity).",
+      "pi-qdrant-memory: lifecycle unavailable (admission_busy).",
+      "pi-qdrant-memory: lifecycle unavailable (producer_fenced).",
+      "pi-qdrant-memory: lifecycle unavailable (shutdown_close).",
+    ]);
     expect(warnings.join(" ")).not.toContain("secret");
   });
 
@@ -664,7 +776,7 @@ describe("autonomous lifecycle wiring", () => {
     await fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
     expect(lifecycle.calls.filter((call) => call.method === "start")).toHaveLength(1);
     expect(lifecycle.calls.filter((call) => call.method === "capture")).toHaveLength(0);
-    expect(context.notifications).toEqual([{ message: "pi-qdrant-memory: lifecycle unavailable (capture).", type: "warning" }]);
+    expect(context.notifications).toEqual([{ message: "pi-qdrant-memory: lifecycle unavailable (project_identity).", type: "warning" }]);
   });
 
   it("requires exact canonical path and fingerprint for local-only identities", async () => {
