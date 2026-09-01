@@ -1,27 +1,11 @@
 export interface ReservationProtocolFileSystem {
     chmod(path: string, mode: number): Promise<void>;
     link(existingPath: string, newPath: string): Promise<void>;
-    lstat(path: string): Promise<{
-        isDirectory(): boolean;
-        isFile(): boolean;
-        isSymbolicLink(): boolean;
-        mode: number;
-        size: number;
-        dev: number;
-        ino: number;
-    }>;
+    lstat(path: string): Promise<FileIdentity>;
     open(path: string, flags: string | number, mode?: number): Promise<{
         writeFile(data: string, encoding?: BufferEncoding): Promise<void>;
         readFile(): Promise<Uint8Array>;
-        stat(): Promise<{
-            isDirectory(): boolean;
-            isFile(): boolean;
-            isSymbolicLink(): boolean;
-            mode: number;
-            size: number;
-            dev: number;
-            ino: number;
-        }>;
+        stat(): Promise<FileIdentity>;
         sync(): Promise<void>;
         close(): Promise<void>;
     }>;
@@ -47,6 +31,18 @@ export interface ReservationRecord {
 export declare const ADMISSION_GENERATION_LIMIT = 1000000;
 export declare const ADMISSION_LOCK: RegExp;
 export declare const ADMISSION_RETIREMENT: RegExp;
+interface FileIdentity {
+    isDirectory(): boolean;
+    isFile(): boolean;
+    isSymbolicLink(): boolean;
+    mode: number;
+    size: number;
+    dev: number;
+    ino: number;
+    nlink?: number;
+    ctimeMs?: number;
+    mtimeMs?: number;
+}
 export declare function admissionLockName(generation: number): string;
 export declare function admissionRetirementName(generation: number): string;
 export declare function isAdmissionProtocolArtifact(name: string): boolean;
@@ -80,3 +76,4 @@ export declare function retireOwnedAdmissionLock<T extends ReservationRecord>(in
     validateReservation: (value: unknown) => T;
     requireOwnership?: boolean;
 }): Promise<void>;
+export {};

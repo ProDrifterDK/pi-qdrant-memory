@@ -930,6 +930,38 @@ describe("autonomous lifecycle wiring", () => {
 
 
 describe("production capture coordinator", () => {
+  it("admits same-policy episodes once while keeping event-relative retention jobs exact", async () => {
+    for (const fixture of [
+      { retention: "indefinite" as const, episodeCount: 1025, expectedJobSizes: [1, 1024], expectedDeadlines: [null, null] },
+      { retention: 30 as const, episodeCount: 3, expectedJobSizes: [1, 1, 1], expectedDeadlines: ["2029-01-31T00:00:01.000Z", "2029-01-31T00:00:02.000Z", "2029-01-31T00:00:03.000Z"] },
+    ]) {
+      const homeDir = await mkdtemp(join(tmpdir(), "pi-qdrant-policy-batches-"));
+      const env = { PI_CODING_AGENT_DIR: join(homeDir, ".pi", "agent"), PI_QDRANT_MEMORY_HOST: "pi" };
+      const configured = JSON.parse(hostConfig(true, true)); configured.capture.episodeRetentionDays = fixture.retention;
+      const runtime = runtimeFetch("pi"); const api = fakeApi();
+      const factory = createMemoryExtension({ env, argv: [], homeDir, now: () => Date.parse("2029-01-01T00:00:00.000Z"), readTextFile: async () => JSON.stringify(configured), fetchImpl: runtime.fetchImpl, projectResolver: async () => registeredProject() });
+      await factory(api.api);
+      const entries: any[] = []; const context = ctx({ sessionId: `session-policy-${fixture.retention}`, entries });
+      await api.handler("session_start")({ type: "session_start", reason: "startup" }, context.value);
+      const eventBase = Date.parse("2029-01-01T00:00:00.000Z");
+      for (let index = 1; index <= fixture.episodeCount; index += 1) entries.push({ id: `entry-${index}`, type: "message", message: { role: "user", content: `episode ${index}`, timestamp: eventBase + index * 1000 } });
+      await api.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
+      await api.handler("session_shutdown")({ type: "session_shutdown", reason: "quit" }, context.value);
+
+      const outboxRoot = join(env.PI_CODING_AGENT_DIR, "pi-qdrant-memory", "outbox");
+      const node = (await readdir(outboxRoot)).find((name) => name.startsWith("node-"))!;
+      const producer = (await readdir(join(outboxRoot, node))).find((name) => !name.endsWith(".json"))!;
+      const jobFiles = (await readdir(join(outboxRoot, node, producer, "jobs"))).sort();
+      const jobs = await Promise.all(jobFiles.map(async (name) => JSON.parse(await readFile(join(outboxRoot, node, producer, "jobs", name), "utf8"))));
+      expect(jobs.map((job) => job.episodes.length).sort((left, right) => left - right)).toEqual(fixture.expectedJobSizes);
+      expect(jobs.map((job) => job.deadline).sort()).toEqual([...fixture.expectedDeadlines].sort());
+      expect(jobs.every((job) => (job.episodes as EpisodeRecord[]).every((episode, index, episodes) => index === 0 || episodes[index - 1]!.eventAt < episode.eventAt))).toBe(true);
+      const ordered = jobs.flatMap((job) => job.episodes as EpisodeRecord[]).sort((left, right) => left.eventAt.localeCompare(right.eventAt));
+      expect([ordered.length, ordered[0]!.text, ordered.at(-1)!.text]).toEqual([fixture.episodeCount, "episode 1", `episode ${fixture.episodeCount}`]);
+      expect((await readdir(join(outboxRoot, "reservations"))).filter((name) => name.endsWith(".retired"))).toHaveLength(fixture.expectedJobSizes.length);
+    }
+  });
+
   it("persists an activation cutoff, excludes custom memory, redacts before durable enqueue, and leaves pending work closed", async () => {
     const homeDir = await mkdtemp(join(tmpdir(), "pi-qdrant-lifecycle-"));
     const env = { PI_CODING_AGENT_DIR: join(homeDir, ".pi", "agent") };

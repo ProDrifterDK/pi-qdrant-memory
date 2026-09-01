@@ -1008,6 +1008,163 @@ await outbox.enqueue({ episodes: [item], policy: current });
       const reservations = join(first.root, "reservations"); await nodeFs.rename(reservations, `${reservations}.replaced`); await nodeFs.mkdir(reservations, { mode: 0o700 }); const rootHandle = await open(first.root, "r"); try { await rootHandle.sync(); } finally { await rootHandle.close(); }
       const second = await createOutbox({ host: "prime", homeDir, nodeId: "node-admission-cache-replacement", producerUuid: producerId(299), machineId: "machine-admission-cache-replacement" }); await second.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000949")], policy: current });
       expect(await readdir(reservations)).toEqual(expect.arrayContaining(["admission.0000000000000000.retired"])); expect(await readdir(reservations)).not.toEqual(expect.arrayContaining(["admission.0000000000000001.retired"]));
+      await nodeFs.rename(reservations, `${reservations}.tampered`); await nodeFs.mkdir(reservations, { mode: 0o700 }); await nodeFs.writeFile(join(reservations, "admission.0000000000000000.retired"), "{}", { mode: 0o600 });
+      const tampered = await createOutbox({ host: "prime", homeDir, nodeId: "node-admission-cache-replacement", producerUuid: producerId(300), machineId: "machine-admission-cache-replacement" });
+      await expect(tampered.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000950")], policy: current })).rejects.toThrow(/malformed/u);
+    } finally { await rm(homeDir, { recursive: true, force: true }); }
+  });
+
+  it("batch-proves a cold retirement snapshot with bounded directory operations", async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), "task5-admission-cold-snapshot-")); const markerReads = new Map<string, number>(); let directoryReads = 0; let directorySyncs = 0; let reservations = "";
+    const fs = {
+      ...nodeFs,
+      readdir: async (...args: Parameters<typeof nodeFs.readdir>) => { if (String(args[0]) === reservations) directoryReads += 1; return nodeFs.readdir(...args); },
+      open: async (...args: Parameters<typeof open>) => {
+        const handle = await open(...args); const path = String(args[0]); const flags = String(args[1]); const name = path.split(/[\\/]/u).at(-1) ?? ""; const handleRead = handle.readFile.bind(handle); const handleSync = handle.sync.bind(handle);
+        return Object.assign(handle, {
+          readFile: async (...readArgs: Parameters<typeof handle.readFile>) => { if (ADMISSION_RETIREMENT_NAME.test(name)) markerReads.set(name, (markerReads.get(name) ?? 0) + 1); return handleRead(...readArgs); },
+          sync: async () => { if (path === reservations && flags === "r") directorySyncs += 1; return handleSync(); },
+        });
+      },
+    };
+    try {
+      const current = policy(); const outbox = await createOutbox({ host: "prime", homeDir, nodeId: "node-admission-cold-snapshot", producerUuid: producerId(411), machineId: "machine-admission-cold-snapshot", fs }); reservations = join(outbox.root, "reservations"); const markerCount = 32;
+      for (let generation = 0; generation < markerCount; generation += 1) {
+        const reservation = reservationRecord(outbox.nodeId, producerId(500 + generation), `00000000-0000-5000-8000-${(500 + generation).toString(16).padStart(12, "0")}`, current);
+        await nodeFs.writeFile(join(reservations, `admission.${generation.toString().padStart(16, "0")}.retired`), canonicalStringify(retirementRecord(generation, reservation)), { mode: 0o600 });
+      }
+      const seedHandle = await open(reservations, "r"); try { await seedHandle.sync(); } finally { await seedHandle.close(); }
+      await outbox.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000973")], policy: current });
+      const seededReads = [...markerReads.entries()].filter(([name]) => name < `admission.${markerCount.toString().padStart(16, "0")}.retired`); expect(seededReads).toHaveLength(markerCount); for (const [, reads] of seededReads) expect(reads).toBe(1);
+      expect(directoryReads).toBeLessThanOrEqual(10); expect(directorySyncs).toBeLessThanOrEqual(16);
+    } finally { await rm(homeDir, { recursive: true, force: true }); }
+  });
+
+  it("does not re-read or fsync-prove retired generations on sequential admissions", async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), "task5-admission-cache-incremental-"));
+    const retirementReads = new Map<string, number>(); let retirementDirectorySyncs = 0; let reservations = "";
+    const fs = {
+      ...nodeFs,
+      open: async (...args: Parameters<typeof open>) => {
+        const handle = await open(...args); const path = String(args[0]); const flags = String(args[1]); const name = path.split(/[\\/]/u).at(-1) ?? "";
+        return Object.assign(handle, { sync: async () => {
+          if (reservations !== "" && path === reservations && flags === "r") retirementDirectorySyncs += 1;
+          return Object.getPrototypeOf(handle).sync.call(handle);
+        }, readFile: async (...readArgs: Parameters<typeof handle.readFile>) => {
+          if (ADMISSION_RETIREMENT_NAME.test(name)) retirementReads.set(name, (retirementReads.get(name) ?? 0) + 1);
+          return Object.getPrototypeOf(handle).readFile.apply(handle, readArgs);
+        } });
+      },
+    };
+    try {
+      const current = policy(); const outbox = await createOutbox({ host: "prime", homeDir, nodeId: "node-admission-cache-incremental", producerUuid: producerId(406), machineId: "machine-admission-cache-incremental", fs }); reservations = join(outbox.root, "reservations");
+      await outbox.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000964")], policy: current });
+      retirementReads.clear(); retirementDirectorySyncs = 0;
+      await outbox.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000965")], policy: current });
+      expect(retirementReads.get("admission.0000000000000000.retired") ?? 0).toBe(0);
+      expect(retirementReads.get("admission.0000000000000001.retired") ?? 0).toBeGreaterThan(0);
+      expect(retirementDirectorySyncs).toBeLessThanOrEqual(10);
+      retirementReads.clear(); retirementDirectorySyncs = 0;
+      await outbox.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000966")], policy: current });
+      expect(retirementReads.get("admission.0000000000000000.retired") ?? 0).toBe(0);
+      expect(retirementReads.get("admission.0000000000000001.retired") ?? 0).toBe(0);
+      expect(retirementReads.get("admission.0000000000000002.retired") ?? 0).toBeGreaterThan(0);
+      expect(retirementDirectorySyncs).toBeLessThanOrEqual(10);
+    } finally { await rm(homeDir, { recursive: true, force: true }); }
+  });
+
+  it("accepts publisher temp cleanup after another instance caches the retirement marker", async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), "task5-admission-cache-temp-unlink-")); let pauseCleanup!: () => void; let resumeCleanup!: () => void;
+    const cleanupPaused = new Promise<void>((resolve) => { pauseCleanup = resolve; }); const cleanupResume = new Promise<void>((resolve) => { resumeCleanup = resolve; }); let paused = false;
+    let pauseObserver!: () => void; let resumeObserver!: () => void; const observerPaused = new Promise<void>((resolve) => { pauseObserver = resolve; }); const observerResume = new Promise<void>((resolve) => { resumeObserver = resolve; }); let observerBlocked = false; let tempUnlinked = false;
+    const publisherFs = { ...nodeFs, rm: async (path: Parameters<typeof nodeFs.rm>[0], options?: Parameters<typeof nodeFs.rm>[1]) => {
+      if (!paused && ADMISSION_RETIREMENT_TEMP_NAME.test(String(path).split(/[\\/]/u).at(-1) ?? "")) { paused = true; pauseCleanup(); await cleanupResume; }
+      return options === undefined ? nodeFs.rm(path) : nodeFs.rm(path, options);
+    } };
+    try {
+      const current = policy(); const publisher = await createOutbox({ host: "prime", homeDir, nodeId: "node-admission-cache-temp-unlink", producerUuid: producerId(412), machineId: "machine-admission-cache-temp-unlink", fs: publisherFs });
+      const observerFs = { ...nodeFs, rm: async (path: Parameters<typeof nodeFs.rm>[0], options?: Parameters<typeof nodeFs.rm>[1]) => {
+        if (ADMISSION_RETIREMENT_TEMP_NAME.test(String(path).split(/[\\/]/u).at(-1) ?? "")) return;
+        return options === undefined ? nodeFs.rm(path) : nodeFs.rm(path, options);
+      }, link: async (existingPath: Parameters<typeof nodeFs.link>[0], newPath: Parameters<typeof nodeFs.link>[1]) => {
+        if (!observerBlocked && String(newPath).endsWith("admission.0000000000000001.lock")) { observerBlocked = true; pauseObserver(); await observerResume; }
+        return nodeFs.link(existingPath, newPath);
+      }, lstat: async (...args: Parameters<typeof nodeFs.lstat>) => {
+        const info = await nodeFs.lstat(...args); return tempUnlinked && String(args[0]).endsWith("admission.0000000000000000.retired") ? Object.assign(info, { ctimeMs: info.ctimeMs + 1 }) : info;
+      } };
+      const observer = await createOutbox({ host: "prime", homeDir, nodeId: "node-admission-cache-temp-unlink", producerUuid: producerId(413), machineId: "machine-admission-cache-temp-unlink", fs: observerFs });
+      const publishing = publisher.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000974")], policy: current }); await cleanupPaused;
+      const reservations = join(publisher.root, "reservations"); const names = await readdir(reservations); const temp = names.find((name) => ADMISSION_RETIREMENT_TEMP_NAME.test(name))!; const marker = join(reservations, "admission.0000000000000000.retired");
+      expect((await stat(marker)).nlink).toBe(2); const observing = observer.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000975")], policy: current }); await observerPaused;
+      await nodeFs.rm(join(reservations, temp)); tempUnlinked = true; expect((await stat(marker)).nlink).toBe(1);
+      resumeObserver(); await observing;
+      await expect(observer.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000976")], policy: current })).resolves.toBeDefined();
+      resumeCleanup(); await publishing;
+    } finally { resumeObserver?.(); resumeCleanup?.(); await rm(homeDir, { recursive: true, force: true }); }
+  });
+
+  it("fails closed when a linked cached retirement is rewritten before publisher temp cleanup", async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), "task5-admission-cache-temp-rewrite-")); let pauseCleanup!: () => void; let resumeCleanup!: () => void;
+    const cleanupPaused = new Promise<void>((resolve) => { pauseCleanup = resolve; }); const cleanupResume = new Promise<void>((resolve) => { resumeCleanup = resolve; }); let paused = false;
+    const publisherFs = { ...nodeFs, rm: async (path: Parameters<typeof nodeFs.rm>[0], options?: Parameters<typeof nodeFs.rm>[1]) => {
+      if (!paused && ADMISSION_RETIREMENT_TEMP_NAME.test(String(path).split(/[\\/]/u).at(-1) ?? "")) { paused = true; pauseCleanup(); await cleanupResume; }
+      return options === undefined ? nodeFs.rm(path) : nodeFs.rm(path, options);
+    } };
+    let stableMarkerMtime: number | undefined; const observerFs = { ...nodeFs, rm: async (path: Parameters<typeof nodeFs.rm>[0], options?: Parameters<typeof nodeFs.rm>[1]) => {
+      if (ADMISSION_RETIREMENT_TEMP_NAME.test(String(path).split(/[\\/]/u).at(-1) ?? "")) return;
+      return options === undefined ? nodeFs.rm(path) : nodeFs.rm(path, options);
+    }, lstat: async (...args: Parameters<typeof nodeFs.lstat>) => {
+      const info = await nodeFs.lstat(...args); if (!String(args[0]).endsWith("admission.0000000000000000.retired")) return info;
+      stableMarkerMtime ??= info.mtimeMs; return Object.assign(info, { mtimeMs: stableMarkerMtime });
+    } };
+    try {
+      const current = policy(); const publisher = await createOutbox({ host: "prime", homeDir, nodeId: "node-admission-cache-temp-rewrite", producerUuid: producerId(414), machineId: "machine-admission-cache-temp-rewrite", fs: publisherFs });
+      const observer = await createOutbox({ host: "prime", homeDir, nodeId: "node-admission-cache-temp-rewrite", producerUuid: producerId(415), machineId: "machine-admission-cache-temp-rewrite", fs: observerFs });
+      const publishing = publisher.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000977")], policy: current }); await cleanupPaused;
+      const reservations = join(publisher.root, "reservations"); const names = await readdir(reservations); const temp = names.find((name) => ADMISSION_RETIREMENT_TEMP_NAME.test(name))!; const marker = join(reservations, "admission.0000000000000000.retired");
+      expect((await stat(marker)).nlink).toBe(2);
+      await observer.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000978")], policy: current });
+      const original = await readFile(marker, "utf8"); const originalStat = await stat(marker); const originalReservation = (JSON.parse(original) as { reservation: { jobId: string; requestedBytes: number } }).reservation; const replacementReservation = reservationRecord(observer.nodeId, producerId(416), originalReservation.jobId, current, originalReservation.requestedBytes); const rewritten = canonicalStringify(retirementRecord(0, replacementReservation));
+      expect(rewritten).not.toBe(original); expect(Buffer.byteLength(rewritten)).toBe(Buffer.byteLength(original));
+      await nodeFs.writeFile(marker, rewritten, { mode: 0o600 }); await nodeFs.utimes(marker, originalStat.atime, originalStat.mtime); await nodeFs.rm(join(reservations, temp));
+      expect((await stat(marker)).nlink).toBe(1); expect((await stat(marker)).mtimeMs).toBeCloseTo(originalStat.mtimeMs, 0);
+      await expect(observer.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000980")], policy: current })).rejects.toThrow(/retirement marker changed/u);
+      resumeCleanup(); await publishing;
+    } finally { resumeCleanup?.(); await rm(homeDir, { recursive: true, force: true }); }
+  });
+
+  it("fails closed when a cached retirement marker is rewritten in place", async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), "task5-admission-cache-rewrite-"));
+    try {
+      const current = policy(); const outbox = await createOutbox({ host: "prime", homeDir, nodeId: "node-admission-cache-rewrite", producerUuid: producerId(407), machineId: "machine-admission-cache-rewrite" });
+      await outbox.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000967")], policy: current });
+      const marker = join(outbox.root, "reservations", "admission.0000000000000000.retired"); const original = await readFile(marker, "utf8"); const rewritten = original.replace(producerId(407), producerId(408));
+      expect(rewritten).not.toBe(original); expect(Buffer.byteLength(rewritten)).toBe(Buffer.byteLength(original));
+      await nodeFs.writeFile(marker, rewritten, { mode: 0o600 }); await nodeFs.utimes(marker, new Date(), new Date(Date.now() + 60_000));
+      await expect(outbox.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000968")], policy: current })).rejects.toThrow(/retirement marker changed/u);
+    } finally { await rm(homeDir, { recursive: true, force: true }); }
+  });
+
+  it("fully validates warm retirement markers when the filesystem omits timestamps", async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), "task5-admission-cache-identity-fallback-")); const retirementReads = new Map<string, number>();
+    const fs = {
+      ...nodeFs,
+      lstat: async (...args: Parameters<typeof nodeFs.lstat>) => Object.assign(await nodeFs.lstat(...args), { ctimeMs: undefined, mtimeMs: undefined }),
+      open: async (...args: Parameters<typeof open>) => {
+        const handle = await open(...args); const name = String(args[0]).split(/[\\/]/u).at(-1) ?? ""; const handleStat = handle.stat.bind(handle); const handleRead = handle.readFile.bind(handle);
+        return Object.assign(handle, {
+          stat: async () => Object.assign(await handleStat(), { ctimeMs: undefined, mtimeMs: undefined }),
+          readFile: async (...readArgs: Parameters<typeof handle.readFile>) => { if (ADMISSION_RETIREMENT_NAME.test(name)) retirementReads.set(name, (retirementReads.get(name) ?? 0) + 1); return handleRead(...readArgs); },
+        });
+      },
+    };
+    try {
+      const current = policy(); const outbox = await createOutbox({ host: "prime", homeDir, nodeId: "node-admission-cache-identity-fallback", producerUuid: producerId(409), machineId: "machine-admission-cache-identity-fallback", fs });
+      await outbox.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000969")], policy: current }); retirementReads.clear();
+      await outbox.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000970")], policy: current });
+      expect(retirementReads.get("admission.0000000000000000.retired") ?? 0).toBeGreaterThan(0);
+      const replacement = reservationRecord("node-admission-cache-identity-fallback", producerId(410), "00000000-0000-5000-8000-000000000971", current); await nodeFs.writeFile(join(outbox.root, "reservations", "admission.0000000000000000.retired"), canonicalStringify(retirementRecord(0, replacement)), { mode: 0o600 });
+      await expect(outbox.enqueue({ episodes: [episode(current, "00000000-0000-5000-8000-000000000972")], policy: current })).rejects.toThrow(/retirement marker changed/u);
     } finally { await rm(homeDir, { recursive: true, force: true }); }
   });
 

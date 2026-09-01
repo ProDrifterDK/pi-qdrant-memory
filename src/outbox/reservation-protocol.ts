@@ -6,8 +6,8 @@ import { canonicalStringify, sha256Hex } from "../domain/canonical.js";
 export interface ReservationProtocolFileSystem {
   chmod(path: string, mode: number): Promise<void>;
   link(existingPath: string, newPath: string): Promise<void>;
-  lstat(path: string): Promise<{ isDirectory(): boolean; isFile(): boolean; isSymbolicLink(): boolean; mode: number; size: number; dev: number; ino: number }>;
-  open(path: string, flags: string | number, mode?: number): Promise<{ writeFile(data: string, encoding?: BufferEncoding): Promise<void>; readFile(): Promise<Uint8Array>; stat(): Promise<{ isDirectory(): boolean; isFile(): boolean; isSymbolicLink(): boolean; mode: number; size: number; dev: number; ino: number }>; sync(): Promise<void>; close(): Promise<void> }>;
+  lstat(path: string): Promise<FileIdentity>;
+  open(path: string, flags: string | number, mode?: number): Promise<{ writeFile(data: string, encoding?: BufferEncoding): Promise<void>; readFile(): Promise<Uint8Array>; stat(): Promise<FileIdentity>; sync(): Promise<void>; close(): Promise<void> }>;
   readFile(path: string, encoding: BufferEncoding): Promise<string>;
   readdir(path: string): Promise<string[]>;
   rm(path: string, options?: { force?: boolean; recursive?: boolean }): Promise<void>;
@@ -45,7 +45,9 @@ export const ADMISSION_GENERATION_LIMIT = 1_000_000;
 export const ADMISSION_LOCK = /^admission\.([0-9]{16})\.lock$/u;
 export const ADMISSION_RETIREMENT = /^admission\.([0-9]{16})\.retired$/u;
 const ADMISSION_RETIREMENT_TEMP = /^\.admission\.([0-9]{16})\.retired\.tmp-[0-9]+-[a-f0-9]{32}$/u;
-interface DirectoryProtocolCache { dev: number; ino: number; cursor: number; retiredReservations: Map<string, RetiredReservation>; }
+interface FileIdentity { isDirectory(): boolean; isFile(): boolean; isSymbolicLink(): boolean; mode: number; size: number; dev: number; ino: number; nlink?: number; ctimeMs?: number; mtimeMs?: number; }
+interface MarkerIdentity { mode: number; size: number; dev: number; ino: number; nlink: number; ctimeMs: number; mtimeMs: number; }
+interface DirectoryProtocolCache { dev: number; ino: number; cursor: number; retiredMarkers: Map<number, MarkerIdentity>; retiredByGeneration: Map<number, string>; retiredReservations: Map<string, RetiredReservation>; }
 const directoryProtocolCaches = new Map<string, DirectoryProtocolCache>();
 
 type PlainRecord = Record<string, unknown>;
@@ -60,12 +62,24 @@ function assertReservationsDirectory(info: DirectoryIdentity): void { if (!info.
 function cacheForDirectory(dir: string, identity: DirectoryIdentity): DirectoryProtocolCache {
   assertReservationsDirectory(identity); const current = directoryProtocolCaches.get(dir);
   if (current !== undefined && current.dev === identity.dev && current.ino === identity.ino) return current;
-  const replacement: DirectoryProtocolCache = { dev: identity.dev, ino: identity.ino, cursor: 0, retiredReservations: new Map<string, RetiredReservation>() };
+  const replacement: DirectoryProtocolCache = { dev: identity.dev, ino: identity.ino, cursor: 0, retiredMarkers: new Map<number, MarkerIdentity>(), retiredByGeneration: new Map<number, string>(), retiredReservations: new Map<string, RetiredReservation>() };
   directoryProtocolCaches.set(dir, replacement); return replacement;
 }
-function cacheRetirement(dir: string, generation: number, reservation: ReservationRecord): void {
+function markerIdentity(info: FileIdentity): MarkerIdentity | undefined {
+  if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o077) !== 0) return undefined;
+  const values = [info.mode, info.size, info.dev, info.ino, info.nlink, info.ctimeMs, info.mtimeMs];
+  if (values.some((value) => typeof value !== "number" || !Number.isFinite(value))) return undefined;
+  return { mode: info.mode, size: info.size, dev: info.dev, ino: info.ino, nlink: info.nlink!, ctimeMs: info.ctimeMs!, mtimeMs: info.mtimeMs! };
+}
+function sameMarkerIdentity(left: MarkerIdentity, right: MarkerIdentity): boolean { return left.mode === right.mode && left.size === right.size && left.dev === right.dev && left.ino === right.ino && left.nlink === right.nlink && left.ctimeMs === right.ctimeMs && left.mtimeMs === right.mtimeMs; }
+function sameMarkerInode(left: MarkerIdentity, right: MarkerIdentity): boolean { return left.mode === right.mode && left.size === right.size && left.dev === right.dev && left.ino === right.ino; }
+function isPublisherTempUnlink(left: MarkerIdentity, right: MarkerIdentity): boolean { return sameMarkerInode(left, right) && left.mtimeMs === right.mtimeMs && left.nlink === 2 && right.nlink === 1 && right.ctimeMs >= left.ctimeMs; }
+function cacheRetirement(dir: string, generation: number, reservation: ReservationRecord, identity: MarkerIdentity | undefined): void {
   const cache = directoryProtocolCaches.get(dir); if (cache === undefined) return; const canonical = canonicalStringify(reservation); const existing = cache.retiredReservations.get(reservation.reservationId);
   if (existing !== undefined && (existing.canonical !== canonical || existing.generation !== generation)) throw new Error("Outbox admission reservation was retired more than once");
+  const generationCanonical = cache.retiredByGeneration.get(generation); if (generationCanonical !== undefined && generationCanonical !== canonical) throw new Error("Outbox admission retirement marker changed");
+  if (identity === undefined) cache.retiredMarkers.delete(generation); else cache.retiredMarkers.set(generation, identity);
+  cache.retiredByGeneration.set(generation, canonical);
   cache.retiredReservations.set(reservation.reservationId, { generation, canonical });
 }
 function bumpGenerationHint(dir: string, generation: number): void { const cache = directoryProtocolCaches.get(dir); if (cache !== undefined) cache.cursor = Math.max(cache.cursor, generation); }
@@ -75,22 +89,22 @@ export function isAdmissionProtocolArtifact(name: string): boolean { return ADMI
 
 async function syncDirectory(fs: ReservationProtocolFileSystem, path: string): Promise<void> { const handle = await fs.open(path, "r"); try { await handle.sync(); } finally { await handle.close(); } }
 async function durableRemove(fs: ReservationProtocolFileSystem, path: string, dir: string): Promise<void> { try { await fs.rm(path); } catch (error) { if (!errno(error, "ENOENT")) throw error; } await syncDirectory(fs, dir); }
-async function readExactPrivateBytes(fs: ReservationProtocolFileSystem, path: string, label: string): Promise<Uint8Array> {
+async function readExactPrivateBytes(fs: ReservationProtocolFileSystem, path: string, label: string): Promise<{ bytes: Uint8Array; identity: MarkerIdentity | undefined }> {
   const info = await fs.lstat(path);
   if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o077) !== 0 || info.size < 1 || info.size > 1_048_576) throw new Error(`${label} is unsafe`);
-  let handle; let bytes: Uint8Array;
+  let handle; let bytes: Uint8Array; let opened: FileIdentity;
   try {
     handle = await fs.open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-    const opened = await handle.stat();
+    opened = await handle.stat();
     if (!opened.isFile() || opened.isSymbolicLink() || opened.dev !== info.dev || opened.ino !== info.ino || opened.size !== info.size || (opened.mode & 0o077) !== 0) throw new Error(`${label} inode changed`);
     bytes = await handle.readFile();
   } finally { await handle?.close().catch(() => undefined); }
   const after = await fs.lstat(path);
   if (!after.isFile() || after.isSymbolicLink() || after.dev !== info.dev || after.ino !== info.ino || after.size !== info.size || (after.mode & 0o077) !== 0 || bytes.length !== info.size) throw new Error(`${label} path changed`);
-  return bytes;
+  return { bytes, identity: markerIdentity(after) };
 }
 async function readPrivateJson(fs: ReservationProtocolFileSystem, path: string): Promise<unknown> {
-  return JSON.parse(Buffer.from(await readExactPrivateBytes(fs, path, "Outbox admission protocol file")).toString("utf8"));
+  return JSON.parse(Buffer.from((await readExactPrivateBytes(fs, path, "Outbox admission protocol file")).bytes).toString("utf8"));
 }
 function retirementValue<T extends ReservationRecord>(generation: number, reservation: T): AdmissionRetirement<T> {
   const value: AdmissionRetirement<T> = { version: 1, kind: "admission_lock_retired", generation, reservation, auditHash: "" };
@@ -103,28 +117,84 @@ function validateRetirement<T extends ReservationRecord>(input: unknown, generat
   if (typeof value.auditHash !== "string" || value.auditHash !== hashWithout(value as unknown as PlainRecord, "auditHash")) throw new Error("Outbox admission retirement marker is malformed");
   return value as AdmissionRetirement<T>;
 }
-async function readExactRetirement<T extends ReservationRecord>(fs: ReservationProtocolFileSystem, file: string, generation: number, validateReservation: (value: unknown) => T): Promise<AdmissionRetirement<T>> {
-  const text = Buffer.from(await readExactPrivateBytes(fs, file, "Outbox admission retirement marker")).toString("utf8");
+async function readExactRetirement<T extends ReservationRecord>(fs: ReservationProtocolFileSystem, file: string, generation: number, validateReservation: (value: unknown) => T): Promise<{ marker: AdmissionRetirement<T>; identity: MarkerIdentity | undefined }> {
+  const exact = await readExactPrivateBytes(fs, file, "Outbox admission retirement marker"); const text = Buffer.from(exact.bytes).toString("utf8");
   const parsed = validateRetirement(JSON.parse(text), generation, validateReservation);
   if (text !== canonicalStringify(parsed)) throw new Error("Outbox admission retirement marker is not canonical");
-  return parsed;
+  return { marker: parsed, identity: exact.identity };
 }
 async function durableRetirement<T extends ReservationRecord>(fs: ReservationProtocolFileSystem, dir: string, generation: number, validateReservation: (value: unknown) => T): Promise<AdmissionRetirement<T> | undefined> {
   const dirInfo = await fs.lstat(dir); cacheForDirectory(dir, dirInfo);
-  const file = join(dir, admissionRetirementName(generation)); let first: AdmissionRetirement<T>;
+  const file = join(dir, admissionRetirementName(generation)); let first: { marker: AdmissionRetirement<T>; identity: MarkerIdentity | undefined };
   try { first = await readExactRetirement(fs, file, generation, validateReservation); } catch (error) { if (errno(error, "ENOENT")) return undefined; throw error; }
   await syncDirectory(fs, dir);
   const dirAfter = await fs.lstat(dir); assertReservationsDirectory(dirAfter);
   if (dirAfter.dev !== dirInfo.dev || dirAfter.ino !== dirInfo.ino) throw new Error("Outbox reservations directory changed");
   const second = await readExactRetirement(fs, file, generation, validateReservation);
-  if (canonicalStringify(second) !== canonicalStringify(first)) throw new Error("Outbox admission retirement marker readback changed");
-  cacheRetirement(dir, generation, second.reservation); return second;
+  if (canonicalStringify(second.marker) !== canonicalStringify(first.marker)) throw new Error("Outbox admission retirement marker readback changed");
+  if (first.identity !== undefined && second.identity !== undefined && !sameMarkerInode(first.identity, second.identity)) throw new Error("Outbox admission retirement marker readback changed");
+  cacheRetirement(dir, generation, second.marker.reservation, second.identity); return second.marker;
 }
-async function cleanupRetirementTemps<T extends ReservationRecord>(fs: ReservationProtocolFileSystem, dir: string, generation: number, validateReservation: (value: unknown) => T): Promise<void> {
-  if (await durableRetirement(fs, dir, generation, validateReservation) === undefined) return;
-  for (const name of await fs.readdir(dir)) { const match = ADMISSION_RETIREMENT_TEMP.exec(name); if (match !== null && generationFrom(match) === generation) await durableRemove(fs, join(dir, name), dir).catch(() => undefined); }
+async function validateCachedRetirement<T extends ReservationRecord>(fs: ReservationProtocolFileSystem, dir: string, cache: DirectoryProtocolCache, generation: number, validateReservation: (value: unknown) => T): Promise<void> {
+  const cached = cache.retiredMarkers.get(generation); const file = join(dir, admissionRetirementName(generation));
+  if (cached !== undefined) {
+    let current: FileIdentity; try { current = await fs.lstat(file); } catch (error) { if (errno(error, "ENOENT")) throw new Error("Outbox admission retirement disappeared during scan"); throw error; }
+    const identity = markerIdentity(current);
+    if (identity !== undefined) {
+      if (sameMarkerIdentity(cached, identity)) return;
+      if (isPublisherTempUnlink(cached, identity)) {
+        const exact = await readExactRetirement(fs, file, generation, validateReservation); const canonical = cache.retiredByGeneration.get(generation);
+        if (canonical === undefined || canonicalStringify(exact.marker.reservation) !== canonical || exact.identity === undefined || !sameMarkerIdentity(identity, exact.identity)) throw new Error("Outbox admission retirement marker changed");
+        cache.retiredMarkers.set(generation, exact.identity); return;
+      }
+      throw new Error("Outbox admission retirement marker changed");
+    }
+  }
+  const marker = await durableRetirement(fs, dir, generation, validateReservation);
+  if (marker === undefined) throw new Error("Outbox admission retirement disappeared during scan");
 }
-async function scanAdmissionState<T extends ReservationRecord>(fs: ReservationProtocolFileSystem, dir: string, validateReservation: (value: unknown) => T): Promise<AdmissionState<T>> {
+function sameNameSet(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false; const sortedLeft = [...left].sort(); const sortedRight = [...right].sort();
+  return sortedLeft.every((name, index) => name === sortedRight[index]);
+}
+async function validateColdRetirementSnapshot<T extends ReservationRecord>(fs: ReservationProtocolFileSystem, dir: string, directory: DirectoryIdentity, names: readonly string[], generations: readonly number[], validateReservation: (value: unknown) => T): Promise<void> {
+  if (generations.length === 0) return;
+  const validated = new Map<number, { marker: AdmissionRetirement<T>; identity: MarkerIdentity | undefined }>();
+  for (const generation of generations) {
+    const file = join(dir, admissionRetirementName(generation)); let exact: { marker: AdmissionRetirement<T>; identity: MarkerIdentity | undefined };
+    try { exact = await readExactRetirement(fs, file, generation, validateReservation); } catch (error) { if (errno(error, "ENOENT")) throw new Error("Outbox admission retirement disappeared during scan"); throw error; }
+    validated.set(generation, exact);
+  }
+  await syncDirectory(fs, dir);
+  const beforeReadback = await fs.lstat(dir); assertReservationsDirectory(beforeReadback);
+  if (beforeReadback.dev !== directory.dev || beforeReadback.ino !== directory.ino) throw new Error("Outbox reservations directory changed during scan");
+  const readbackNames = await fs.readdir(dir); const afterReadback = await fs.lstat(dir); assertReservationsDirectory(afterReadback);
+  if (afterReadback.dev !== directory.dev || afterReadback.ino !== directory.ino || !sameNameSet(names, readbackNames)) throw new Error("Outbox reservations directory name set changed during scan");
+  for (const generation of generations) {
+    const first = validated.get(generation)!; const file = join(dir, admissionRetirementName(generation)); let current: FileIdentity;
+    try { current = await fs.lstat(file); } catch (error) { if (errno(error, "ENOENT")) throw new Error("Outbox admission retirement disappeared during scan"); throw error; }
+    const identity = markerIdentity(current);
+    if (first.identity !== undefined && identity !== undefined) {
+      if (sameMarkerIdentity(first.identity, identity)) continue;
+      if (!isPublisherTempUnlink(first.identity, identity)) throw new Error("Outbox admission retirement marker changed during scan");
+      const second = await readExactRetirement(fs, file, generation, validateReservation);
+      if (canonicalStringify(second.marker) !== canonicalStringify(first.marker) || second.identity === undefined || !sameMarkerIdentity(identity, second.identity)) throw new Error("Outbox admission retirement marker changed during scan");
+      first.identity = second.identity;
+    } else {
+      const second = await readExactRetirement(fs, file, generation, validateReservation);
+      if (canonicalStringify(second.marker) !== canonicalStringify(first.marker)) throw new Error("Outbox admission retirement marker changed during scan");
+    }
+  }
+  for (const [generation, exact] of validated) cacheRetirement(dir, generation, exact.marker.reservation, exact.identity);
+}
+async function cleanupRetirementTemps<T extends ReservationRecord>(fs: ReservationProtocolFileSystem, dir: string, generation: number, validateReservation: (value: unknown) => T, alreadyValidated = false, knownNames?: readonly string[]): Promise<void> {
+  if (!alreadyValidated && await durableRetirement(fs, dir, generation, validateReservation) === undefined) return;
+  let removed = false; const names = knownNames ?? await fs.readdir(dir);
+  for (const name of names) { const match = ADMISSION_RETIREMENT_TEMP.exec(name); if (match !== null && generationFrom(match) === generation) { try { await fs.rm(join(dir, name)); removed = true; } catch (error) { if (!errno(error, "ENOENT")) throw error; } } }
+  if (removed) await syncDirectory(fs, dir);
+  if (removed && await durableRetirement(fs, dir, generation, validateReservation) === undefined) throw new Error("Outbox admission retirement disappeared during cleanup");
+}
+async function scanAdmissionStateOnce<T extends ReservationRecord>(fs: ReservationProtocolFileSystem, dir: string, validateReservation: (value: unknown) => T): Promise<AdmissionState<T>> {
   const initialDirectory = await fs.lstat(dir); const cache = cacheForDirectory(dir, initialDirectory);
   const names = await fs.readdir(dir); const afterRead = await fs.lstat(dir); assertReservationsDirectory(afterRead);
   if (afterRead.dev !== initialDirectory.dev || afterRead.ino !== initialDirectory.ino) throw new Error("Outbox reservations directory changed during scan");
@@ -140,17 +210,16 @@ async function scanAdmissionState<T extends ReservationRecord>(fs: ReservationPr
   if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor >= ADMISSION_GENERATION_LIMIT) throw new Error("Outbox admission generation limit reached");
   for (let generation = 0; generation < cursor; generation += 1) {
     if (!retired.has(generation)) throw new Error("Outbox admission generation history is not contiguous");
-    const marker = await durableRetirement(fs, dir, generation, validateReservation);
-    if (marker === undefined) throw new Error("Outbox admission retirement disappeared during scan");
+    await validateCachedRetirement(fs, dir, cache, generation, validateReservation);
   }
+  const coldGenerations: number[] = [];
   while (retired.has(cursor)) {
-    const marker = await durableRetirement(fs, dir, cursor, validateReservation);
-    if (marker === undefined) throw new Error("Outbox admission retirement disappeared during scan");
-    await cleanupRetirementTemps(fs, dir, cursor, validateReservation).catch(() => undefined); cursor += 1;
+    coldGenerations.push(cursor); cursor += 1;
     if (cursor >= ADMISSION_GENERATION_LIMIT) throw new Error("Outbox admission generation limit reached");
   }
+  await validateColdRetirementSnapshot(fs, dir, initialDirectory, names, coldGenerations, validateReservation);
   for (const generation of retired) if (generation > cursor) throw new Error("Outbox admission generation history has a gap");
-  for (const generation of temps) { if (generation < cursor) await cleanupRetirementTemps(fs, dir, generation, validateReservation).catch(() => undefined); else if (generation > cursor) throw new Error("Outbox admission retirement temp is beyond the generation cursor"); }
+  for (const generation of temps) { if (generation < cursor) await cleanupRetirementTemps(fs, dir, generation, validateReservation, true, names).catch(() => undefined); else if (generation > cursor) throw new Error("Outbox admission retirement temp is beyond the generation cursor"); }
   let active: { generation: number; file: string; reservation: T } | undefined;
   for (const [generation, namesForGeneration] of locks) {
     if (namesForGeneration.length !== 1) throw new Error("Outbox admission generation has ambiguous locks");
@@ -164,6 +233,13 @@ async function scanAdmissionState<T extends ReservationRecord>(fs: ReservationPr
   const finalDirectory = await fs.lstat(dir); assertReservationsDirectory(finalDirectory);
   if (finalDirectory.dev !== initialDirectory.dev || finalDirectory.ino !== initialDirectory.ino) throw new Error("Outbox reservations directory changed during scan");
   cache.cursor = cursor; return { cursor, active, retiredReservations: cache.retiredReservations };
+}
+async function scanAdmissionState<T extends ReservationRecord>(fs: ReservationProtocolFileSystem, dir: string, validateReservation: (value: unknown) => T): Promise<AdmissionState<T>> {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try { return await scanAdmissionStateOnce(fs, dir, validateReservation); }
+    catch (error) { if (!(error instanceof Error) || error.message !== "Outbox reservations directory name set changed during scan" || attempt === 3) throw error; }
+  }
+  throw new Error("Outbox reservations directory changed during scan");
 }
 function assertNotRetired<T extends ReservationRecord>(state: AdmissionState<T>, reservation: T): void {
   const retired = state.retiredReservations.get(reservation.reservationId); if (retired === undefined) return;
@@ -185,7 +261,7 @@ export async function publishAdmissionRetirement<T extends ReservationRecord>(fs
   await syncDirectory(fs, dir);
   const winner = await durableRetirement(fs, dir, generation, validateReservation);
   if (winner === undefined || !sameReservation(winner.reservation, reservation)) throw new Error("Outbox admission retirement marker collision");
-  await cleanupRetirementTemps(fs, dir, generation, validateReservation).catch(() => undefined); bumpGenerationHint(dir, generation + 1);
+  await cleanupRetirementTemps(fs, dir, generation, validateReservation, true).catch(() => undefined); bumpGenerationHint(dir, generation + 1);
 }
 
 export async function activeAdmissionLocks<T extends ReservationRecord>(fs: ReservationProtocolFileSystem, dir: string, validateReservation: (value: unknown) => T): Promise<Array<{ generation: number; file: string; reservation: T }>> {

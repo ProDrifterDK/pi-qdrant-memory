@@ -52,6 +52,7 @@ const HARD_CONTEXT_BUDGET = 16000;
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const CACHE_MAX_ENTRIES = 32;
 const LIFECYCLE_DELIVERY_BATCH = 64;
+const OUTBOX_JOB_MAX_EPISODES = 1024;
 const LIFECYCLE_HEARTBEAT_INTERVAL_MS = 15_000;
 const LIFECYCLE_RECOVERY_PRODUCERS = 64;
 const LIFECYCLE_RECOVERY_NODES = 512;
@@ -826,6 +827,7 @@ function createProductionLifecycleCoordinatorInternal(input: { homeDir: string; 
         acceptEpisodes: async (records) => {
           try {
             const bound: EpisodeRecord[] = [];
+            const groups = new Map<string, { policy: ProcessingPolicy; episodes: EpisodeRecord[] }>();
             for (const record of records) {
               const eventAt = Date.parse(record.eventAt); if (!Number.isFinite(eventAt)) throw new Error("capture event clock");
               const binding = producerBinding; if (binding === undefined) throw new Error("capture policy");
@@ -834,9 +836,15 @@ function createProductionLifecycleCoordinatorInternal(input: { homeDir: string; 
                 destinationId: eventPolicy.destinationIds.qdrant, expiresAt: eventPolicy.expiresAt,
                 ...(binding.modelId === undefined ? {} : { modelId: binding.modelId }), contentHash: "pending" };
               const episode = Object.freeze({ ...pending, contentHash: canonicalRecordHash(pending) });
-              // One event-relative policy per immutable job keeps retention
-              // exact while every outbox admission remains below 1024 records.
-              await outbox!.enqueue({ episodes: Object.freeze([episode]), policy: eventPolicy }); bound.push(episode);
+              bound.push(episode);
+              const group = groups.get(eventPolicy.id);
+              if (group === undefined) groups.set(eventPolicy.id, { policy: eventPolicy, episodes: [episode] });
+              else group.episodes.push(episode);
+            }
+            for (const group of groups.values()) {
+              for (let index = 0; index < group.episodes.length; index += OUTBOX_JOB_MAX_EPISODES) {
+                await outbox!.enqueue({ episodes: Object.freeze(group.episodes.slice(index, index + OUTBOX_JOB_MAX_EPISODES)), policy: group.policy });
+              }
             }
             acceptedRecords = Object.freeze(bound);
           } catch (error) { acceptanceFailed = true; acceptanceError = error; throw error; }
