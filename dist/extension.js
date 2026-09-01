@@ -872,9 +872,10 @@ function createProductionLifecycleCoordinatorInternal(input) {
             const currentPolicy = policy;
             if (currentPolicy === undefined)
                 return Object.freeze([]);
-            const control = runtime === undefined ? undefined : await runtime.store.readControl().catch(() => undefined);
-            if (runtime !== undefined && (control === undefined || control.state !== "active"))
-                return Object.freeze([]);
+            // Capture is local durable admission only. The runtime's activation
+            // snapshot brands the queued record; delivery revalidates live control
+            // and rejects stale epochs or revoked destinations before any egress.
+            const capturePrivacyEpoch = runtime?.control.privacyEpoch ?? 0;
             let acceptedRecords;
             let acceptanceFailed = false;
             let acceptanceError;
@@ -889,7 +890,7 @@ function createProductionLifecycleCoordinatorInternal(input) {
                 projectIdentityKind: value.project.identityKind ?? "local_only",
                 projectAllowlist: value.config.capture.projectAllowlist, projectDenylist: value.config.capture.projectDenylist,
                 marker: canonicalCaptureMarker(value.host, value.marker),
-                policyId: currentPolicy.id, privacyEpoch: control?.privacyEpoch ?? 0, expiresAt: null,
+                policyId: currentPolicy.id, privacyEpoch: capturePrivacyEpoch, expiresAt: null,
                 originProvider: producerBinding?.sessionOriginProvider ?? "unknown",
                 destinationId: currentPolicy.destinationIds.qdrant,
                 nodeId: outbox.nodeId, producerId: outbox.producerUuid,
@@ -1551,7 +1552,6 @@ export function createMemoryExtension(dependencies = {}) {
                 return Object.freeze([]);
             }
             try {
-                await runHeartbeat();
                 const episodes = await lifecycle.capture({
                     host, config, sessionId: sessionState.sessionId, cwd: ctx.cwd,
                     project: sessionState.project, marker, getEntries: sessionEntries(ctx), ctx,

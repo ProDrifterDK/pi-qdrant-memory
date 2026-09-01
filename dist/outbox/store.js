@@ -908,6 +908,10 @@ export async function createOutbox(input) {
             state = validateState(await readSecureJson(fs, stateFile));
             if (state.state !== "active")
                 throw new OutboxProducerClosedError();
+            // Admission itself keeps producer liveness current. This atomic local
+            // state write is serialized with enqueue and never depends on the idle
+            // periodic heartbeat task.
+            await writeState(producerState({ version: 1, state: "active", heartbeatAt: Math.max(state.heartbeatAt, acceptedAt), closedAt: null }));
             const job = outboxJob({ host: input.host, nodeId, producerUuid, now: acceptedAt, policy: enqueueInput.policy, episodes: enqueueInput.episodes, homeDir: input.homeDir });
             const file = join(jobsDir, `${job.id}.json`);
             const bodyBytes = Buffer.byteLength(canonicalStringify(job), "utf8");

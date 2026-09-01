@@ -413,7 +413,7 @@ describe("autonomous lifecycle wiring", () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it("heartbeats immediately before each capture admission", async () => {
+  it("does not run the periodic heartbeat inline with capture admission", async () => {
     const lifecycle = lifecycleDouble(); const order: string[] = [];
     lifecycle.coordinator.heartbeat = async () => { order.push("heartbeat"); };
     lifecycle.coordinator.capture = async (value) => { order.push(`capture:${value.lifecycle}`); return []; };
@@ -426,7 +426,7 @@ describe("autonomous lifecycle wiring", () => {
     await factory(fake.api);
     await fake.handler("session_start")({ type: "session_start", reason: "startup" }, context.value);
     await fake.handler("agent_end")({ type: "agent_end", messages: [] }, context.value);
-    expect(order.slice(0, 2)).toEqual(["heartbeat", "capture:agent_end"]);
+    expect(order[0]).toBe("capture:agent_end");
     await fake.handler("session_shutdown")({ type: "session_shutdown", reason: "quit" }, context.value);
   });
 
@@ -456,6 +456,58 @@ describe("autonomous lifecycle wiring", () => {
     releaseDelivery();
     await handler;
     await fake.handler("session_shutdown")({ type: "session_shutdown", reason: "quit" }, context.value);
+  });
+
+  it("returns agent_end after durable local admission while the production control read is pending", async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), "pi-qdrant-local-admission-"));
+    const env = { PI_CODING_AGENT_DIR: join(homeDir, ".pi", "agent"), PI_QDRANT_MEMORY_HOST: "pi" };
+    const runtime = runtimeFetch("pi"); let holdControl = false; let releaseControl!: () => void;
+    const controlPending = new Promise<void>((resolve) => { releaseControl = resolve; });
+    const fetchImpl: typeof fetch = async (rawUrl, init) => {
+      const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
+      if (holdControl && init?.method === "POST" && Array.isArray(body?.ids) && body.ids.includes(COLLECTION_CONTROL_ID)) await controlPending;
+      return runtime.fetchImpl(String(rawUrl), init);
+    };
+    try {
+      const api = fakeApi(); const base = Date.parse("2029-01-01T00:00:00.000Z");
+      const factory = createMemoryExtension({ env, argv: [], homeDir, now: () => base, readTextFile: async () => hostConfig(true, true), fetchImpl, projectResolver: async () => registeredProject() });
+      await factory(api.api); const entries: any[] = []; const context = ctx({ sessionId: "session-local-admission", entries, header: null });
+      await api.handler("session_start")({ type: "session_start", reason: "startup" }, context.value);
+      entries.push({ id: "local-admission-entry", type: "message", message: { role: "user", content: "durable before remote control", timestamp: base + 1 } });
+      holdControl = true;
+      const handler = Promise.resolve(api.handler("agent_end")({ type: "agent_end", messages: [] }, context.value));
+      let agentEndResolved = false;
+      void handler.then(() => { agentEndResolved = true; });
+      const outboxRoot = join(env.PI_CODING_AGENT_DIR, "pi-qdrant-memory", "outbox");
+      await vi.waitFor(async () => {
+        const node = (await readdir(outboxRoot)).find((name) => name.startsWith("node-"));
+        expect(node).toBeDefined();
+        const producers = (await readdir(join(outboxRoot, node!))).filter((name) => !name.endsWith(".json"));
+        const jobs = (await Promise.all(producers.map((producer) => readdir(join(outboxRoot, node!, producer, "jobs"))))).flat();
+        expect(jobs).toHaveLength(1);
+        expect(agentEndResolved).toBe(true);
+      }, { timeout: 2_000, interval: 20 });
+      holdControl = false; releaseControl(); await handler;
+      await api.handler("session_shutdown")({ type: "session_shutdown", reason: "quit" }, context.value);
+    } finally { releaseControl(); await rm(homeDir, { recursive: true, force: true }); }
+  });
+
+  it("does not join a blocked periodic heartbeat from agent_end", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const lifecycle = lifecycleDouble(); let heartbeatStarted!: () => void; const started = new Promise<void>((resolve) => { heartbeatStarted = resolve; });
+    let releaseHeartbeat!: () => void; const blocked = new Promise<void>((resolve) => { releaseHeartbeat = resolve; });
+    lifecycle.coordinator.heartbeat = async () => { heartbeatStarted(); await blocked; };
+    const runtime = runtimeFetch("pi"); const factory = createMemoryExtension({ env: { PI_QDRANT_MEMORY_HOST: "pi" }, argv: [], homeDir: "/home/test", readTextFile: async () => hostConfig(true, true), fetchImpl: runtime.fetchImpl, projectResolver: async () => registeredProject(), lifecycleCoordinator: lifecycle.coordinator });
+    const api = fakeApi(); const context = ctx({ header: null });
+    try {
+      await factory(api.api); await api.handler("session_start")({ type: "session_start", reason: "startup" }, context.value);
+      await vi.advanceTimersByTimeAsync(15_000); await started;
+      const handler = Promise.resolve(api.handler("agent_end")({ type: "agent_end", messages: [] }, context.value));
+      await expect(Promise.race([handler.then(() => "resolved"), new Promise<string>((resolve) => setTimeout(() => resolve("blocked"), 25))])).resolves.toBe("resolved");
+      expect(lifecycle.calls.some((call) => call.method === "capture")).toBe(true);
+      releaseHeartbeat(); await handler;
+      await api.handler("session_shutdown")({ type: "session_shutdown", reason: "quit" }, context.value);
+    } finally { releaseHeartbeat(); vi.useRealTimers(); }
   });
 
   it("serializes maintenance and aborts it before shutdown clears lifecycle state", async () => {

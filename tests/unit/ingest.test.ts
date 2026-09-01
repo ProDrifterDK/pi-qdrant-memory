@@ -478,6 +478,21 @@ describe("Task 7 redacted outbox ingest over the Task 8 ingest bundle", () => {
     expect([...backend.points.values()].some((point) => point.payload.record_type === "processing_policy")).toBe(true);
   });
 
+  it("revalidates current authority at delivery and denies revoked or mismatched jobs before egress", async () => {
+    const localPolicy = policy();
+    for (const control of [
+      emptyControl({ revokedDestinationIds: [embeddingDestination.id] }),
+      emptyControl({ coordinationPolicyEpoch: coordination.policyEpoch + 1 }),
+    ]) {
+      let embeds = 0;
+      const backend = restQdrantWriter([controlPoint(control)]);
+      const processor = createIngestProcessor({ localPolicy, runtime: runtime(backend, async () => { embeds += 1; return Array.from({ length: 1024 }, () => 0.25); }), maxClockSkewMs: 0, now: () => 0 });
+      await expect(processor.process(job(localPolicy), {})).resolves.toMatchObject({ status: "pending", category: "control_unavailable" });
+      expect(embeds).toBe(0);
+      expect([...backend.points.values()].some((point) => point.payload.record_type === "episode" || point.payload.record_type === "processing_policy")).toBe(false);
+    }
+  });
+
   it("rejects unknown control keys and never dereferences malformed processor jobs", async () => {
     const localPolicy = policy();
     const malformed = { ...controlPayload(emptyControl()), unexpected_raw: true };

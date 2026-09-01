@@ -185,7 +185,8 @@ describe("Task 5 durable outbox", () => {
     try {
       let clock = Date.parse("2029-01-02T00:00:00.000Z");
       const first = await createOutbox({ host: "prime", homeDir, nodeId: "node-recovery", producerUuid: producerId(18), machineId: "machine-recovery", now: () => clock });
-      const current = policy(); const accepted = await first.enqueue({ episodes: [episode(current)], policy: current });
+      const current = policy(); clock += 500; const accepted = await first.enqueue({ episodes: [episode(current)], policy: current });
+      expect((await first.outboxStatus()).heartbeatAt).toBe(clock);
       clock += 1000; await first.heartbeat();
       expect((await first.outboxStatus()).heartbeatAt).toBe(clock);
       await nodeFs.writeFile(join(first.producerPath, "jobs", "malformed.json"), "Bearer raw-secret-value-123456789", { mode: 0o600 });
